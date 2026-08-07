@@ -1039,7 +1039,7 @@ argument by hand, and repeating it walks back through earlier commands.
 | `exit [n]` · `exit status n` | Leave the shell with status `n` (default: the last command's status; masked to 0–255). **`exit status n` is the same thing**, written the way [`return status n`](#functions) is, so the two ways of leaving with a status read alike — it disambiguates nothing, since `exit` fills only the status channel. `exit status(n)` needs no rule: the call is one word that renders as its code. `exit status` with no code is an error, as `return status` is, and does not end the shell. `exit value n` is refused by name — `exit` has no value channel to fill, since a value needs somewhere to go and a leaving shell has nowhere. That message only changes what is *said*: `exit` reads words, so a quoted `exit "value"` cannot be told from the written one, and each keeps the outcome its operand would have had — alone it still exits `2`, with more after it the shell stays. Leaves the **whole shell**; to leave only the current function with a status, use `fail`. |
 | `fail [n]` | Leave the current function (or sourced file) with a nonzero status — `1` by default, `n` when given — carrying that status as its value. A **validating wrapper** over `return status(n)`, not exact sugar for it: `fail 0` is refused, where `status(0)` is legal. `return true` is how a function leaves with success. |
 | `prompt [text]` | Set the interactive prompt to `text`. With no arguments, print the current prompt; `--reset` restores the status-sensitive default, and `prompt -- --reset` sets that literal text. |
-| `title text` | Name the window and tab with `OSC 0` — `ESC k` inside screen or tmux, where the name belongs to the pane. The shell titles itself already (`user@host: dir` at the prompt, the command line while one runs); this is how a [`preprompt` or `preexec` hook](#custom-prompts-and-hooks) says something else. Control characters become spaces and the text is cut at 96 characters, as it is for the automatic titles. `title ""` clears it. `$sh.options.osc-title = false` silences this along with the rest, and a terminal off the allowlist is sent nothing. There is no `--reset`: the shell holds no title of its own to restore and a terminal cannot be asked what its title is, so the only question `title` answers is "write this now". **Calling `title` takes the window**: the shell stops naming it from then on, so what you set stays until you or a hook sets something else. A session with only an `on preexec` handler therefore loses the automatic idle title too — see `TODO.md`, which tracks replacing this rule with a shipped hook you can override. Goes to the terminal rather than stdout, as `clip` and `notify` do, so a redirect cannot swallow it: `title x > file` names the window and leaves the file empty. **Refused in a forked pipeline stage** (`title x \| cat`): the write would reach the terminal but the clear mesh owes on the way out would die with the stage, leaving the window named after a shell that has gone. A pipeline's *last* stage runs in the shell itself, so it is allowed. |
+| `title text` | Name the window and tab with `OSC 0` — `ESC k` inside screen or tmux, where the name belongs to the pane. The shell titles itself already (`user@host: dir` at the prompt, the command line while one runs); this is how a [`preprompt` or `preexec` hook](#custom-prompts-and-hooks) says something else. Control characters become spaces and the text is cut at 96 characters, as it is for the automatic titles. `title ""` clears it. `$sh.options.osc-title = false` silences this along with the rest, and a terminal off the allowlist is sent nothing. There is no `--reset`: the shell holds no title of its own to restore and a terminal cannot be asked what its title is, so the only question `title` answers is "write this now". `title` is the **mechanism**, not the interface: it writes a title now, and the next prompt or `preexec` hook will write over it. To set a title that lasts, replace the shipped handler for that moment — see the hooks section above. Goes to the terminal rather than stdout, as `clip` and `notify` do, so a redirect cannot swallow it: `title x > file` names the window and leaves the file empty. **Refused in a forked pipeline stage** (`title x \| cat`): the write would reach the terminal but the clear mesh owes on the way out would die with the stage, leaving the window named after a shell that has gone. A pipeline's *last* stage runs in the shell itself, so it is allowed. |
 | `on event name function` | Register a named function for a prompt lifecycle event. Reusing `name` within an event replaces that hook without changing its order. |
 | `jobs` | List the jobs, one `[id] State command` per line. |
 | `fg [job]` | Resume a job in the foreground and wait for it. No argument takes the most recent job. |
@@ -1600,25 +1600,21 @@ on preprompt title title-idle
 on preexec   title title-busy
 ```
 
-Registering either takes the window: the first title that actually reaches the
-terminal stops the shell naming it for itself, at the prompt *and* while a
-command runs. The prompt's own title is written after the `preprompt` hooks — so
-that a handler which `cd`s is titled from where it left the shell — and once a
-`title` has landed, neither automatic write happens again.
+**The hooks are the interface; `title` is the mechanism they call.** mesh's own
+titles are not special — they are `mesh-title-idle` and `mesh-title-busy`,
+ordinary mesh functions shipped in the prelude and registered on these same two
+hooks. Print them with `puts $sh.prelude`. Registering your own over a name
+replaces the shipped handler; `unset $sh.preprompt.title` leaves that half
+untitled. There is no second, privileged path to outrank.
 
-A call that writes nothing does not take it, which is what you want: with
-`$sh.options.osc-title = false`, or on a terminal off the allowlist, `title` is
-silent and the shell's own titles are silent too, so there is nothing to hand
-over. Turn the option back on and the automatic titles resume until a `title`
-call succeeds.
+So set a title by **owning the hook**, not by calling `title` at the prompt. A
+`title` you type by hand lasts only until the next prompt or hook runs, since the
+handler for that moment will name the window again — the same as any other hook
+output. That is not a limitation to work around: it is what having one mechanism
+means.
 
-**The halves are not independent, so register both or neither.** Taking the
-window is one flag, not one per hook, so a session with only an `on preexec`
-handler loses the automatic *idle* title too and the window keeps whatever the
-last command was called. Registering the pair above avoids it, since each moment
-then has a handler of its own. This is the one rough edge in the current design
-and it goes away when the shell's own titles become overridable hooks — see
-`TODO.md` — where taking a half is just replacing that half's handler.
+The two halves are independent, because they are two hooks. Replacing only
+`preexec` leaves the shipped idle title in place, and vice versa.
 
 `$sh.options.osc-title = false` turns off both the shell's titles and the hooks',
 so it stays the one switch that means "leave my title bar alone".

@@ -142,7 +142,6 @@ struct Shell {
     /// shipped title becomes an overridable hook, where taking the window is just
     /// replacing the shipped handler — `TODO.md`, *A single mechanism for the
     /// title*.
-    title_owned_by_caller: bool,
     /// Inside a `precd` / `postcd` handler. A handler may `cd` — the design
     /// allows it — but that move must not dispatch the hooks again, or
     /// `$sh.postcd.track = func(from) { cd $from }` would recurse until the
@@ -335,7 +334,6 @@ impl Shell {
             produced: Produced::Status,
             status_records: 0,
             title_clear: Vec::new(),
-            title_owned_by_caller: false,
             in_cd_hooks: false,
             input_error: None,
             pending_error: None,
@@ -1240,7 +1238,7 @@ fn bump_shlvl() {
 /// startup. The text stays readable, which is the point of shipping it as source
 /// at all: the defaults are ordinary functions a user can print and replace,
 /// rather than Rust that a hook merely outranks.
-const PRELUDE: &str = include_str!("prelude.mesh");
+pub(crate) const PRELUDE: &str = include_str!("prelude.mesh");
 
 fn run_startup_files(
     options: &StartupOptions,
@@ -10656,7 +10654,6 @@ fn set_title_builtin(args: &[String], shell: &mut Shell) -> Step {
     if let Some(clear) = title_sequence(term.as_deref(), "") {
         shell.owe_clear(TitleSink::Terminal, clear);
     }
-    shell.title_owned_by_caller = true;
     Step::Continue(0)
 }
 
@@ -10894,45 +10891,6 @@ fn report_cwd(enabled: bool) {
 /// the edge. Cutting it here keeps the decision with the shell.
 const TITLE_LIMIT: usize = 96;
 
-/// Set the window and tab title, per `DESIGN.md` "terminal control".
-///
-/// Automatic: at the prompt it says where the shell is, and while a command runs
-/// it says what is running, which is what makes a row of tabs readable at a
-/// glance. `enabled` is [`decoration`] with [`Opt::OscTitle`]; failure to write is
-/// ignored for the same reason as [`semantic_mark`].
-///
-/// **Returns the sequence that clears what it wrote**, for the caller to record
-/// on the [`Shell`] as the debt — `None` when nothing was written, which is a
-/// terminal with no title to set (`$env.TERM` off the allowlist) or the setting
-/// off. Handing back the clear rather than a bool is what keeps a title and its
-/// clear in one dialect; see [`Shell::title_clear`].
-fn set_title(enabled: bool, text: &str) -> Option<(TitleSink, String)> {
-    // Stdout has to *be* the terminal, not merely belong to a session that owns
-    // one. `decoration` answers the second — `owns_terminal` is a session flag —
-    // and a session that redirects stdout for good would otherwise have its
-    // automatic titles written into the file: escape bytes in someone's log, and
-    // a cleanup debt recorded against a sink the terminal never saw, displacing
-    // one that `title` had correctly recorded against `/dev/tty`. Asking the
-    // descriptor is the only question that separates the two. Raised in review
-    // on #452.
-    if !enabled || !stdout_is_terminal() {
-        return None;
-    }
-    let term = session_term();
-    let sequence = title_sequence(term.as_deref(), text)?;
-    let clear = title_sequence(term.as_deref(), "")?;
-    // The sink before the write, not after: a title written without a recorded
-    // debt is one nothing can undo. `written_on_stdout` has its own way to fail —
-    // `ttyname_r` may have no name to give for fd 1 even where the write would
-    // have landed — so resolving it first is what makes that cost a title rather
-    // than the window. Raised in review on #452, when the sink was a duplicated
-    // descriptor and a full descriptor table was the failure; the mechanism is a
-    // path now, and the ordering matters for the same reason.
-    let sink = TitleSink::written_on_stdout()?;
-    write_stdout(&sequence);
-    Some((sink, clear))
-}
-
 /// Is the shell's own stdout a terminal *now*?
 ///
 /// Read per write rather than cached: unlike `$env.TERM`, which describes a
@@ -11050,19 +11008,6 @@ fn report_failed_write(label: &str, out: &mut impl io::Write, sequence: &str) ->
             false
         }
     }
-}
-
-/// Write a terminal sequence on the shell's own stdout, which the interactive
-/// loop owns at every point it decorates from.
-///
-/// Failure is ignored for the same reason as [`semantic_mark`]: a decoration that
-/// could change a command's status would be worse than a missing decoration.
-/// The *clear* on the way out goes through [`report_failed_write`] instead.
-fn write_stdout(sequence: &str) {
-    use std::io::Write as _;
-    let mut out = io::stdout();
-    let _ = out.write_all(sequence.as_bytes());
-    let _ = out.flush();
 }
 
 /// The session's `$env.TERM`, taken once and held.
@@ -11319,48 +11264,6 @@ fn notify_command_done(enabled: bool, command: &str, status: u8, elapsed: Durati
     let mut out = io::stdout();
     let _ = out.write_all(sequence.as_bytes());
     let _ = out.flush();
-}
-
-/// What the title says at the prompt: `user@host: directory`, the form a terminal
-/// window has carried since `xterm` — the shell is idle, so the useful thing to
-/// say is where it is idle. `$HOME` shortens to `~`, as in a prompt.
-///
-/// Assembled from parameters rather than read from the environment so it is
-/// testable without one.
-fn prompt_title(user: &str, host: &[u8], cwd: &Path, home: Option<&Path>) -> String {
-    let mut title = String::new();
-    if !user.is_empty() {
-        title.push_str(user);
-    }
-    if !host.is_empty() {
-        if !title.is_empty() {
-            title.push('@');
-        }
-        title.push_str(&String::from_utf8_lossy(host));
-    }
-    if !title.is_empty() {
-        title.push_str(": ");
-    }
-    title.push_str(&crate::expand::abbreviated_home(cwd, home));
-    title
-}
-
-/// The title while a command runs: the command line itself, so a tab says what it
-/// is busy with. Where the shell is is *already* on screen in the scrollback above
-/// it; what is running may not be, once the output scrolls.
-fn running_title(command: &str) -> String {
-    command.trim().to_owned()
-}
-
-/// The prompt title, read from the environment. `$env.USER` is consulted for the
-/// user name because that is the name the session was opened under; `getpwuid`
-/// would answer with the account behind a `sudo -u`, which is not what a title is
-/// reporting.
-fn environment_prompt_title() -> String {
-    let user = std::env::var("USER").unwrap_or_default();
-    let cwd = std::env::current_dir().unwrap_or_default();
-    let home = std::env::var_os("HOME").map(PathBuf::from);
-    prompt_title(&user, &crate::url::hostname(), &cwd, home.as_deref())
 }
 
 /// Run `jobdone` for every job reported since the last drain, oldest first.
@@ -13958,21 +13861,6 @@ fn run_interactive(options: &StartupOptions) -> ExitCode {
             // a fresh command: a continuation line is the same command line still
             // being typed, and the shell cannot have moved between the two.
             report_cwd(decoration(&shell.vars, Opt::CwdReport));
-            // Unless something has named the window itself, in which case the
-            // window is theirs from then on — see [`Shell::title_owned_by_caller`].
-            // Standing aside rather than moving this write above the hooks, which
-            // would title the directory a `preprompt` handler had just left.
-            if !shell.title_owned_by_caller
-                && let Some(clear) = set_title(
-                    decoration(&shell.vars, Opt::OscTitle),
-                    &environment_prompt_title(),
-                )
-            {
-                // Replaced only on a write. Assigning unconditionally would drop
-                // the debt the moment the setting went off, and the clear is owed
-                // from when it was on.
-                shell.owe_clear(clear.0, clear.1);
-            }
         }
         *completion.write().expect("completion state poisoned") =
             CompletionState::from_shell(&shell);
@@ -15003,29 +14891,6 @@ fn handle_signal(
                 return Some(run_line(&text, last, false, shell));
             }
             let marks = decoration(&shell.vars, Opt::ShellIntegration);
-            // Before `C`, since a title is not output: it belongs outside the
-            // region a terminal will offer to fold, next to the submission that
-            // caused it. The prompt's title comes back at the next prompt, so a
-            // command's title lasts exactly as long as the command.
-            //
-            // Gated on ownership for the same reason the prompt's title is, and
-            // it is the *worse* of the two to miss: the prompt's write is the one
-            // that would put the window back, so a running title written over a
-            // caller's would then never be replaced — `title CUSTOM; sleep 10`
-            // would leave the window reading `sleep 10` for good. Raised in
-            // review on #452.
-            //
-            // Still on `interactive()` rather than a setting of its own:
-            // `$sh.options.osc-title` is the next change, not this one.
-            if !shell.title_owned_by_caller
-                && let Some(clear) = set_title(
-                    decoration(&shell.vars, Opt::OscTitle),
-                    &running_title(&command),
-                )
-            {
-                // Replaced only on a write, as at the prompt above.
-                shell.owe_clear(clear.0, clear.1);
-            }
             // `E` first, so a terminal knows what is about to run before any of
             // its output arrives — the order VS Code's own integrations use.
             // Nothing is written for `OSC 133`, which has no such sequence.
@@ -15419,9 +15284,9 @@ mod tests {
         expansion_word, external_stage, func_definition_is_open, handle_signal, help_completions,
         history_designators, history_path_from, input_highlighter, interactive_keybindings,
         interruptible_task, last_argument, mark_sequence, needs_more_input, open_history,
-        path_completions_sync, persist_logical_history, prepare_history_path, prompt_title,
-        run_hooks, run_line, run_source, running_title, segment_completions, title_sequence,
-        title_text, variable_completions, vscode_escaped,
+        path_completions_sync, persist_logical_history, prepare_history_path, run_hooks, run_line,
+        run_source, segment_completions, title_sequence, title_text, variable_completions,
+        vscode_escaped,
     };
 
     /// The sink names the terminal a title was written to.
@@ -15599,7 +15464,7 @@ mod tests {
     use std::ffi::OsStr;
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
-    use std::path::{Path, PathBuf};
+    use std::path::PathBuf;
     use std::sync::Arc;
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -17951,60 +17816,6 @@ mod tests {
         // notification.
         assert_eq!(words(3600), "1h0m");
         assert_eq!(words(7505), "2h5m");
-    }
-
-    #[test]
-    fn the_prompt_title_says_who_and_where() {
-        let home = PathBuf::from("/home/mikel");
-        assert_eq!(
-            prompt_title(
-                "mikel",
-                b"vm",
-                &PathBuf::from("/home/mikel/src"),
-                Some(&home)
-            ),
-            "mikel@vm: ~/src"
-        );
-        // `$HOME` itself, rather than `~/`.
-        assert_eq!(
-            prompt_title("mikel", b"vm", &home, Some(&home)),
-            "mikel@vm: ~"
-        );
-        // Whole components only: `/home/mikelward` is not `~ward`.
-        assert_eq!(
-            prompt_title(
-                "mikel",
-                b"vm",
-                &PathBuf::from("/home/mikelward"),
-                Some(&home)
-            ),
-            "mikel@vm: /home/mikelward"
-        );
-        // A missing piece drops out with its separator rather than leaving `@` or
-        // `: ` hanging — a title is read at a glance, and `@vm: ~` reads as a
-        // truncation while `vm: ~` reads as a fact.
-        assert_eq!(
-            prompt_title("", b"vm", &PathBuf::from("/tmp"), None),
-            "vm: /tmp"
-        );
-        assert_eq!(
-            prompt_title("mikel", b"", &PathBuf::from("/tmp"), None),
-            "mikel: /tmp"
-        );
-        assert_eq!(prompt_title("", b"", &PathBuf::from("/tmp"), None), "/tmp");
-        // `$HOME=/` would make every path `~`-prefixed, so it is left alone.
-        assert_eq!(
-            prompt_title("", b"", &PathBuf::from("/tmp"), Some(Path::new("/"))),
-            "/tmp"
-        );
-    }
-
-    #[test]
-    fn the_running_title_is_the_command() {
-        assert_eq!(running_title("  cargo test  "), "cargo test");
-        // A multi-line command keeps both lines; `title_text` is what flattens
-        // them, so the two responsibilities stay separable.
-        assert_eq!(running_title("puts one\nputs two"), "puts one\nputs two");
     }
 
     #[test]
