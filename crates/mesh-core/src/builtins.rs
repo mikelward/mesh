@@ -9,7 +9,7 @@ use std::ffi::{OsStr, OsString};
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::os::unix::ffi::OsStrExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::vars::{Decoration, NEST_INDENT, Value};
 
@@ -22,7 +22,13 @@ use crate::vars::{Decoration, NEST_INDENT, Value};
 /// command you type would be wrong anyway, so there is nothing to keep in step.
 const TABLE: &[(&str, &str)] = &[
     ("cd [DIR]", "Change the working directory"),
-    ("pwd", "Print the working directory"),
+    // Two spellings, like `gets`: the command prints the path and the call yields
+    // it, so a prompt segment can say `style(pwd(), fg: blue)` without forking a
+    // `$(pwd)` to get the same string.
+    (
+        "pwd · pwd()",
+        "Print the working directory, or yield it as a value",
+    ),
     ("puts [ARG ...]", "Render the arguments, then a newline"),
     ("print [ARG ...]", "As `puts`, with no trailing newline"),
     // Two spellings on one line — the only builtin with both, and `·` is what the
@@ -651,7 +657,7 @@ pub(crate) fn is_literal(name: &str) -> bool {
 /// The list exists so nothing has to ask "is this a call?" twice and get two
 /// answers — `gets():capture` must record the *call*, not run the command form and
 /// discard the line it read.
-const CALLABLE_BUILTINS: &[&str] = &["gets", "status"];
+const CALLABLE_BUILTINS: &[&str] = &["gets", "status", "pwd"];
 
 /// Does `name` name a builtin with a value-call spelling? See [`CALLABLE_BUILTINS`].
 pub(crate) fn is_callable_builtin(name: &str) -> bool {
@@ -1010,18 +1016,29 @@ pub(crate) fn write_stdout(label: &str, bytes: &[u8]) -> u8 {
     }
 }
 
-/// `pwd` — print the current working directory (physical `getcwd`).
+/// The working directory **both** `pwd` spellings report.
 ///
-/// M0-level: no `-L`/`-P` flags and no logical-cwd tracking yet.
+/// One reader so the command and the call cannot come to disagree about what the
+/// cwd is, or about how a failure reads. Physical `getcwd` for now: the
+/// shell-owned logical cwd of `DESIGN.md` §"Built-ins" — maintained by `cd` and
+/// validated against a stale or forged `$env.PWD` — is not built yet, and when it
+/// lands it lands here, for both spellings at once.
+pub(crate) fn working_directory() -> Result<PathBuf, String> {
+    env::current_dir().map_err(|err| err.to_string())
+}
+
+/// `pwd` — print the current working directory.
+///
+/// M0-level: no `-L`/`-P` flags. The value spelling is `pwd()`, in `repl.rs`.
 fn pwd(args: &[String]) -> u8 {
     if !args.is_empty() {
         note!("mesh: pwd: too many arguments");
         return 1;
     }
-    match env::current_dir() {
+    match working_directory() {
         Ok(dir) => write_stdout("pwd", &path_line(dir.as_os_str())),
-        Err(err) => {
-            note!("mesh: pwd: {err}");
+        Err(message) => {
+            note!("mesh: pwd: {message}");
             1
         }
     }

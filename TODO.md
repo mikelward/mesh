@@ -1834,6 +1834,22 @@ all under "Beyond M3 — External tool integration".
 
 ## Beyond M3 — Navigation
 
+- [x] **`pwd()`, the value spelling** — *landed*. `pwd` printed and nothing else,
+      so everything that wanted the cwd as a **value** went through `$(pwd)`: a
+      fork, a pipe, and a trailing-newline trim to read a string the shell was
+      holding all along — on the prompt path, which is exactly where
+      `docs/PROMPT.md` counts forks. The call yields it instead, so `here = pwd()`,
+      `pwd():base` and `style(pwd(), fg: blue)` compose, and the prompt / title
+      examples in `REFERENCE.md`, `TOUR.md` and `HOOKS.md` no longer fork once a
+      prompt to ask where they are.
+
+      Both spellings read one function (`builtins::working_directory`), so they
+      cannot drift apart about what the cwd is, and the shell-owned **logical**
+      cwd lands there for both when it lands — `--physical` waits for it, since
+      there is nothing to be physical *about* until then. A non-UTF-8 directory
+      name arrives lossily in the call and byte-exact from the command form: a
+      mesh string is UTF-8, the same boundary `precd` / `postcd` already hand a
+      path across.
 - [x] **`CDPATH` search in `cd`** — *landed*. A plain relative operand is looked
       for in each `$env.CDPATH` entry in order, first hit wins; a miss falls back
       to the current directory, so setting it never breaks a plain `cd subdir`.

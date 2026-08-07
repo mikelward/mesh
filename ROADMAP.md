@@ -62,8 +62,10 @@ the placeholder tokenizer with the first real slice of the mesh lexer.
   binary is a thin `main` (enables direct unit tests of the lexer).
 - `&&` / `||` sequencing and `;` ✅ landed — the smallest useful control flow.
 - `cd`/`pwd`/`puts` builtins ✅ landed — basic `cd` (`$HOME`, `cd -`, updates
-  `$env.PWD`/`OLDPWD`); `CDPATH` search landed later. Remaining for `cd`:
-  `--physical`, autocd, logical cwd.
+  `$env.PWD`/`OLDPWD`); `CDPATH` search landed later, as did `pwd()`, the value
+  spelling that yields the path instead of printing it. Remaining for `cd`:
+  `--physical`, autocd, logical cwd — and `pwd` reports that logical cwd, and
+  grows its own `--physical`, when it arrives.
 
 **Acceptance:** edit and recall lines interactively; `echo "a b"` passes one
 argument; `false || echo ok` prints `ok`.

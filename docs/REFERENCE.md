@@ -1032,7 +1032,7 @@ argument by hand, and repeating it walks back through earlier commands.
 | `link(text, url)` | A [styled value](#styled-values) carrying an `OSC 8` hyperlink, so `text` is clickable. The url needs a **scheme** (`https://…`, `file://host/path`) and anything RFC 3986 forbids raw is percent-encoded, a space included; over 2083 encoded bytes is refused, since past a terminal's own limit the whole sequence — link text included — is dropped. |
 | `glob(pattern)` · `files(dir = ".")` · `dirs(dir = ".")` | The paths a pattern matches, and a directory's immediate files or subdirectories — a **list**, since these are [value calls](#the-glob-family) rather than commands. |
 | `cd [dir]` | Change directory. No argument goes to `$env.HOME`; `cd -` returns to the previous directory and prints it. A plain relative name is searched in [`$env.CDPATH`](#cdpath). Updates `$env.PWD` and `$env.OLDPWD`, and runs the [`precd` / `postcd` hooks](#custom-prompts-and-hooks) around the move. Autocd is not implemented, so a bare directory name is a command, not a `cd`. |
-| `pwd` | Print the working directory. |
+| `pwd` · `pwd()` | The working directory. The command **prints** it; the [value call](#functions) **yields** it as a string and writes nothing, so the path composes — `here = pwd()`, `pwd():base`, `style(pwd(), fg: blue)`. `$(pwd)` answers the same question by forking a capture and trimming the newline off what came back; the call hands over the string the shell was already holding, which is what puts it on the prompt path. Neither spelling takes an argument, `--physical` included: mesh does not track a logical cwd yet, so both report `getcwd` and there is nothing to be physical *about*. A directory name that is not valid UTF-8 is printed byte-for-byte by the command and arrives **lossily** in the call, since a mesh string is UTF-8 — print it when the bytes matter. |
 | `clip [text …]` | Copy to the terminal's clipboard with `OSC 52`, so it works over `ssh`. Arguments join with a space; with none, stdin is read (`puts hi \| clip`). The bytes are copied as given, a trailing newline included. Goes to the terminal, not stdout, so a redirect cannot swallow it. Whether the copy lands is up to the terminal — xterm needs `allowWindowOps`, tmux `set-clipboard on` — and there is no reply, so success means "asked". |
 | `notify [text …]` | Raise a desktop notification through the terminal with `OSC 9`. Arguments or stdin, like `clip`. A command that runs for more than ten seconds notifies on its own, with its outcome and duration — `$sh.options.command-notify = false` turns that off. Inside tmux the sequence is wrapped for passthrough, which tmux forwards only with `allow-passthrough` set. Support is uneven and unreportable — iTerm2, WezTerm, Ghostty, kitty and ConEmu raise these; xterm and Alacritty discard them; tmux needs `allow-passthrough` — so success means "asked". |
 | `status code` · `status(code)` | A [**status value**](#exit-status) — how a command went — from a code between `0` and `255`. Out of range is refused rather than truncated, and so is a code that is not an integer: both spellings read the operand as a *value*, so `code = "5"; status $code` is refused exactly as `status($code)` is. The call is the constructor (`file-not-found = status(5)`), and the command form leaves the same value as the statement's result, which is what a `match` arm writes: `x = match $kind { missing => { status 5 } }`. `status(0)` is legal where `fail 0` is not: naming a zero status is reasonable, while a `fail` that succeeds is a mistake. It writes nothing and answers with a value, so — like `return` — it is refused in a pipeline, under a redirection, and in the background, where that value would be discarded. |
@@ -1545,7 +1545,7 @@ prompt. This example includes the current directory:
 
 ```mesh
 func refresh-prompt() {
-  prompt "$(pwd)> "
+  prompt "${pwd()}> "
 }
 on preprompt cwd refresh-prompt
 ```
@@ -1556,7 +1556,7 @@ directory, and current Git branch before a minimal `> ` input prompt:
 ```mesh
 func prompt-context() {
   host = $sh.host
-  dir = $(pwd)
+  dir = pwd()
   branch = $(sh -c 'git branch --show-current 2>/dev/null || true')
 
   if $branch == "" {
@@ -1591,7 +1591,7 @@ no format string to learn. A title and a prompt that should agree share a
 function, not a syntax:
 
 ```mesh
-func where-i-am() { "${sh.host}:$(pwd)" }
+func where-i-am() { "${sh.host}:${pwd()}" }
 
 func title-idle()      { title "${where-i-am()}" }
 func title-busy(cmd)   { title "$cmd — ${where-i-am()}" }
@@ -4128,9 +4128,12 @@ The same is true of a builtin (`puts hi | tr a-z A-Z`, `puts hi &`).
     nonzero exit is data: `false():capture` reports `.status` 1 rather than
     failing.
 
-    Builtins are commands here as well: `puts(x):capture` runs the builtin, not a
-    program named `puts`, and `pwd():capture` does not reach `/bin/pwd`. `exit`
-    still leaves the shell rather than reporting a status into a record.
+    Builtins are commands here as well: `puts(x):capture` runs the builtin rather
+    than a program named `puts`. A builtin with a **value spelling** captures as
+    that call instead, so `pwd():capture` holds the path in `.value` with `.out`
+    empty — which is the `/bin/pwd` question from the other side, since an exec
+    would have put the path in `.out` and a status in `.value`. `exit` still
+    leaves the shell rather than reporting a status into a record.
   - **A background job the call starts holds the record open.** It inherits the
     capture's pipes as its own stdout and stderr, so the capture waits until it
     lets go — the same thing bash's command substitution does, and mesh's own
