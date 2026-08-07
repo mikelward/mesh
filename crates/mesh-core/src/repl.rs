@@ -1233,6 +1233,15 @@ fn bump_shlvl() {
     }
 }
 
+/// mesh's shipped defaults, written in mesh — see `prelude.mesh`.
+///
+/// Compiled in rather than installed as a file, so the binary is always
+/// self-consistent and a missing or version-skewed copy cannot fail a shell at
+/// startup. The text stays readable, which is the point of shipping it as source
+/// at all: the defaults are ordinary functions a user can print and replace,
+/// rather than Rust that a hook merely outranks.
+const PRELUDE: &str = include_str!("prelude.mesh");
+
 fn run_startup_files(
     options: &StartupOptions,
     interactive: bool,
@@ -1243,6 +1252,18 @@ fn run_startup_files(
     // depth rather than the parent shell's.
     if interactive {
         bump_shlvl();
+    }
+    // The shipped defaults, ahead of anything of the user's, so a startup file
+    // replaces a handler simply by registering over it — see `prelude.mesh`.
+    // Interactive only: everything it registers fires from the interactive loops,
+    // and a script should not pay to parse it. A failure here is mesh's own bug
+    // rather than the user's, so it is reported and the session continues; the
+    // shell is still usable without a window title.
+    if interactive
+        && let flow @ (Step::Exit(_) | Step::Return(..)) =
+            run_sourced_text(PRELUDE, Path::new("<prelude>"), last, shell)
+    {
+        return flow;
     }
     // The first file that broke. Kept across the rest of the sequence for the same
     // reason a single file keeps it across its own statements: the startup set's
