@@ -443,13 +443,12 @@ parser can no longer hold the whole list and cannot tell a typo from a name decl
 elsewhere; `:latest` is diagnosed when the line runs rather than when it is read. The
 *grammar* reservation below is untouched — `ubuntu:latest` is still a modifier
 position and never text — and the escapes above are still the escapes. That move is
-**shipped**: the parser's gate on `MODIFIER_NAMES` is open for a value subject and
-for the `:name` reference alike, and `parser::unknown_modifier_message` carries the
-wording to its new site. The [regex literal](#operators-and-matching) below is the
-one gate still standing.
+**shipped**: the parser's gate on `MODIFIER_NAMES` is open for a value subject, for
+the `:name` reference, and for the regex-literal suffix alike, and
+`parser::unknown_modifier_message` carries the wording to its new site.
 
 **The flag suffix on a [regex literal](#operators-and-matching) is opened with the
-rest** *(decided)*, because a regex flag **is** a modifier — one whose subject is a
+rest** *(shipped)*, because a regex flag **is** a modifier — one whose subject is a
 pattern and whose result is a pattern. That was already the settled reading
 ([Tests and comparisons](#tests-and-comparisons)), and the shipped vocabulary already
 agrees: `i`, `ignorecase`, `m`, `multiline`, `s`, `dotall`, `x` and `extended` are all
@@ -491,10 +490,10 @@ flag needs a pattern subject, and a string is not one.
 once, in extended mode, rather than compiled and then modified — which is what
 [`re()`](#tests-and-comparisons) already says, and why `re($x, extended: true)` exists.
 Making the suffix an ordinary postfix chain does not change that; it constrains *when*
-the literal compiles, not what the grammar reads. Today it compiles eagerly
-(`repl.rs`, `E::Regex` calls `compile_regex` before any postfix runs), and the contract
-is unmet in the shipped build — `/foo#(/:x` reports `invalid regex` — so this is a bug
-to fix alongside, not a behavior to preserve.
+the literal compiles, not what the grammar reads. It used to compile eagerly, before
+any postfix ran, and the contract was unmet — `/foo#(/:x` reported `invalid regex` —
+which was a bug to fix alongside rather than a behavior to preserve. `Expr::Regex` now
+carries the flag, so the literal is built with it.
 
 What folds is the **leading run** of flags, and it closes at the first modifier that is
 not one — because that is exactly how far the text still belongs to the literal. Past

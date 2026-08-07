@@ -331,13 +331,6 @@ pub enum ParseErrorKind {
     /// message names both, and it keeps this the loud error it was before value
     /// arguments existed rather than three arguments where one was written.
     GluedValueArgument,
-    /// A chain link on a `/…/` literal that names no regex flag *and* no
-    /// modifier — `/a/:g`. Its own variant because
-    /// [`unknown_modifier_message`]'s help is the wrong help here: it never
-    /// mentions flags, and its quote-the-word advice would turn the pattern into
-    /// text. A link that is a real modifier (`/a/:upper`) is not this error — the
-    /// literal reading declines and the string one stands, exactly as before.
-    UnknownRegexFlag(String),
     /// A modifier given an **argument list** inside a `$…` interpolation —
     /// `"$env:get(HOME, none)"`. Its own variant because the reader wrote
     /// something that has a working spelling rather than something mesh cannot
@@ -430,12 +423,6 @@ impl std::fmt::Display for ParseError {
             ParseErrorKind::TooDeep => write!(
                 f,
                 "syntax error: nested too deeply; mesh parses at most {MAX_DEPTH} levels"
-            ),
-            ParseErrorKind::UnknownRegexFlag(name) => write!(
-                f,
-                "syntax error: `:{name}` is not a regex flag; a `/…/` literal takes \
-                 `:i`/`:ignorecase`, `:m`/`:multiline`, `:s`/`:dotall`, or \
-                 `:x`/`:extended`"
             ),
             ParseErrorKind::InterpolatedModifierArguments(name) => write!(
                 f,
@@ -1067,7 +1054,20 @@ pub enum MatchPattern {
 pub enum Expr {
     Scalar(Spanned<Word>),
     /// A context-sensitive `/.../` literal in a match operand.
-    Regex(String),
+    ///
+    /// `extended` records whether the **leading run** of flags after the closer
+    /// held `:x` / `:extended`. That one flag decides whether the pattern text is
+    /// *valid* — `#` becomes a comment introducer under it — so it has to be part
+    /// of constructing the literal rather than applied to a finished one, which is
+    /// what `re($x, extended: true)` exists for on the constructor side. The run
+    /// closes at the first link that is not a flag, because that is how far the
+    /// text still belongs to the literal (`DESIGN.md` §"Modifiers"). The flags
+    /// themselves stay in the chain and are applied again by the postfix loop;
+    /// setting one twice is the same as setting it once.
+    Regex {
+        pattern: String,
+        extended: bool,
+    },
     /// A bare whole-string glob in a match operand.
     Glob(String),
     Variable(Spanned<String>),
@@ -2651,7 +2651,14 @@ fn match_operand(expression: Expr) -> Expr {
                     }
                     source.push_str(text);
                 }
-                Expr::Regex(source[1..source.len() - 1].to_owned())
+                Expr::Regex {
+                    pattern: source[1..source.len() - 1].to_owned(),
+                    // A literal that tokenized as one word carries no chain here:
+                    // any `:name` after it is a separate token, so
+                    // [`became_regex`] meets it as a wrapping `Expr::Modifier` and
+                    // the flag is applied by the postfix loop like any other.
+                    extended: false,
+                }
             } else if pieces.iter().all(|piece| {
                 matches!(
                     piece,
@@ -2694,17 +2701,14 @@ fn regex_slot_operand(expression: Expr) -> Expr {
 /// would restore the original word and leave `:i` to be applied to a string.
 fn became_regex(expression: &Expr) -> bool {
     match expression {
-        Expr::Regex(_) => true,
-        // Only through a **regex flag**. Any other modifier means the chain was
-        // never a flagged literal but an ordinary string expression that happens
-        // to start with a slash word: `/a/:upper` is the string `/A/` everywhere
-        // else, and reading it as a regex here would both change its meaning and
-        // fail, since `:upper` is not a flag.
-        Expr::Modifier {
-            value,
-            name,
-            arguments: None,
-        } => regex_flag(name) && became_regex(value),
+        Expr::Regex { .. } => true,
+        // Through **any** modifier, not only a flag. Shape decides and vocabulary
+        // does not: `/a/` in a match slot is a pattern, and `:name` after it is an
+        // ordinary chain on that pattern whatever the name turns out to be. This
+        // used to ask `regex_flag`, which made a name the parser knew back out of
+        // the regex reading and take the string one — the corner that let
+        // `"/A/":replaceall(/a/:upper, X)` mean the string `/A/`.
+        Expr::Modifier { value, .. } => became_regex(value),
         _ => false,
     }
 }
@@ -5939,20 +5943,29 @@ impl Parser<'_> {
                 span: start..close + 1,
             });
         }
-        // A chain hanging off the closer keeps this a literal only if every link
-        // is a regex **flag**. `/a/:upper` is the ordinary string `/A/`
-        // everywhere else, and reading it as a regex here would both change what
-        // it means and fail, since `:upper` is not a flag — the rule
-        // [`became_regex`] already applies to a literal that tokenized as one
-        // word, asked here of one that did not.
+        // A `/…/` in a match slot is a pattern **value**, and a `:name` after it is
+        // the ordinary postfix chain on that pattern — resolved when it runs, like
+        // every other chain. Shape decides and vocabulary does not, so this no
+        // longer asks whether each link is a flag in order to *keep* the literal
+        // reading; nothing can make it back out.
+        //
+        // What the scan is still for is **construction**. `:x` decides whether the
+        // pattern text is valid, so a leading run of flags holding it has to reach
+        // the literal before it compiles rather than be applied to a finished one
+        // (`DESIGN.md` §"Modifiers"). The run closes at the first link that is not
+        // a flag, because that is how far the text still belongs to the literal:
+        // `/foo#(/:x` compiles in extended mode, `/foo#(/:foo:x` fails the way
+        // `re("foo#(")` fails, and `/foo#(/:x:foo` is the fix.
+        //
         // A link counts only when it is **attached** — the `:` abutting what it
-        // follows and the name abutting the `:` — because that is what the
-        // postfix chain that consumes it requires. This scan only *looks*: a
-        // detached `:g` is not a chain link but the next token of the
-        // statement, so the chain simply ends and the statement grammar has
-        // its ordinary say about the leftover.
+        // follows and the name abutting the `:` — because that is what the postfix
+        // chain that consumes it requires. This scan only *looks*: a detached `:g`
+        // is not a chain link but the next token of the statement, and the flags it
+        // does read stay in the chain to be applied again, which for a flag is the
+        // same as applying it once.
         let mut ahead = 0;
         let mut chain_end = close + 1;
+        let mut extended = false;
         while let Some(colon) = self.tokens.get(self.position + ahead)
             && matches!(colon.value, TokenKind::Colon)
             && colon.span.start == chain_end
@@ -5963,29 +5976,14 @@ impl Parser<'_> {
                 .is_some_and(|token| token.span.start == colon.span.end);
             match self.word_text_at(ahead + 1).filter(|_| attached) {
                 Some(name) if regex_flag(name) => {
+                    extended |= matches!(name, "x" | "extended");
                     chain_end = self.tokens[self.position + ahead + 1].span.end;
                     ahead += 2;
                 }
-                // A link that is no modifier *either* has no reading left: the
-                // string path this would decline to can only say "not a
-                // modifier", which never mentions flags and suggests quoting —
-                // the one fix that changes what the pattern means. Report it
-                // here, where the flag vocabulary is the answer.
-                Some(name) if !modifier_name(name) => {
-                    let span = self.tokens[self.position + ahead].span.start
-                        ..self.tokens[self.position + ahead + 1].span.end;
-                    return Err(ParseError {
-                        kind: ParseErrorKind::UnknownRegexFlag(name.to_string()),
-                        span,
-                    });
-                }
-                _ => {
-                    self.position = saved;
-                    return Ok(None);
-                }
+                _ => break,
             }
         }
-        Ok(Some(Expr::Regex(pattern)))
+        Ok(Some(Expr::Regex { pattern, extended }))
     }
 
     fn primary_inner(&mut self) -> Result<Expr, ParseError> {
@@ -6693,15 +6691,6 @@ impl Parser<'_> {
             {
                 self.chaining_error_claims_statement(saved)
             }
-            // An unknown regex flag claims the statement outright, with no
-            // operand guard: the error only fires on an *attached* `:name`
-            // naming no modifier, and that same attached token fails every
-            // command reading of the text as `UnknownModifier` — whose
-            // quoting advice is the misleading help this error exists to
-            // replace. Unlike a chaining error, there is no valid command
-            // line to hand back to, only a worse diagnostic for the same
-            // fault.
-            Err(error) if matches!(error.kind, ParseErrorKind::UnknownRegexFlag(_)) => true,
             // A keyword function reference claims it for the same reason, and needs
             // to: the command reading of `&if` is a backgrounding `&` with nothing
             // in front of it, so handing the text back reports `empty command in a
@@ -7632,6 +7621,21 @@ pub fn is_builtin_modifier(name: &str) -> bool {
 /// reserves is unchanged — `:` plus an identifier is a modifier position and
 /// never text — so both escapes the parse-time message named are still the
 /// escapes, and it keeps its wording at the new site.
+/// What a chain link on a **pattern** naming no regex flag is told — `/a/:g`,
+/// `$r:g`.
+///
+/// Distinct from [`unknown_modifier_message`] because that help never mentions
+/// flags, and its quote-the-word advice would turn the pattern into text. Said at
+/// run time now, on better grounds than the parser had: the subject *is* a
+/// pattern there rather than guessed from syntax, and the flag list stays closed
+/// because a built-in modifier name cannot be redeclared.
+pub fn unknown_regex_flag_message(name: &str) -> String {
+    format!(
+        "`:{name}` is not a regex flag; a `/…/` literal takes `:i`/`:ignorecase`, \
+         `:m`/`:multiline`, `:s`/`:dotall`, or `:x`/`:extended`"
+    )
+}
+
 pub fn unknown_modifier_message(name: &str) -> String {
     format!(
         "`:{name}` is not a modifier; quote the whole word to keep it as text \
@@ -8112,48 +8116,42 @@ mod tests {
     }
 
     #[test]
-    fn an_unknown_regex_flag_is_reported_with_the_flag_vocabulary() {
-        // `:g` names no flag and no modifier, so no reading is left — the
-        // string path could only say "not a modifier" and suggest quoting,
-        // the one fix that turns the pattern into text. The span points at
-        // the link, past the flags that were fine.
-        let source = "x = abc ~ /a/:i:g";
-        let error = parse(source).unwrap_err();
-        assert_eq!(
-            error.kind,
-            ParseErrorKind::UnknownRegexFlag("g".to_string())
-        );
-        assert_eq!(&source[error.span], ":g");
+    fn a_chain_on_a_regex_literal_is_read_by_its_shape() {
+        // A `/…/` in a match slot is a pattern, and a `:name` after it is the
+        // ordinary postfix chain on that pattern — whatever the name is. `:g`
+        // names no flag and no modifier, and it *parses*: which names apply to a
+        // pattern is a run-time question, where the subject is known to be one
+        // rather than guessed from syntax.
+        for source in [
+            "x = abc ~ /a/:i:g",
+            "x = abc ~ /a/:upper",
+            "abc ~ /a/:i:g",
+            "if abc ~ /a/:g { puts x }",
+        ] {
+            assert!(
+                matches!(parse(source), Ok(ParseOutcome::Complete(_))),
+                "{source}: {:?}",
+                parse(source)
+            );
+        }
 
-        // A link that is a real modifier is not this error: the literal
-        // reading declines and the string one stands, exactly as before.
+        // A leading `:x` reaches the literal, because it decides whether the
+        // pattern text is valid at all — `a_parse_affecting_flag_is_folded_into_the_literal`
+        // in `crates/mesh/tests/cli.rs` pins what that buys.
         assert!(matches!(
-            parse("x = abc ~ /a/:upper"),
+            parse("x = abc ~ /foo#(/:x"),
             Ok(ParseOutcome::Complete(_))
         ));
 
         // A *detached* colon or name is not a chain link at all — the postfix
         // chain that consumes the flags requires abutment — so the spaced
-        // spellings keep the ordinary statement error rather than a flag
-        // report about a slot nobody wrote.
+        // spellings keep the ordinary statement error.
         for spaced in ["x = abc ~ /a/ :g", "x = abc ~ /a/: g", "x = abc ~ /a/:i :g"] {
             let error = parse(spaced).unwrap_err();
             assert_eq!(
                 error.kind,
                 ParseErrorKind::Expected("a statement separator"),
                 "{spaced}"
-            );
-        }
-
-        // The value-vs-command probe does not throw the error away either: the
-        // same attached `:g` fails the command reading too, with the quoting
-        // advice this error exists to replace, so a bare statement and a
-        // condition report the flag error just as the assignment does.
-        for bare in ["abc ~ /a/:i:g", "if abc ~ /a/:g { puts x }"] {
-            let error = parse(bare).unwrap_err();
-            assert!(
-                matches!(error.kind, ParseErrorKind::UnknownRegexFlag(_)),
-                "{bare}"
             );
         }
     }
