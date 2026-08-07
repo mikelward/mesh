@@ -1382,7 +1382,7 @@ with its switch: add an `Opt` variant in `options.rs` and read it through
       silences titles but is not the same question — it is about the terminal,
       not about who is in charge. This applies past titles: any shipped hook will
       raise it.
-- [ ] **Collapse `TitleSink` now that only `title` writes titles.** With the
+- [x] **Collapse `TitleSink` now that only `title` writes titles.** With the
       shipped titles moved into the prelude, every title goes through the `title`
       builtin to `/dev/tty`, so `TitleSink::Written` — the stdout arm — can no
       longer be constructed outside its own tests. That variant and the machinery
