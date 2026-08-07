@@ -138,6 +138,13 @@ apply throughout.
   latest state of the branch — not the scope from when it was opened. Re-read the
   diff against `origin/main` and patch whatever no longer matches; don't wait to
   be told it drifted.
+- **The PR title carries the same prefix as a commit subject** (see *Commit
+  messages*), judged over the whole branch rather than any one commit. A branch
+  that adds a `design:` commit and a bare one is a behavior change overall, so
+  its title goes bare. Re-judge it on every push: a branch can start
+  documentation-only and stop being so with the next commit. The title is there
+  to be read — it is what the PR list shows the repo owner — so the prefix says
+  at a glance whether a PR changes what mesh does.
 - **Link every open PR** in a stack when you push, summarize CI, or invite review
   — one URL per line — since the "View PR" chip sticks to the first link and
   hides the rest (anthropics/claude-code#46625).
@@ -225,9 +232,44 @@ apply throughout.
 ## Commit messages
 
 - Write a clear, plain-English subject in sentence case; keep it short
-  (≤ ~70 chars) and free of internal jargon.
+  (≤ ~70 chars, prefix included) and free of internal jargon.
 - Put the mechanism, the bug fixed, and file:line detail in the body, after a
   blank line — the body is not size-constrained.
+- **Prefix a subject that does not change what mesh does.** A bare subject
+  means the language, the CLI, or the runtime behaves differently after this
+  commit. Anything else takes one of these, lowercase, followed by the
+  sentence-case subject as above:
+
+  | Prefix | For |
+  |---|---|
+  | `design:` | A decision recorded in `docs/DESIGN.md` or `GRAMMAR.md` — designed, not built |
+  | `docs:` | Prose: `README.md`, `DEVELOPMENT.md`, `ROADMAP.md`, the rest of `docs/`, this file |
+  | `todo:` | `TODO.md` bookkeeping on its own |
+  | `test:` | Tests only, with the code under test unchanged |
+  | `build:` | Toolchain, CI, `Makefile`, hooks — nothing the shipped binary does |
+  | `refactor:` | Code that is deliberately behavior-preserving |
+
+- **There is no `feat:` or `fix:`, on purpose.** Those would prefix the
+  majority of commits and leave the log exactly as flat as it is now. The
+  prefix earns its space by marking the exception, so the default stays bare.
+- **The design track is what makes this worth doing.** `ebc2468 Let a user
+  declare a modifier, "func _s:name()"` touched only `docs/DESIGN.md`;
+  `e40a987 Parse a modifier declaration, "func _s:name()"` implemented it in
+  `crates/`. Two adjacent log lines, near-identical subjects, and nothing to
+  say which one shipped. The first should have read `design: …`.
+- **`TODO.md` rides along and never decides the prefix.** It is touched by
+  most commits of every kind, so it counts only when it is the whole change.
+- **A mixed commit goes bare if any part of it changes behavior.** That
+  outranks every prefix in the table.
+- **Below that line the prefix names why the commit exists, not what it
+  touched.** `5335952 Pin an exact Rust release instead of tracking stable`
+  edited the `Makefile`, CI, a hook, `README.md` and `DEVELOPMENT.md`, and it
+  is `build:` — the prose moved because the toolchain did. That is the
+  `TODO.md` rule generalized: whatever changed only to keep the tree
+  consistent with the real change doesn't get a vote, so there is no
+  precedence order among the prefixes to memorize. Two categories that are
+  genuinely independent, neither serving the other, are two commits — see
+  *one commit per logical change*.
 
 ## Language and spelling
 
