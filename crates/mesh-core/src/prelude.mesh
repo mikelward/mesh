@@ -1,0 +1,45 @@
+# mesh's shipped defaults, in mesh.
+#
+# This file is compiled into the binary and run before your own startup files,
+# so everything here is an ordinary function you can read, copy, or replace.
+# Print it with `puts $sh.prelude`.
+#
+# To take over a handler, register your own over it:
+#
+#     func my-title() { title "whatever you like" }
+#     on preprompt title my-title
+#
+# or `unset $sh.preprompt.title` for no title at all. Nothing here is
+# privileged — these are the same hooks your own configuration uses.
+#
+# Keep this small. It is parsed at every interactive shell start.
+
+# The current directory, with `$HOME` written back as `~`.
+func mesh-title-where() {
+    here = $(pwd):tilde
+    $here
+}
+
+# `user@host`, dropping either half when the session cannot name it.
+func mesh-title-who() {
+    user = $env:get("USER", "")
+    host = $sh.host
+    if $user == "" { return $host }
+    if $host == "" { return $user }
+    "$user@$host"
+}
+
+# At the prompt: where the shell is.
+func mesh-title-idle() {
+    who = mesh-title-who()
+    where = mesh-title-where()
+    if $who == "" { title $where } else { title "$who: $where" }
+}
+
+# While a command runs: what is running.
+func mesh-title-busy(command) {
+    title $command
+}
+
+on preprompt title mesh-title-idle
+on preexec title mesh-title-busy
