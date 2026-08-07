@@ -480,6 +480,38 @@ pub(crate) fn path_hits(name: &str) -> Vec<PathBuf> {
         .collect()
 }
 
+/// Does **anything** of this name sit on `PATH`, executable or not — or might
+/// it, where the lookup cannot tell?
+///
+/// [`path_hits`] answers the question `whence` asks — what would *run* — and so
+/// filters to executables. This one answers the question a diagnostic has to ask
+/// before short-circuiting a lookup: whether `execvp` would find a candidate to
+/// try and fail on. A non-executable file of the name is exactly that case, and
+/// it is why the two cannot share a predicate — reporting `command not found`
+/// for a file that is really `permission denied` moves the reader away from the
+/// `chmod` that fixes it.
+///
+/// Only `NotFound` establishes absence. Every other error — `PermissionDenied`
+/// from a `PATH` directory the user cannot search, and anything else `stat` can
+/// fail with — means this lookup *does not know*, and the honest answer is to
+/// let `execvp` try: it holds the same permissions and its `EACCES` is the real
+/// one. Treating an unreadable directory as empty is the same mistake as
+/// treating a non-executable file as absent, one layer down, and it fails the
+/// same way — a short-circuit to `command not found` over a lookup that had a
+/// better answer.
+pub(crate) fn path_entry_exists(name: &str) -> bool {
+    let path = match env::var_os("PATH") {
+        Some(path) => path,
+        None => default_path(),
+    };
+    env::split_paths(&path).any(|directory| {
+        !matches!(
+            fs::metadata(directory.join(name)),
+            Err(ref error) if error.kind() == std::io::ErrorKind::NotFound
+        )
+    })
+}
+
 /// The search path `execvp` uses when `PATH` is unset — the platform's own
 /// answer, `confstr(_CS_PATH)`, rather than a guess: it is `/bin:/usr/bin` on
 /// Linux and `/usr/bin:/bin` on macOS, and the order between them is exactly what

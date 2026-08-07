@@ -9742,8 +9742,43 @@ fn run_expanded(mut argv: Argv, last: u8, shell: &mut Shell) -> Step {
     match builtins::dispatch(words, last) {
         Some(Builtin::Exit(code)) => Step::Exit(code),
         Some(Builtin::Status(code)) => Step::Continue(code),
-        None => Step::Continue(exec::run(words, &mut shell.jobs)),
+        None => {
+            if let Some(note) = callable_variable_note(&words[0], shell) {
+                note!("mesh: command not found: {} ({note})", words[0]);
+                return Step::Continue(127);
+            }
+            Step::Continue(exec::run(words, &mut shell.jobs))
+        }
     }
+}
+
+/// What `command not found` adds when the name **is** bound, to a callable.
+///
+/// `double = func(x) { $x * 2 }` then `double(5)` is one `$` from working, and
+/// `type double` already says so — reporting a bare not-found sends the reader
+/// looking for a program that was never the point. The parens are the tell:
+/// nobody writes `double(5)` meaning a program.
+///
+/// Asked **only when `PATH` holds nothing of the name at all**, which is what
+/// keeps this a diagnostic rather than a resolution rule: a real program keeps
+/// winning over a same-named variable, exactly as it did before, and the note
+/// appears in the one case where the alternative is a dead end. That ordering is
+/// also why this cannot live in [`exec::spawn_error_code`] with the other notes —
+/// those are a pure function of the name, and this one has to read the variables.
+///
+/// The test is [`whence::path_entry_exists`] rather than `path_hits`, and the
+/// difference is load-bearing. `path_hits` filters to *executables*, so a
+/// non-executable file of the name looks like nothing at all to it — and
+/// short-circuiting there turned `permission denied` (126) into `command not
+/// found` (127) for a name that also happened to be a bound callable, sending
+/// the reader away from the `chmod` that fixes it. Anything on `PATH` means
+/// `execvp` has a candidate to fail on, and its answer is the better one.
+fn callable_variable_note(name: &str, shell: &Shell) -> Option<String> {
+    if !matches!(shell.vars.get(name), Some(Value::Function(_))) {
+        return None;
+    }
+    (!whence::path_entry_exists(name))
+        .then(|| format!("`{name}` is a variable holding a function; call it `${name}(…)`"))
 }
 
 /// `cd [DIR]`, with the directory hooks around it: `precd` before the move

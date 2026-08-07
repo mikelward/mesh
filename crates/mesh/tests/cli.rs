@@ -684,6 +684,190 @@ fn a_bash_builtin_with_no_mesh_command_spells_out_the_replacement() {
 }
 
 #[test]
+fn a_variable_holding_a_function_says_so_rather_than_dead_ending() {
+    // `double(5)` with `double` bound to a lambda is one `$` from working, and
+    // `type double` already says so — a bare not-found sends the reader looking
+    // for a program that was never the point. Both spellings reach it.
+    for source in [
+        "double = func(x) { $x * 2 }\ndouble(5)\n",
+        "double = func(x) { $x * 2 }\nx = double(5)\n",
+        "double = func(x) { $x * 2 }\ndouble 5\n",
+    ] {
+        let out = run_with_input(source);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains(
+                "command not found: double (`double` is a variable holding a function; \
+                 call it `$double(…)`)"
+            ),
+            "{source}: {stderr}"
+        );
+    }
+
+    // The miss is `127`, and it reaches a statement the ordinary way. An
+    // assignment is the exception the status decision already makes: a
+    // command-shaped call yields *how it went*, so `x` binds `status(127)` and
+    // the binding itself succeeds — the note is what tells you, not the status.
+    let statement = run_with_input("double = func(x) { $x * 2 }\ndouble(5)\n");
+    assert_eq!(statement.status.code(), Some(127));
+    let bound = run_with_input("double = func(x) { $x * 2 }\nx = double(5)\nputs $x:repr\n");
+    assert_eq!(String::from_utf8_lossy(&bound.stdout), "status(127)\n");
+
+    // The spelling it points at works.
+    let works = run_with_input("double = func(x) { $x * 2 }\nputs $double(5)\n");
+    assert_eq!(String::from_utf8_lossy(&works.stdout), "10\n");
+
+    // It is a diagnostic, not a resolution rule: a real program of the same name
+    // still wins, exactly as before, so this can only ever replace a dead end.
+    // The program is one this test writes, on a `PATH` it controls — asking a
+    // system command to prove it would tie the assertion to whichever `ls` the
+    // platform ships.
+    let dir = fresh_dir("callable_variable_shadowing");
+    let program = dir.join("meshtest-callable");
+    std::fs::write(&program, "#!/bin/sh\necho the program ran\n").expect("write the program");
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755))
+            .expect("make it executable");
+    }
+    let shadowed = mesh_command()
+        .env(
+            "PATH",
+            format!(
+                "{}:{}",
+                dir.display(),
+                std::env::var("PATH").unwrap_or_default()
+            ),
+        )
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .and_then(|mut child| {
+            use std::io::Write;
+            child
+                .stdin
+                .take()
+                .expect("stdin")
+                .write_all(b"meshtest-callable = func() { puts nope }\nmeshtest-callable\n")?;
+            child.wait_with_output()
+        })
+        .expect("run mesh");
+    assert_eq!(
+        String::from_utf8_lossy(&shadowed.stdout),
+        "the program ran\n",
+        "a same-named variable must not shadow the program: {}",
+        String::from_utf8_lossy(&shadowed.stderr)
+    );
+
+    // A variable that is not callable has nothing to suggest.
+    let plain = run_with_input("double = 5\ndouble(5)\n");
+    let stderr = String::from_utf8_lossy(&plain.stderr);
+    assert!(stderr.contains("command not found: double\n"), "{stderr}");
+
+    // A **non-executable** file of the name is not "nothing on PATH": `execvp`
+    // has a candidate to fail on, and `permission denied` is the better answer
+    // because it points at the `chmod`. The note must not short-circuit past it,
+    // which is why the test is "any entry" rather than "any executable entry".
+    let unrunnable = dir.join("meshtestunrunnable");
+    std::fs::write(&unrunnable, "#!/bin/sh\necho ran\n").expect("write it");
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&unrunnable, std::fs::Permissions::from_mode(0o644))
+            .expect("make it unrunnable");
+    }
+    let with_path = format!(
+        "{}:{}",
+        dir.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let denied = |source: &'static str| {
+        mesh_command()
+            .env("PATH", &with_path)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .and_then(|mut child| {
+                use std::io::Write;
+                child
+                    .stdin
+                    .take()
+                    .expect("stdin")
+                    .write_all(source.as_bytes())?;
+                child.wait_with_output()
+            })
+            .expect("run mesh")
+    };
+    // The same answer with and without a same-named callable bound.
+    for source in [
+        "meshtestunrunnable\n",
+        "meshtestunrunnable = func() { puts nope }\nmeshtestunrunnable\n",
+    ] {
+        let out = denied(source);
+        assert_eq!(out.status.code(), Some(126), "{source}");
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains("permission denied: meshtestunrunnable"),
+            "{source}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    // A `PATH` directory the user cannot search is *not* absence either: `stat`
+    // fails with `PermissionDenied`, the lookup cannot tell, and `execvp` — which
+    // holds the same permissions — has the real answer. Root bypasses the search
+    // bit, so where the suite runs privileged there is nothing to observe.
+    if unsafe { libc::geteuid() } == 0 {
+        return;
+    }
+    let blocked = dir.join("blocked");
+    std::fs::create_dir_all(&blocked).expect("create the blocked directory");
+    let inside = blocked.join("meshtestblocked");
+    std::fs::write(&inside, "#!/bin/sh\necho ran\n").expect("write it");
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&inside, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        std::fs::set_permissions(&blocked, std::fs::Permissions::from_mode(0o000))
+            .expect("block the directory");
+    }
+    let blocked_path = format!(
+        "{}:{}",
+        blocked.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let out = mesh_command()
+        .env("PATH", &blocked_path)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .and_then(|mut child| {
+            use std::io::Write;
+            child
+                .stdin
+                .take()
+                .expect("stdin")
+                .write_all(b"meshtestblocked = func() { puts nope }\nmeshtestblocked\n")?;
+            child.wait_with_output()
+        })
+        .expect("run mesh");
+    // Put it back so the directory can be cleaned up — before the assertion, so a
+    // failing assertion still leaves a removable tree. Not discarded: if the
+    // restore fails, the temp tree is unremovable from here on, and a test that
+    // passed while leaking that is worse than one that says so.
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&blocked, std::fs::Permissions::from_mode(0o755))
+            .expect("restore access to the blocked directory");
+    }
+    assert!(
+        !String::from_utf8_lossy(&out.stderr).contains("is a variable holding a function"),
+        "an unsearchable PATH entry is not absence; defer to execvp: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
 fn an_ordinary_missing_command_keeps_the_bare_message() {
     let out = run_with_input("this_command_does_not_exist_42\n");
     let stderr = String::from_utf8_lossy(&out.stderr);
