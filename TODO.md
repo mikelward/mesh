@@ -21,14 +21,6 @@ Delete an entry once you have agreed with it or reversed it.
       N` **spelling** — a literal leading word, not a channel word and not a
       value — but that was asked for rather than guessed, so it is not queued
       here.
-- [ ] **A value call on a name that resolves to nothing now reports `command
-      not found`.** It used to say *a command has no return value*, which was
-      also the message for `double(5)` where `double` is a variable holding a
-      lambda — the `$double(5)` mistake. Command position already answers that
-      way for a bare `double`, so the two spellings now agree, at the cost of a
-      pointer that was only ever accidental. *Reversible:* a diagnostic that
-      notices a same-named function *value* would be an addition, not a
-      reversal.
 - [ ] **`exec` keeps its own process as a pipeline's last stage.** Everything else
       in-shell now runs in the shell there, but `exec` still forks. Running it in
       the shell would spend the *shell* on the replacement, and it buys nothing:
@@ -5800,6 +5792,28 @@ unguarded, alongside fish and elvish, and carries a `TODO:` naming this entry.
       equality does not, whether numeric types compare across (`1 == 1.0`, where
       the document and the implementation disagree), and where `Status` lands
       once those are answered. Whatever equality ends up doing, `match` arms do.
+
+- [ ] **The callable-variable note only reaches an unstaged foreground command.**
+      `double = func(x) { … }; double 5` reports ``command not found: double
+      (`double` is a variable holding a function; call it `$double(…)`)``, but
+      `double 5 > out`, `double 5 | cat` and `double 5 &` still print the bare
+      message: a redirected, piped or backgrounded stage is classified external
+      and runs through `external_stage` / `run_pipeline`, never reaching the
+      check in `run_expanded`'s fallthrough.
+
+      Fixing it means attaching the note to the spawn failure itself rather than
+      to one dispatch path. Every failure converges on
+      `exec::spawn_error_code`, but that is in `exec`, which has no `Shell` — by
+      design, and the other notes there are a pure function of the name. So it
+      needs either a note threaded through `exec::run`, `exec_stage` and
+      `run_pipeline` (the pipeline case per stage), or the same guard repeated at
+      each of the five repl-side dispatch sites. That is dispatch plumbing for a
+      diagnostic, in code the status work has just finished stabilizing, which is
+      why it is filed rather than done.
+
+      Partial coverage is not a correctness bug — the bare message is what every
+      shell gives — so the cost of leaving it is that the same typo is explained
+      in one position and not another.
 
 - [ ] **Consider removing `fail`.** It is a reserved word and a whole control
       path (`parser.rs` `take_word("fail")`, `Expanded::Fail`, `make_fail`) for

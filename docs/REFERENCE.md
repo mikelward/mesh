@@ -605,6 +605,22 @@ mesh$ whence ls
 mesh: command not found: whence (mesh spells this `type`)
 ```
 
+A **bound name** draws one too. `double = func(x) { … }` makes `double` a
+variable, not a command, so `double(5)` is one `$` from working — and the note
+says which, rather than sending you after a program that was never the point:
+
+```text
+mesh$ double = func(x) { $x * 2 }
+mesh$ double(5)
+mesh: command not found: double (`double` is a variable holding a function; call it `$double(…)`)
+mesh$ puts $double(5)
+10
+```
+
+It is a diagnostic and not a resolution rule: it is asked only when nothing on
+`PATH` answers the name, so a real program still wins over a same-named
+variable, and the note can only ever replace a dead end.
+
 The name-lookup command draws four of these — `type`, `what`, `which` and
 `where` all point at [`type`](#type) — because it is the one command every
 shell names differently. `which` and `where` are real externals on many systems,
