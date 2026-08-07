@@ -1311,7 +1311,7 @@ stays perfectly legal — `upper` is not a builtin *command*, and a shipped modi
 no claim on the command namespace. One principle, applied per namespace; adding modifier
 names to the command-side check would break working code.
 
-**An argument reaches a modifier through braces** *(decided)*. Inside `"…"`, an
+**An argument reaches a modifier through braces** *(shipped)*. Inside `"…"`, an
 attached `(` after `:name` is never literal text — it is the modifier's argument list,
 and it always reports, because an unbraced `$…` interpolation cannot pass one. Which
 complaint you get is the modifier's to make: `"$x:upper(foo)"` says **`:upper` does

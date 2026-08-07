@@ -31135,25 +31135,37 @@ fn an_interpolated_modifier_cannot_take_arguments() {
         String::from_utf8_lossy(&out.stderr)
     );
 
-    // Only an **abutting** `(` after a name the vocabulary holds *and takes
-    // arguments* is the shape. After an argument-free modifier a `(` is ordinary
-    // text and always was, which the first line here would have broken: the braced
-    // form the message points at rejects `${$x:upper(foo)}` outright. Raised in
-    // review as a P2. A gap is a separate argument, and a `(` with no `$` in front
-    // of the word never was a chain. (`"$x:nosuch(1)"` is not here: an unknown
-    // modifier is now reported for its *name* before its arguments are reached —
-    // see `a_modifier_chain_survives_punctuation_after_it`.)
+    // An **abutting** `(` is the argument list whatever the name takes, so an
+    // argument-free modifier reports too — it just gets a different complaint,
+    // which is the whole reason the choice moved to where arity is known.
+    // `"$x:upper(foo)"` used to be the text `AB(foo)`, and the parser could only
+    // keep that reading by asking a table a declared modifier is not in.
+    // Bracing advice is given only where bracing is the fix: `${x:upper(foo)}` is
+    // equally wrong, so `:upper` hears what the braced form itself says.
+    let arity = run_with_input("x = ab\nputs \"$x:upper(foo)\"\n");
+    assert_eq!(String::from_utf8_lossy(&arity.stdout), "");
+    assert!(
+        String::from_utf8_lossy(&arity.stderr).contains("modifier :upper does not take arguments"),
+        "{}",
+        String::from_utf8_lossy(&arity.stderr)
+    );
+
+    // Everything around it keeps its reading: a gap is a separate argument, a `(`
+    // with no `$` in front of the word never was a chain, and `"${x:upper}(foo)"`
+    // is the spelling for literal text after a chain. An **unclosed** `(` is not
+    // an argument list either.
     let out = run_with_input(
         "x = ab\n\
-         puts \"$x:upper(foo)\"\n\
          puts \"$x:upper (1)\"\n\
          puts \"a:get(b)\"\n\
          puts \"($x:upper)\"\n\
+         puts \"${x:upper}(foo)\"\n\
+         puts \"$x:upper(foo\"\n\
          puts \"[  a  ]:trimstart\"\n",
     );
     assert_eq!(
         String::from_utf8_lossy(&out.stdout),
-        "AB(foo)\nAB (1)\na:get(b)\n(AB)\n[  a  ]:trimstart\n"
+        "AB (1)\na:get(b)\n(AB)\nAB(foo)\nAB(foo\n[  a  ]:trimstart\n"
     );
     assert!(
         out.status.success(),

@@ -200,12 +200,25 @@ pub enum ModifierStep {
         message: String,
         regex_message: String,
     },
+    /// `:name(…)` written in an **unbraced** interpolation, which cannot carry an
+    /// argument list — so this always reports, and the only question is which
+    /// complaint. That depends on the modifier's *arity*: one that takes no
+    /// arguments hears so, and one that does is pointed at the braced form, since
+    /// bracing advice is only given where bracing is the fix.
+    ///
+    /// `message` is what the built-in vocabulary answers, prepared by the caller.
+    /// A **declared** modifier's arity is the session's to say, so the resolver
+    /// that has `Funcs` replaces it before this is applied (`DESIGN.md`
+    /// §"Modifiers").
+    InterpolatedArguments { name: String, message: String },
 }
 
 impl ModifierStep {
     pub(crate) fn name(&self) -> &str {
         match self {
-            ModifierStep::Apply { name, .. } | ModifierStep::Unavailable { name, .. } => name,
+            ModifierStep::Apply { name, .. }
+            | ModifierStep::Unavailable { name, .. }
+            | ModifierStep::InterpolatedArguments { name, .. } => name,
         }
     }
 
@@ -217,6 +230,9 @@ impl ModifierStep {
     fn regex_message(&self) -> String {
         match self {
             ModifierStep::Unavailable { regex_message, .. } => regex_message.clone(),
+            // The arguments are wrong whatever the subject is, so a pattern hears
+            // the same thing everything else does.
+            ModifierStep::InterpolatedArguments { message, .. } => message.clone(),
             ModifierStep::Apply { name, .. } => {
                 format!("modifier :{name} is not valid for a regex")
             }
@@ -268,6 +284,11 @@ pub(crate) fn apply_modifier_step(
             })
         }
         ModifierStep::Unavailable { message, .. } => {
+            Err(ExpandError::ModifierUnavailable(message.clone()))
+        }
+        // Never applied, only reported. A declared modifier's arity has already
+        // been folded into `message` by the resolver that could ask for it.
+        ModifierStep::InterpolatedArguments { message, .. } => {
             Err(ExpandError::ModifierUnavailable(message.clone()))
         }
     }
