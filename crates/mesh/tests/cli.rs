@@ -24461,6 +24461,46 @@ fn a_value_expression_can_be_a_command_argument() {
     assert!(out.stderr.is_empty(), "{:?}", out.stderr);
 }
 
+/// Two spaced value arguments are **two arguments**, not a call of the first on the
+/// second. The expression parser lets a call's `(` be spaced — `y = f (1)` calls —
+/// but in argument position the spacing is the separator, and reading it as a call
+/// made `puts (a()) (b())` pass `b()`'s value to `a()`'s and hand `puts` one
+/// argument: `call target: value is not callable` where the value was not callable,
+/// and silently wrong output where it was.
+#[test]
+fn spaced_value_arguments_stay_separate_arguments() {
+    let out = run_with_input(
+        "func a() { return A }\n\
+         func b() { return B }\n\
+         puts (a()) (b())\n\
+         puts (1 + 2) (3 + 4)\n\
+         puts (a()) (b()) (a())\n",
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "A B\n3 7\nA B A\n",
+        "{:?}",
+        out.stderr
+    );
+    assert!(out.stderr.is_empty(), "{:?}", out.stderr);
+
+    // Attached, it is the call it always was, and the rule is the argument's own top
+    // level: inside a group the spacing freedom is back.
+    let called = run_with_input(
+        "func a() { return func(x) { \"a got $x\" } }\n\
+         func b() { return B }\n\
+         puts (a())(b())\n\
+         puts ((a()) (b()))\n",
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&called.stdout),
+        "a got B\na got B\n",
+        "{:?}",
+        called.stderr
+    );
+    assert!(called.stderr.is_empty(), "{:?}", called.stderr);
+}
+
 #[test]
 fn a_value_argument_stays_typed_for_a_builtin_and_bytes_for_an_external() {
     // The argument carries the **value**, not its text, so everything the styled and
