@@ -1356,6 +1356,17 @@ with its switch: add an `Opt` variant in `options.rs` and read it through
       error path. A rule with no lifetime cannot be any of those. What it costs is
       that it cannot tell "titles sometimes" from "owns the title", so a session
       with only an `on preexec` handler loses the automatic idle title as well.
+- [ ] **Decide how a user turns hooks off.** Now that the hooks are
+      authoritative, a `title` typed at the prompt lasts only until the next
+      prompt or hook runs — correct for one mechanism, but it leaves no way to
+      say "stop titling, I am naming this window myself" short of knowing to
+      `unset $sh.preprompt.title` and `$sh.preexec.title` by name. Worth deciding
+      what the switch is: per-hook `unset` as today and nothing more, a way to
+      disable a whole event, a session-wide "no hooks" for debugging a startup
+      file, or something on `title` itself. `$sh.options.osc-title = false`
+      silences titles but is not the same question — it is about the terminal,
+      not about who is in charge. This applies past titles: any shipped hook will
+      raise it.
 - [ ] **Collapse `TitleSink` now that only `title` writes titles.** With the
       shipped titles moved into the prelude, every title goes through the `title`
       builtin to `/dev/tty`, so `TitleSink::Written` — the stdout arm — can no
