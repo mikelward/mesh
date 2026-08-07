@@ -25,6 +25,15 @@ pub struct FuncDef {
     /// argument reaches its positionals and `...rest` verbatim and `--help` is
     /// forwarded rather than answered here.
     pub wrapper: bool,
+    /// The **subject** of a modifier declaration — the `_s` of `func _s:foo()`,
+    /// the `..._xs` of `func ..._xs:join(_sep)`. `None` for an ordinary `func`.
+    ///
+    /// Not a positional: it arrives through the call site's `$x:` rather than
+    /// through the parens, which is what lets a list-taking modifier still take
+    /// arguments without colliding with rest-must-be-last. Its kind is the whole
+    /// of the element-wise rule — `Required` receives one element, `Rest` the
+    /// collection (`DESIGN.md` §"Modifiers").
+    pub subject: Option<Param>,
 }
 
 impl FuncDef {
@@ -130,6 +139,16 @@ impl Funcs {
     pub fn define_modifier(&mut self, name: String, def: FuncDef) {
         self.modifiers.insert(name, def);
     }
+
+    /// Look up a declared modifier by name.
+    ///
+    /// Resolved **per application**, never cached at the point a chain is written:
+    /// a later declaration changes what an already-written `$x:foo` runs, exactly
+    /// as redefining a `func` changes what an already-written call runs
+    /// (`DESIGN.md` §"Modifiers").
+    pub fn modifier(&self, name: &str) -> Option<&FuncDef> {
+        self.modifiers.get(name)
+    }
 }
 
 #[cfg(test)]
@@ -147,6 +166,7 @@ mod tests {
             },
             captures: Vec::new(),
             wrapper,
+            subject: None,
         }
     }
 

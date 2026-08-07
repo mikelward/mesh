@@ -32359,6 +32359,402 @@ fn a_builtin_with_no_options_reports_a_flag_rather_than_printing_it() {
     }
 }
 
+/// A declared modifier **runs**, and every spelling of the chain runs the same one.
+///
+/// The agreement is the assertion. `y = $x:foo` reaches the shell's function table
+/// directly while `"$x:foo"` goes through word expansion, and the two answering
+/// differently is the failure this has to avoid (`DESIGN.md` §"Modifiers").
+#[test]
+fn a_declared_modifier_runs_when_it_is_applied() {
+    let out = run_with_input(
+        "func _s:shout() { return \"$_s!\" }\n\
+         x = hi\n\
+         puts $x:shout\n\
+         puts \"$x:shout\"\n\
+         puts \"${x:shout}\"\n\
+         y = $x:shout\n\
+         puts $y\n\
+         puts a\"$x:shout\"b\n",
+    );
+    assert!(
+        out.stderr.is_empty(),
+        "{:?}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "hi!\nhi!\nhi!\nhi!\nahi!b\n"
+    );
+
+    // An argument reaches it the way any call's does, and a chain mixes freely
+    // with the built-ins in either order.
+    let mixed = run_with_input(
+        "func _s:wrap(_c) { return \"$_c$_s$_c\" }\n\
+         x = ab\n\
+         puts $x:wrap(\"*\")\n\
+         puts \"${x:wrap(\"*\")}\"\n\
+         puts $x:upper:wrap(\"-\")\n\
+         puts $x:wrap(\"-\"):upper\n",
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&mixed.stdout),
+        "*ab*\n*ab*\n-AB-\n-AB-\n"
+    );
+
+    // Its own vocabulary, so an ordinary `func` of the same name is untouched and
+    // unreachable as `:foo` — and the modifier is unreachable as a command.
+    let namespaces = run_with_input(
+        "func foo() { puts command }\n\
+         func _s:foo() { return \"[$_s]\" }\n\
+         foo\n\
+         x = q\n\
+         puts $x:foo\n",
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&namespaces.stdout),
+        "command\n[q]\n"
+    );
+
+    // And by reference, which is the spelling `DESIGN.md` offers for passing one
+    // to a higher-order modifier.
+    let referenced = run_with_input(
+        "func _s:foo() { return \"[$_s]\" }\n\
+         xs = [a b]\n\
+         puts $xs:map(:foo)\n\
+         m = :foo\n\
+         puts $m(z)\n",
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&referenced.stdout),
+        "[a]\n[b]\n[z]\n"
+    );
+}
+
+/// A modifier is resolved **when it is called**, the same rule command position
+/// has — so nothing is hoisted and a declaration may sit wherever a `func` may.
+#[test]
+fn a_declared_modifier_resolves_when_it_is_called() {
+    // A later declaration reaches a *delayed* use, and redefining changes what an
+    // already-written use runs. Exactly what `func f { g }` buys, and no more.
+    let late = run_with_input(
+        "func f() { x = hi; puts $x:said }\n\
+         func _s:said() { return \"one($_s)\" }\n\
+         f\n\
+         func _s:said() { return \"two($_s)\" }\n\
+         f\n",
+    );
+    assert_eq!(String::from_utf8_lossy(&late.stdout), "one(hi)\ntwo(hi)\n");
+
+    // The other half of that rule, stated so it cannot be "fixed": a *direct* use
+    // above the declaration is not reached, exactly as calling a `func` above its
+    // definition is not.
+    let forward = run_with_input("x = q\nputs $x:fwd\nfunc _s:fwd() { return F }\n");
+    assert_eq!(String::from_utf8_lossy(&forward.stdout), "");
+    assert!(
+        String::from_utf8_lossy(&forward.stderr).contains("`:fwd` is not a modifier"),
+        "{}",
+        String::from_utf8_lossy(&forward.stderr)
+    );
+
+    // Nowhere is out of bounds, because there is no pre-pass to keep honest: a
+    // declaration inside a branch binds when the branch runs.
+    let nested = run_with_input("if true { func _s:cond() { return C } }\nx = q\nputs $x:cond\n");
+    assert_eq!(String::from_utf8_lossy(&nested.stdout), "C\n");
+
+    // And a sourced library's modifiers work in the script that sources it —
+    // the boundary a load-time check could not see across.
+    let dir = fresh_dir("sourced_modifier");
+    let library = dir.join("lib.mesh");
+    std::fs::write(&library, "func _s:lib() { return \"lib:$_s\" }\n").expect("write library");
+    let sourced = run_with_input(&format!(
+        "source {}\nx = q\nputs $x:lib\n",
+        library.to_str().unwrap()
+    ));
+    assert_eq!(String::from_utf8_lossy(&sourced.stdout), "lib:q\n");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// **Element-wise by default; `...` takes the collection.** The subject is spread
+/// into its parameter exactly as an argument is, so which one a declaration gets is
+/// the parameter's own shape rather than a second meaning for `...`.
+#[test]
+fn a_declared_modifier_is_element_wise_unless_its_subject_is_a_rest() {
+    let out = run_with_input(
+        "func _s:tag() { return \"<$_s>\" }\n\
+         func ..._xs:count() { return $_xs:len }\n\
+         func ..._xs:oxford(_conj) { return $_xs:join(\", $_conj \") }\n\
+         xs = [a b]\n\
+         puts $xs:tag\n\
+         puts $xs:count\n\
+         puts $xs:oxford(and)\n\
+         one = solo\n\
+         puts $one:count\n",
+    );
+    assert!(
+        out.stderr.is_empty(),
+        "{:?}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        // A plain subject maps; a rest subject sees the whole list once — and a
+        // scalar spreads into it as the one element it is.
+        "<a>\n<b>\n2\na, and b\n1\n"
+    );
+
+    // An **empty** list makes no calls, and the binder inside a call is the only
+    // thing that checks the arguments — so a wrong argument count was silently
+    // fine on `[]` and reported the moment the list had an element. A signature is
+    // wrong on the line it is written on, whatever the subject's length. Raised in
+    // review as a P2.
+    for (source, message) in [
+        ("puts $empty:tag(1)", "expected 0 argument(s), got 1"),
+        ("puts $empty:pad", "expected 1 argument(s), got 0"),
+    ] {
+        let out = run_with_input(&format!(
+            "func _s:tag() {{ return $_s }}\n\
+             func _s:pad(_n) {{ return $_s }}\n\
+             empty = []\n\
+             {source}\n"
+        ));
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains(message),
+            "{source}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    // …and a *correct* call on an empty list is still the empty list.
+    let empty =
+        run_with_input("func _s:pad(_n) { return $_s }\nempty = []\nputs $empty:pad(8):repr\n");
+    assert_eq!(String::from_utf8_lossy(&empty.stdout), "[]\n");
+
+    // A map is neither, and says which modifier to reach for. A placeholder for a
+    // question `TODO.md` keeps open, not an answer to it.
+    let map = run_with_input("func _s:tag() { return $_s }\nm = [k: v]\nputs $m:tag\n");
+    assert!(
+        String::from_utf8_lossy(&map.stderr).contains("`:keys` or `:values`"),
+        "{}",
+        String::from_utf8_lossy(&map.stderr)
+    );
+}
+
+/// A spread naming no variable names no variable.
+///
+/// `expansion_word` resolves a declared chain before expansion, so a spread word
+/// can carry an already-evaluated value — and the argv diagnostics then had no
+/// name to blame. Prefixing a sigil to the stand-in printed `...$...` and
+/// `$$f`, presenting punctuation as a variable. Raised in review as two P2s.
+#[test]
+fn an_anonymous_spread_is_not_given_an_invented_name() {
+    let resolved =
+        run_with_input("func _s:nest() { return [[a b]] }\nxs = [q]\n/bin/echo ...$xs:nest\n");
+    let stderr = String::from_utf8_lossy(&resolved.stderr);
+    assert!(stderr.contains("...: nested list element"), "{stderr}");
+    assert!(!stderr.contains("$..."), "{stderr}");
+
+    // A **named** spread still names itself, in both families of message: the
+    // argv rules spell `...$ys`, and the no-byte-form ones spell `$f`.
+    let named = run_with_input("ys = [[a b]]\n/bin/echo ...$ys\n");
+    assert!(
+        String::from_utf8_lossy(&named.stderr).contains("...$ys: nested list element"),
+        "{}",
+        String::from_utf8_lossy(&named.stderr)
+    );
+    let function = run_with_input("f = &puts\nputs ...$f\n");
+    assert!(
+        String::from_utf8_lossy(&function.stderr).contains("$f: a function value has no text form"),
+        "{}",
+        String::from_utf8_lossy(&function.stderr)
+    );
+}
+
+/// A declared modifier's body runs **once per element**, however the chain is
+/// written.
+///
+/// A body is ordinary mesh and may have effects, and a word is expanded more than
+/// once per command — to classify a spread's elements, then to render them. Before
+/// `expansion_word` resolved a declared chain itself, `puts "$x:foo"` ran the body
+/// twice and said its diagnostics twice with it.
+#[test]
+fn a_declared_modifier_body_runs_once_per_element() {
+    let dir = fresh_dir("modifier_effects");
+    let marks = dir.join("marks");
+    for (source, expected) in [
+        ("puts \"$x:mark\"", 1),
+        ("puts $x:mark", 1),
+        ("puts a\"$x:mark\"b", 1),
+        ("y = \"$x:mark\"", 1),
+        ("cat << EOF\n$x:mark\nEOF", 1),
+        // Two elements, one call each.
+        ("puts ...$xs:mark", 2),
+        ("true ...$xs:mark", 2),
+    ] {
+        let _ = std::fs::remove_file(&marks);
+        let out = run_with_input(&format!(
+            "func _s:mark() {{ echo m >> {}; return $_s }}\nx = q\nxs = [a b]\n{source}\n",
+            marks.to_str().unwrap()
+        ));
+        let runs = std::fs::read_to_string(&marks)
+            .unwrap_or_default()
+            .lines()
+            .count();
+        assert_eq!(
+            runs,
+            expected,
+            "{source} ran the body {runs} times: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A declared modifier's body runs in the **stage's own process**, like any other
+/// value in a word.
+///
+/// A word's expansion is otherwise a pure read, so where it happens cannot be
+/// observed — which is why `can_defer` asked only whether a word held a `$(…)`.
+/// A chain naming a declaration is code in a variable's clothing: without it in
+/// that answer, `puts "$x:foo" | cat` ran the body in the parent, a `global`
+/// inside it changed the parent's binding, and a slow one held a background
+/// launch. Raised in review as a P1.
+#[test]
+fn a_declared_modifier_body_runs_in_the_stage_that_wrote_it() {
+    for stage in [
+        "puts \"$x:change\" | cat",
+        "puts $x:change | cat",
+        "puts ...$xs:change | cat",
+    ] {
+        let out = run_with_input(&format!(
+            "func _s:change() {{ global n = after; return $_s }}\n\
+             n = before\n\
+             x = q\n\
+             xs = [q]\n\
+             {stage}\n\
+             puts $n\n"
+        ));
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout),
+            "q\nbefore\n",
+            "{stage} reached the parent's binding: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    // A backgrounded stage is the other half of the same rule.
+    let background = run_with_input(
+        "func _s:change() { global n = after; return $_s }\n\
+         n = before\n\
+         x = q\n\
+         puts \"$x:change\" &\n\
+         wait\n\
+         puts $n\n",
+    );
+    assert!(
+        String::from_utf8_lossy(&background.stdout).ends_with("before\n"),
+        "{}",
+        String::from_utf8_lossy(&background.stdout)
+    );
+
+    // An ordinary reference is still a pure read, so it keeps being expanded
+    // where it always was — this must not make every `$x` defer.
+    let pure = run_with_input("x = q\nputs \"$x\" | cat\n");
+    assert_eq!(String::from_utf8_lossy(&pure.stdout), "q\n");
+
+    // A **heredoc body** is the same question one layer down. It is data — a
+    // `$(…)` in one is literal text, which is why the check never looked inside —
+    // and a declared modifier is the first thing in a body that runs code. A
+    // heredoc is a redirection, so the stage cannot defer at all; backgrounding it
+    // is refused rather than silently done in the parent, exactly as
+    // `cmd $(…) > out &` is. Raised in review as a P1.
+    let heredoc = run_with_input(
+        "func _s:change() { global n = after; return $_s }\n\
+         n = before\n\
+         x = q\n\
+         cat << END &\n\
+         $x:change\n\
+         END\n\
+         wait\n\
+         puts $n\n",
+    );
+    assert!(
+        String::from_utf8_lossy(&heredoc.stderr).contains("cannot be backgrounded"),
+        "{}",
+        String::from_utf8_lossy(&heredoc.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&heredoc.stdout), "before\n");
+
+    // A body with no declared chain in it still backgrounds, and a raw one is
+    // data all the way down — neither must be caught by the widened check.
+    for body in ["value $x", "$x:change"] {
+        let quoted = if body.starts_with("value") {
+            "END"
+        } else {
+            "'END'"
+        };
+        let out = run_with_input(&format!(
+            "func _s:change() {{ return $_s }}\nx = q\ncat << {quoted} &\n{body}\nEND\nwait\n"
+        ));
+        assert!(
+            out.status.success(),
+            "{body}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+}
+
+/// A declared modifier's body ends a **capture tail**, so a capture before it
+/// stops answering for the line.
+///
+/// An assignment reports its right-hand side's capture status only when the value
+/// comes from a `$(…)` at the tail — and a modifier that runs nothing keeps that
+/// true, which is why `x = $(cmd):upper` still answers for `cmd`. A declared
+/// modifier runs a body, so it is the last thing to record a status and the
+/// capture's is gone. Raised in review as a P2.
+#[test]
+fn a_declared_modifier_ends_a_capture_tail() {
+    for tail in ["\"$(true)\":id", "\"$(true)$y:id\""] {
+        let out = run_with_input(&format!(
+            "func _s:id() {{ false; return $_s }}\ny = q\nx = {tail}\nputs $sh.status\n"
+        ));
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout),
+            "0\n",
+            "{tail} leaked the body's status: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    // A built-in chain runs nothing, so the capture still owns the status — in
+    // both spellings, and this must not change.
+    for tail in [
+        "\"$(false)\":upper",
+        "\"$(false)$y:upper\"",
+        "\"$(false)suffix\"",
+    ] {
+        let out = run_with_input(&format!("y = q\nx = {tail}\nputs $sh.status\n"));
+        assert_eq!(String::from_utf8_lossy(&out.stdout), "1\n", "{tail}");
+    }
+}
+
+/// How a declared modifier's body **left** survives the expansion boundary.
+///
+/// A chain is applied where only an expansion error can be reported, which has no
+/// vocabulary for control flow — so an `exit` inside a body had to travel as
+/// something other than a status, or the session would survive it.
+#[test]
+fn a_declared_modifier_body_can_exit_the_shell() {
+    let out = run_with_input("func _s:bye() { exit 3 }\nx = q\nputs \"$x:bye\"\nputs after\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "");
+    assert_eq!(out.status.code(), Some(3));
+
+    // The same through a heredoc body, which resolves its references by its own
+    // walk rather than through word expansion.
+    let heredoc =
+        run_with_input("func _s:bye() { exit 4 }\nx = q\ncat << EOF\n$x:bye\nEOF\nputs after\n");
+    assert_eq!(String::from_utf8_lossy(&heredoc.stdout), "");
+    assert_eq!(heredoc.status.code(), Some(4));
+}
+
 /// The modifier declaration form, `func _s:name()` (`DESIGN.md` §"Modifiers").
 ///
 /// The subject sits *outside* the parens, which is the whole reason for the shape:

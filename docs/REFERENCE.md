@@ -2453,9 +2453,9 @@ as text (`"x:latest"`), or brace the name when it comes from a variable
 ```
 
 The error lands **when the line runs**, not when it is read, because a script may
-declare a modifier of its own and the parser cannot know the whole vocabulary. So
-the work above a bad `:name` happens, and a branch that is never taken never
-complains.
+[declare a modifier](#declaring-a-modifier) of its own and the parser cannot know
+the whole vocabulary. So the work above a bad `:name` happens, and a branch that is
+never taken never complains.
 
 Quoting the *subject* does not help — `"ubuntu":latest` is the same chain. The
 colon has to be inside the quotes (`"ubuntu:latest"`), or the name braced when it
@@ -2501,6 +2501,41 @@ A name mesh **reserves** for a modifier it has not built yet — `:sort`,
 `not implemented yet` rather than a silent no-op. Both arrive when the line runs,
 and they stay worded differently: "no such modifier" and "not built yet" are
 different answers.
+
+### Declaring a modifier
+
+`func SUBJECT:NAME(…) { … }` adds to the vocabulary. The subject sits **left of the
+colon**, where the call site puts it, and outside the parens — which is what lets a
+collection modifier still take an argument:
+
+```
+func _s:shout()          { return "$_s!" }        # $x:shout
+func _s:wrap(_c)         { return "$_c$_s$_c" }   # $x:wrap("*")
+func ..._xs:oxford(_c)   { return $_xs:join(", $_c ") }
+```
+
+**Element-wise is the default; `...` takes the collection.** A plain subject
+parameter receives one element, so a list subject calls the body per element — the
+auto-mapping the built-ins do. A rest subject receives the whole list, once. A map
+subject is an error naming `:keys` and `:values`.
+
+An ordinary one-argument `func` is **not** reachable as `:name`: the declaration is
+what marks a modifier, so a private helper is never promoted to public vocabulary by
+accident. The two namespaces are independent — `func upper() { … }` is legal beside
+the built-in `:upper`, while `func _s:upper()` is refused, because a built-in
+modifier name cannot be redeclared.
+
+A modifier **resolves when it is called**, exactly as a command name does. Nothing
+is hoisted: a declaration binds when it executes, may sit anywhere a `func` may
+(inside a branch, inside a function body), and one arriving from a `source` a
+statement earlier is found. A later declaration therefore reaches a *delayed* use
+and not a direct one:
+
+```
+func f() { puts $x:foo }     # fine — `f` runs below, after the declaration binds
+func _s:foo() { … }
+f
+```
 
 | Modifier | Input | Result |
 | --- | --- | --- |
