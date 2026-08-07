@@ -2573,15 +2573,32 @@ colon**, where the call site puts it, and outside the parens — which is what l
 collection modifier still take an argument:
 
 ```
-func _s:shout()          { return "$_s!" }        # $x:shout
-func _s:wrap(_c)         { return "$_c$_s$_c" }   # $x:wrap("*")
-func ..._xs:oxford(_c)   { return $_xs:join(", $_c ") }
+func _s:shout()   { return "$_s!" }        # $x:shout
+func _s:wrap(_c)  { return "$_c$_s$_c" }   # $x:wrap("*")
 ```
 
 **Element-wise is the default; `...` takes the collection.** A plain subject
 parameter receives one element, so a list subject calls the body per element — the
 auto-mapping the built-ins do. A rest subject receives the whole list, once. A map
 subject is an error naming `:keys` and `:values`.
+
+A rest subject is what you reach for when the answer depends on **all** the
+elements at once, so no amount of mapping would get there — and it still takes its
+own arguments, which is the whole reason the subject sits outside the parens:
+
+```mesh
+func ..._xs:oxford(_conj) {
+  if $_xs:len < 3 { return $_xs:join(" $_conj ") }
+  _head = $_xs[..-1]:join(", ")
+  return "$_head, $_conj $_xs[-1]"
+}
+
+fruit = [apples pears figs]
+pair = [apples pears]
+puts $fruit:oxford(and)   # apples, pears, and figs
+puts $fruit:oxford(or)    # apples, pears, or figs
+puts $pair:oxford(and)    # apples and pears — no comma at two
+```
 
 An ordinary one-argument `func` is **not** reachable as `:name`: the declaration is
 what marks a modifier, so a private helper is never promoted to public vocabulary by

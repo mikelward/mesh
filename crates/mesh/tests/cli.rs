@@ -33222,11 +33222,9 @@ fn a_declared_modifier_is_element_wise_unless_its_subject_is_a_rest() {
     let out = run_with_input(
         "func _s:tag() { return \"<$_s>\" }\n\
          func ..._xs:count() { return $_xs:len }\n\
-         func ..._xs:oxford(_conj) { return $_xs:join(\", $_conj \") }\n\
          xs = [a b]\n\
          puts $xs:tag\n\
          puts $xs:count\n\
-         puts $xs:oxford(and)\n\
          one = solo\n\
          puts $one:count\n",
     );
@@ -33239,7 +33237,39 @@ fn a_declared_modifier_is_element_wise_unless_its_subject_is_a_rest() {
         String::from_utf8_lossy(&out.stdout),
         // A plain subject maps; a rest subject sees the whole list once — and a
         // scalar spreads into it as the one element it is.
-        "<a>\n<b>\n2\na, and b\n1\n"
+        "<a>\n<b>\n2\n1\n"
+    );
+
+    // The case a rest subject **exists** for: an answer that depends on all the
+    // elements at once, so no amount of mapping would reach it — and that still
+    // takes an argument of its own. Every length is pinned, because the lengths
+    // are where an Oxford join differs from a plain one: no separator at one, no
+    // comma at two, a comma before the conjunction from three on.
+    let oxford = run_with_input(
+        "func ..._xs:oxford(_conj) {\n\
+         if $_xs:len < 3 { return $_xs:join(\" $_conj \") }\n\
+         _head = $_xs[..-1]:join(\", \")\n\
+         return \"$_head, $_conj $_xs[-1]\"\n\
+         }\n\
+         one = [apples]\n\
+         two = [apples pears]\n\
+         three = [apples pears figs]\n\
+         four = [apples pears figs plums]\n\
+         puts $one:oxford(and)\n\
+         puts $two:oxford(and)\n\
+         puts $three:oxford(and)\n\
+         puts $four:oxford(and)\n\
+         puts $three:oxford(or)\n",
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&oxford.stdout),
+        "apples\n\
+         apples and pears\n\
+         apples, pears, and figs\n\
+         apples, pears, figs, and plums\n\
+         apples, pears, or figs\n",
+        "{}",
+        String::from_utf8_lossy(&oxford.stderr)
     );
 
     // An **empty** list makes no calls, and the binder inside a call is the only
