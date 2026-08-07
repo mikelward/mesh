@@ -1072,6 +1072,25 @@ impl Default for Vars {
     }
 }
 
+/// A host name cut at its first `.` — `host1.example.com` as `host1`.
+///
+/// What `$sh.host` reports, and what a prompt or window title almost always
+/// wants: the domain is the same on every machine a person works across, so it
+/// costs width without distinguishing anything. `$sh.fqdn` keeps the whole name
+/// for the cases that need it, which is the split bash draws between `\h` and
+/// `\H`.
+///
+/// A name that is already short, or one that cannot be read at all, passes
+/// through unchanged — the empty string stays empty rather than becoming a
+/// placeholder nobody asked for.
+fn short_hostname(host: &[u8]) -> String {
+    let name = String::from_utf8_lossy(host);
+    match name.split_once('.') {
+        Some((short, _)) => short.to_owned(),
+        None => name.into_owned(),
+    }
+}
+
 /// The terminal's column count, or `0` when there is no terminal to ask.
 ///
 /// Asked of stdout first, then stderr, then stdin: the width that matters is the
@@ -1313,6 +1332,23 @@ impl Vars {
             ("pid".to_owned(), Value::Integer(i64::from(self.pid))),
             ("ppid".to_owned(), Value::Integer(i64::from(self.ppid))),
             ("uid".to_owned(), Value::Integer(i64::from(self.uid))),
+            // Read from `gethostname(2)` on each access, for the reason `width`
+            // below is: a live read cannot be stale, and the syscall is cheaper
+            // than the `$(hostname)` fork it exists to replace — which is the
+            // whole point, since a prompt pays it every time it draws.
+            //
+            // `$env.HOSTNAME` is deliberately not consulted; see
+            // [`crate::url::hostname`] for why a stale exported copy is worse
+            // than no answer. Empty when the name cannot be read, the same
+            // honest sentinel `width` uses for "there is no terminal".
+            (
+                "host".to_owned(),
+                Value::String(short_hostname(&crate::url::hostname())),
+            ),
+            (
+                "fqdn".to_owned(),
+                Value::String(String::from_utf8_lossy(&crate::url::hostname()).into_owned()),
+            ),
             (
                 "version".to_owned(),
                 Value::String(env!("CARGO_PKG_VERSION").to_owned()),
@@ -1683,8 +1719,33 @@ pub fn append_into(current: &mut Value, value: Value, name: &str) -> Result<(), 
 mod tests {
     use super::{
         Color, Decoration, FuncValue, LINK_LIMIT, NoLiteral, RegexValue, Style, StyledValue, Value,
-        Vars, link_url,
+        Vars, link_url, short_hostname,
     };
+
+    #[test]
+    fn a_host_name_is_cut_at_its_first_dot() {
+        assert_eq!(short_hostname(b"host1.example.com"), "host1");
+        assert_eq!(short_hostname(b"host1"), "host1");
+        // The first dot, not the last: a name is cut down to its leftmost label.
+        assert_eq!(short_hostname(b"a.b.c"), "a");
+    }
+
+    #[test]
+    fn an_unreadable_host_name_stays_empty() {
+        // `hostname()` answers with an empty vector when `gethostname` fails, and
+        // `$sh.host` passes that through rather than inventing `localhost`.
+        assert_eq!(short_hostname(b""), "");
+        // A leading dot is a degenerate name, not an invitation to look further
+        // along it.
+        assert_eq!(short_hostname(b".example.com"), "");
+    }
+
+    #[test]
+    fn a_host_name_that_is_not_utf8_still_answers() {
+        // The prompt asks every time it draws, so this cannot be a hard error —
+        // the lossy replacement is what `prompt_title` already does with it.
+        assert_eq!(short_hostname(b"h\xffst1.example.com"), "h\u{fffd}st1");
+    }
 
     #[test]
     fn a_scalar_writes_the_literal_you_would_have_typed() {

@@ -205,6 +205,7 @@ The rest of the read-only runtime surface:
 | `$sh.pipestatus` | That run's per-stage statuses, as a list |
 | `$sh.pid` / `$sh.ppid` | This shell's process id, and its parent's |
 | `$sh.uid` | This shell's effective user id |
+| `$sh.host` / `$sh.fqdn` | This machine's name, cut at the first `.` and whole |
 | `$sh.version` | The shell's version |
 | `$sh.interactive` | Whether this is an interactive session |
 | `$sh.width` | The terminal's column count, or `0` when there is no terminal |
@@ -214,6 +215,20 @@ The rest of the read-only runtime surface:
 `$sh.interactive` answers **what kind of session this is**, not what fd 0 happens
 to be: `mesh -s` on a terminal reads commands without being an interactive session
 and reports `false`, while `-i` makes one out of any input and reports `true`.
+
+`$sh.host` is the machine's name up to its first `.`, and `$sh.fqdn` the whole
+name — the split bash draws between `\h` and `\H`. A prompt or window title
+almost always wants the short one, since the domain is identical on every machine
+a person works across and so costs width without distinguishing anything.
+
+Both come from `gethostname(2)` at each access, which is the point: `$(hostname)`
+is a fork paid every time the prompt draws, to learn something that does not
+change. `$env.HOSTNAME` is deliberately **not** consulted — it is not in the
+environment a login shell is given on either platform mesh targets, and a stale
+exported copy names the machine you `ssh`'d *from*, which is exactly the case a
+host in the prompt is there to distinguish. When the name cannot be read at all
+both are the empty string, the same honest sentinel `$sh.width` uses for "there
+is no terminal".
 
 `$sh.width` is read from the terminal at each access rather than cached, so it
 cannot go stale: `TIOCGWINSZ` is what the kernel answers from and it is current
@@ -1539,7 +1554,7 @@ directory, and current Git branch before a minimal `> ` input prompt:
 
 ```mesh
 func prompt-context() {
-  host = $(hostname -s)
+  host = $sh.host
   dir = $(pwd)
   branch = $(sh -c 'git branch --show-current 2>/dev/null || true')
 
@@ -1555,10 +1570,10 @@ prompt "> "
 ```
 
 The hook writes the context above the editor; `prompt "> "` controls only the
-input indicator. `hostname -s` requests the short hostname. Use `hostname`
-instead if the platform's default hostname spelling is preferred. The `sh`
-wrapper makes the branch segment empty outside a Git worktree without printing
-Git's diagnostic on every prompt.
+input indicator. [`$sh.host`](#shargs-and-shname) is the short hostname, read
+without a fork; use `$sh.fqdn` for the whole name. The `sh` wrapper makes the
+branch segment empty outside a Git worktree without printing Git's diagnostic on
+every prompt.
 
 An external renderer works the same way:
 
