@@ -127,56 +127,74 @@ pub enum Modifier {
     Code,
 }
 
+/// Every spelling of an argument-free modifier, paired with what it means.
+///
+/// A **table** rather than a `match` so the vocabulary can be walked as well as
+/// looked up: the parser asks it whether a name is one mesh ships
+/// (`parser::modifier_name`) instead of keeping a second copy of these names, which
+/// is what let the two lists drift apart before.
+pub(crate) const NAMED_MODIFIERS: &[(&str, Modifier)] = &[
+    ("dir", Modifier::Dir),
+    ("base", Modifier::Base),
+    ("ext", Modifier::Ext),
+    ("exts", Modifier::Exts),
+    ("stem", Modifier::Stem),
+    ("bare", Modifier::Bare),
+    ("tilde", Modifier::Tilde),
+    ("real", Modifier::Real),
+    ("url", Modifier::Url),
+    ("len", Modifier::Len),
+    ("code", Modifier::Code),
+    ("tty", Modifier::Tty),
+    ("first", Modifier::First),
+    ("last", Modifier::Last),
+    ("rest", Modifier::Rest),
+    ("init", Modifier::Init),
+    ("dedup", Modifier::Dedup),
+    ("keys", Modifier::Keys),
+    ("values", Modifier::Values),
+    ("upper", Modifier::Upper),
+    ("lower", Modifier::Lower),
+    ("trimstart", Modifier::TrimStart),
+    ("trimend", Modifier::TrimEnd),
+    ("int", Modifier::Int),
+    ("flag", Modifier::Flag),
+    ("bool", Modifier::Bool),
+    // The split family carries a two-letter alias each, since a split is what a
+    // line loop or a `-print0` pipeline writes on every use. They are
+    // *systematic* — initial plus `s` — rather than the `test`-derived single
+    // letters `:f` / `:d` / `:l` / `:x`, which is why none of them collides: `:l`
+    // is already `:links`.
+    ("words", Modifier::Words),
+    ("ws", Modifier::Words),
+    ("lines", Modifier::Lines),
+    ("ls", Modifier::Lines),
+    ("nulls", Modifier::Nulls),
+    ("ns", Modifier::Nulls),
+    ("tabs", Modifier::Tabs),
+    ("ts", Modifier::Tabs),
+    ("repr", Modifier::Repr),
+    ("pretty", Modifier::Pretty),
+    ("exists", Modifier::Exists),
+    ("type", Modifier::Type),
+    ("read", Modifier::Read),
+    ("write", Modifier::Write),
+    ("files", Modifier::Files),
+    ("f", Modifier::Files),
+    ("dirs", Modifier::Dirs),
+    ("d", Modifier::Dirs),
+    ("links", Modifier::Links),
+    ("l", Modifier::Links),
+    ("exec", Modifier::Exec),
+    ("x", Modifier::Exec),
+];
+
 impl Modifier {
     pub(crate) fn from_name(name: &str) -> Option<Self> {
-        Some(match name {
-            "dir" => Self::Dir,
-            "base" => Self::Base,
-            "ext" => Self::Ext,
-            "exts" => Self::Exts,
-            "stem" => Self::Stem,
-            "bare" => Self::Bare,
-            "tilde" => Self::Tilde,
-            "real" => Self::Real,
-            "url" => Self::Url,
-            "len" => Self::Len,
-            "code" => Self::Code,
-            "tty" => Self::Tty,
-            "first" => Self::First,
-            "last" => Self::Last,
-            "rest" => Self::Rest,
-            "init" => Self::Init,
-            "dedup" => Self::Dedup,
-            "keys" => Self::Keys,
-            "values" => Self::Values,
-            "upper" => Self::Upper,
-            "lower" => Self::Lower,
-            "trimstart" => Self::TrimStart,
-            "trimend" => Self::TrimEnd,
-            "int" => Self::Int,
-            "flag" => Self::Flag,
-            "bool" => Self::Bool,
-            // The split family carries a two-letter alias each, since a split is
-            // what a line loop or a `-print0` pipeline writes on every use. They
-            // are *systematic* — initial plus `s` — rather than the `test`-derived
-            // single letters `:f` / `:d` / `:l` / `:x`, which is why none of them
-            // collides: `:l` is already `:links`.
-            "words" | "ws" => Self::Words,
-            "lines" | "ls" => Self::Lines,
-            "nulls" | "ns" => Self::Nulls,
-            "tabs" | "ts" => Self::Tabs,
-            "repr" => Self::Repr,
-            "pretty" => Self::Pretty,
-            "exists" => Self::Exists,
-            "type" => Self::Type,
-            "read" => Self::Read,
-            "write" => Self::Write,
-            "files" | "f" => Self::Files,
-            "dirs" | "d" => Self::Dirs,
-            "links" | "l" => Self::Links,
-            "exec" | "x" => Self::Exec,
-            _ => return None,
-        })
+        NAMED_MODIFIERS
+            .iter()
+            .find(|(spelling, _)| *spelling == name)
+            .map(|(_, modifier)| *modifier)
     }
 }
 

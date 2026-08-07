@@ -7673,7 +7673,10 @@ impl Parser<'_> {
 }
 
 fn modifier_name(name: &str) -> bool {
-    MODIFIER_NAMES.contains(&name)
+    // The argument-free family is asked of its own implementation rather than
+    // copied here, so adding a `Modifier` variant cannot leave a name that
+    // evaluates but is not recognized as shipped.
+    crate::expand::Modifier::from_name(name).is_some() || MODIFIER_NAMES.contains(&name)
 }
 
 /// Is `name` one of the shipped modifiers? The name set a **modifier**
@@ -7767,36 +7770,26 @@ pub(crate) fn modifier_accepts_arguments(name: &str) -> bool {
     modifier_requires_arguments(name) || matches!(name, "trimstart" | "trimend" | "bool")
 }
 
+/// The shipped modifiers **that [`crate::expand::Modifier`] does not hold** — the
+/// argument-taking family, the regex flags, and the time family, each implemented
+/// where its arguments are evaluated rather than in that enum. The argument-free
+/// half is asked of `Modifier::from_name` instead of listed again here, so the two
+/// cannot drift; a name in both would mean the split has slipped, which
+/// `the_two_modifier_tables_do_not_overlap` catches.
 const MODIFIER_NAMES: &[&str] = &[
     "add",
     "ancestors",
     "append",
     "atime",
-    "bare",
-    "base",
-    "bool",
     "capture",
     "captures",
-    "code",
     "ctime",
-    "d",
-    "dedup",
-    "dir",
-    "dirs",
     "dotall",
     "each",
     "epoch",
-    "exec",
-    "exists",
-    "ext",
     "extend",
     "extended",
-    "exts",
-    "f",
-    "files",
     "filter",
-    "first",
-    "flag",
     "format",
     "get",
     "groups",
@@ -7804,18 +7797,8 @@ const MODIFIER_NAMES: &[&str] = &[
     "has",
     "i",
     "ignorecase",
-    "init",
-    "int",
     "iso",
     "join",
-    "keys",
-    "l",
-    "last",
-    "len",
-    "lines",
-    "links",
-    "lower",
-    "ls",
     "m",
     "map",
     "match",
@@ -7824,46 +7807,24 @@ const MODIFIER_NAMES: &[&str] = &[
     "ms",
     "mtime",
     "multiline",
-    "ns",
-    "nulls",
     "num",
     "old",
     "parents",
     "prepend",
-    "pretty",
     "quotemeta",
     "raw",
-    "read",
-    "real",
     "remove",
     "replace",
     "replaceall",
     "replaceend",
     "replacestart",
-    "repr",
-    "rest",
     "s",
     "same",
     "secs",
     "sort",
     "split",
-    "stem",
     "stripend",
     "stripstart",
-    "tabs",
-    "tilde",
-    "trimend",
-    "trimstart",
-    "ts",
-    "tty",
-    "type",
-    "upper",
-    "url",
-    "values",
-    "words",
-    "write",
-    "ws",
-    "x",
 ];
 
 #[cfg(test)]
@@ -9191,9 +9152,25 @@ mod tests {
         assert!(matches!(negation("not $n > 2"), Executable::Not(_)));
     }
 
+    /// `MODIFIER_NAMES` holds only what [`crate::expand::Modifier`] does not, so a
+    /// name appearing in both is a copy that can go stale — the failure this split
+    /// exists to make impossible.
+    #[test]
+    fn the_two_modifier_tables_do_not_overlap() {
+        let copied: Vec<_> = MODIFIER_NAMES
+            .iter()
+            .filter(|name| crate::expand::Modifier::from_name(name).is_some())
+            .collect();
+        assert!(copied.is_empty(), "listed twice: {copied:?}");
+    }
+
     #[test]
     fn recognizes_the_documented_modifier_vocabulary() {
-        for modifier in MODIFIER_NAMES {
+        let vocabulary = MODIFIER_NAMES
+            .iter()
+            .copied()
+            .chain(crate::expand::NAMED_MODIFIERS.iter().map(|(name, _)| *name));
+        for modifier in vocabulary {
             let source = format!("x = $value:{modifier}");
             let tree = complete(&source);
             assert!(matches!(
