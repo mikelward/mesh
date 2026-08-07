@@ -5506,6 +5506,17 @@ fn modifier_step(name: &str) -> expand::ModifierStep {
             message: RAW_NEEDS_A_CAPTURE.to_string(),
             regex_message: RAW_NEEDS_A_CAPTURE.to_string(),
         },
+        // Not in the vocabulary at all. The parser used to answer this, and stopped
+        // once a user could declare a modifier: `:ident` is still reserved by the
+        // grammar, but *which* names exist is only knowable when the line runs
+        // (`DESIGN.md` §"Modifiers"). Worded as it was there, escapes included, and
+        // kept distinct from the "not implemented yet" below — "no such modifier"
+        // and "not built yet" are different answers.
+        None if !parser::is_builtin_modifier(name) => expand::ModifierStep::Unavailable {
+            name: name.to_string(),
+            message: parser::unknown_modifier_message(name),
+            regex_message: parser::unknown_modifier_message(name),
+        },
         None => expand::ModifierStep::Unavailable {
             name: name.to_string(),
             message: if parser::modifier_requires_arguments(name) {
@@ -5708,6 +5719,12 @@ fn eval_modifier_with_arguments(
         }
         _ if expand::Modifier::from_name(name).is_some() => {
             runtime_error(format!("modifier :{name} does not take arguments"))
+        }
+        // Outside the vocabulary entirely, so the answer is the same one the
+        // argument-free path gives — a name nothing declares is not a modifier,
+        // whatever it was handed.
+        _ if !parser::is_builtin_modifier(name) => {
+            runtime_error(parser::unknown_modifier_message(name))
         }
         _ => runtime_error(format!(
             "modifier :{name} arguments are not implemented yet"

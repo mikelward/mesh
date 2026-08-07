@@ -3747,6 +3747,11 @@ fn a_group_takes_an_expression_across_lines() {
 /// was implemented, at which point it silently became a chain — so introducing a
 /// modifier would break scripts that never mentioned it. Every other spelling
 /// already reserved the shape; the bare-in-string one asked the list.
+///
+/// The *diagnostic* has since moved to run time — a user may declare a modifier,
+/// so the parser cannot hold the vocabulary — which is why these exit 1 rather
+/// than 2. What the grammar reserves did not move: every spelling below still
+/// claims the chain, and none of them is text.
 #[test]
 fn a_modifier_name_is_reserved_by_shape_not_by_the_name_list() {
     // The three spellings of the same chain agree, whether or not the name is one
@@ -3760,7 +3765,7 @@ fn a_modifier_name_is_reserved_by_shape_not_by_the_name_list() {
             format!("h = host\ny = \"$h:{name}\"\n"),
         ] {
             let out = run_with_input(&source);
-            assert_eq!(out.status.code(), Some(2), "{source}");
+            assert_eq!(out.status.code(), Some(1), "{source}");
             assert!(
                 String::from_utf8_lossy(&out.stderr).contains("is not a modifier"),
                 "{source}: {}",
@@ -3833,6 +3838,48 @@ fn a_modifier_name_is_reserved_by_shape_not_by_the_name_list() {
     // claimed.
     let works = run_with_input("h = host\nputs $h:upper\nputs \"${h:upper}\"\nputs \"$h:upper\"\n");
     assert_eq!(String::from_utf8_lossy(&works.stdout), "HOST\nHOST\nHOST\n");
+}
+
+/// An unknown `:name` is diagnosed when the line **runs**, not when it is read.
+///
+/// A user may declare a modifier, so the parser cannot hold the vocabulary and
+/// cannot tell a typo from a name bound elsewhere (`DESIGN.md` §"Modifiers"). What
+/// that buys is not the message — the wording did not change — but *when*: work
+/// above the fault happens, and a branch that is never taken never complains at
+/// all, neither of which a syntax error can offer.
+#[test]
+fn an_unknown_modifier_reports_when_the_line_runs() {
+    // `puts one` ran. Under the parse-time gate the whole file was rejected first,
+    // so nothing before the fault reached the shell.
+    let after = run_with_input("h = host\nputs one\nputs $h:nope\n");
+    assert_eq!(String::from_utf8_lossy(&after.stdout), "one\n");
+    assert_eq!(
+        after.status.code(),
+        Some(1),
+        "a run-time error, not a parse"
+    );
+    assert!(
+        String::from_utf8_lossy(&after.stderr).contains("`:nope` is not a modifier"),
+        "{}",
+        String::from_utf8_lossy(&after.stderr)
+    );
+
+    // Never reached, never reported — the same reach a call to an undefined `func`
+    // in an untaken branch has.
+    let unreached = run_with_input("h = host\nif false { puts $h:nope }\nputs done\n");
+    assert_eq!(String::from_utf8_lossy(&unreached.stdout), "done\n");
+    assert!(unreached.status.success());
+
+    // The keyword carve-out moves with it: an attached `:name` outranks keyword
+    // parsing whether or not the name is one mesh knows, so `if:nope` is a chain on
+    // the word `if` that reports rather than a conditional or a syntax error.
+    let keyword = run_with_input("puts if:nope\n");
+    assert_eq!(String::from_utf8_lossy(&keyword.stdout), "");
+    assert!(
+        String::from_utf8_lossy(&keyword.stderr).contains("`:nope` is not a modifier"),
+        "{}",
+        String::from_utf8_lossy(&keyword.stderr)
+    );
 }
 
 /// A bare `$name:mod` chain in a `"…"` string reads the same wherever the string
@@ -20671,8 +20718,13 @@ fn a_modifier_reference_rejects_what_it_cannot_apply() {
             "predicate must return a boolean",
         ),
         // Not a modifier name at all: there is no other reading of a leading `:`
-        // in expression position, so it is a syntax error rather than literal text.
-        ("xs = [a b]\ny = $xs:map(:nope)\n", "syntax error"),
+        // in expression position, so it is claimed and reported rather than read as
+        // literal text. Reported when the reference is *applied*, since a
+        // declaration could have bound `:nope` anywhere above this line.
+        (
+            "xs = [a b]\ny = $xs:map(:nope)\n",
+            "`:nope` is not a modifier",
+        ),
     ] {
         let out = run_with_input(source);
         assert!(!out.status.success(), "{source}");

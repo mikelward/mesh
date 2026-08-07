@@ -331,21 +331,12 @@ pub enum ParseErrorKind {
     /// message names both, and it keeps this the loud error it was before value
     /// arguments existed rather than three arguments where one was written.
     GluedValueArgument,
-    /// An attached `:name` naming no modifier — `ubuntu:latest`, `host:port`. Its
-    /// own variant because `:` + identifier is reserved by the grammar rather than
-    /// gated on a name list, so this is the diagnostic that replaces the old silent
-    /// fallback to literal text. Carries the name so the message can quote it, and
-    /// says *unknown* rather than *unimplemented*: a name the vocabulary reserves but
-    /// the engine cannot apply yet (`:sort`) parses fine and reports at run time.
-    UnknownModifier(String),
     /// A chain link on a `/…/` literal that names no regex flag *and* no
-    /// modifier — `/a/:g`. Its own variant because [`UnknownModifier`]'s message
-    /// is the wrong help here: it never mentions flags, and its quote-the-word
-    /// advice would turn the pattern into text. A link that is a real modifier
-    /// (`/a/:upper`) is not this error — the literal reading declines and the
-    /// string one stands, exactly as before.
-    ///
-    /// [`UnknownModifier`]: ParseErrorKind::UnknownModifier
+    /// modifier — `/a/:g`. Its own variant because
+    /// [`unknown_modifier_message`]'s help is the wrong help here: it never
+    /// mentions flags, and its quote-the-word advice would turn the pattern into
+    /// text. A link that is a real modifier (`/a/:upper`) is not this error — the
+    /// literal reading declines and the string one stands, exactly as before.
     UnknownRegexFlag(String),
     /// A modifier given an **argument list** inside a `$…` interpolation —
     /// `"$env:get(HOME, none)"`. Its own variant because the reader wrote
@@ -439,12 +430,6 @@ impl std::fmt::Display for ParseError {
             ParseErrorKind::TooDeep => write!(
                 f,
                 "syntax error: nested too deeply; mesh parses at most {MAX_DEPTH} levels"
-            ),
-            ParseErrorKind::UnknownModifier(name) => write!(
-                f,
-                "syntax error: `:{name}` is not a modifier; quote the whole word to \
-                 keep it as text (`\"x:{name}\"`), or brace the name when it comes \
-                 from a variable (`\"${{x}}:{name}\"`)"
             ),
             ParseErrorKind::UnknownRegexFlag(name) => write!(
                 f,
@@ -2322,7 +2307,9 @@ fn valid_variable_access(value: &str) -> bool {
             rest = &rest[close..];
         } else if let Some(modifier) = rest.strip_prefix(':') {
             let end = modifier.find(':').unwrap_or(modifier.len());
-            if !modifier_name(&modifier[..end]) {
+            // A name, not a known modifier: which names exist is answered when the
+            // chain runs, so the shape is all this can check.
+            if !valid_name(&modifier[..end]) {
                 return false;
             }
             rest = &modifier[end..];
@@ -2565,14 +2552,15 @@ pub(crate) fn variable_access_prefix(text: &str) -> Result<usize, ParseErrorKind
             // already reserves the shape (`$h:nope` and `"${h:nope}"` are both
             // `:nope` is not a modifier); this was the one that did not.
             //
+            // Which names exist is a **run-time** question, since a user may declare
+            // one (`DESIGN.md` §"Modifiers"): the claim is still the shape, but the
+            // unknown-name diagnostic is the engine's to give when the line runs.
+            //
             // A leading digit is not an identifier, which is what keeps `"$h:2"`,
             // `"$h:/path"`, `"$h:$port"` and a bare `"$h:"` reading as the text they
             // always were: punctuation and numerals were never in the claim.
             if length == 0 {
                 break;
-            }
-            if !modifier_name(&value[..length]) {
-                return Err(ParseErrorKind::UnknownModifier(value[..length].to_string()));
             }
             // An abutting `(` after a modifier that **can take one** is an argument
             // list, and this scan has nowhere to put it: it stops at the character,
@@ -5540,19 +5528,7 @@ impl Parser<'_> {
                     .is_some_and(|(name, colon)| name.span.start == colon.span.end)
             {
                 self.position += 1;
-                let start = self.previous_end();
                 let name = self.name()?;
-                // `:` + identifier is reserved by the grammar, so a name the
-                // vocabulary does not hold is an error rather than falling back to
-                // literal text. A name it *does* hold but the engine cannot apply yet
-                // (`:sort`) parses fine and reports at run time, which is why this
-                // asks `modifier_name` rather than whether it can be applied.
-                if !modifier_name(&name) {
-                    return Err(ParseError {
-                        kind: ParseErrorKind::UnknownModifier(name),
-                        span: start..self.previous_end(),
-                    });
-                }
                 // The `(` has to **abut** the name, exactly as it must for an attached
                 // call and an index. Command position separates arguments by spacing,
                 // so `puts $x:upper (1)` is the chain plus a separate `(1)`; that used
@@ -7196,6 +7172,10 @@ impl Parser<'_> {
     ///
     /// Spacing is the signal, exactly as it is wherever else a chain is recognized:
     /// `if :upper` keeps the keyword and reads `:upper` as a modifier reference.
+    ///
+    /// The attached name is not checked against the modifier vocabulary, for the
+    /// reason [`Parser::modifier_ref_name`] gives: which names exist is a run-time
+    /// question, so `if:nope` is a chain that reports rather than a conditional.
     fn carries_attached_modifier(&self) -> bool {
         let (Some(word), Some(colon)) = (self.peek(), self.tokens.get(self.position + 1)) else {
             return false;
@@ -7207,7 +7187,7 @@ impl Parser<'_> {
                 .tokens
                 .get(self.position + 2)
                 .is_some_and(|name| name.span.start == colon.span.end)
-            && self.word_text_at(2).is_some_and(modifier_name)
+            && self.word_text_at(2).is_some()
     }
     fn take_word(&mut self, expected: &str) -> bool {
         if self.word(expected) {
@@ -7491,7 +7471,11 @@ impl Parser<'_> {
             return None;
         };
         let name = word.bare_word()?;
-        modifier_name(name).then(|| name.to_string())
+        // Shape, not membership — as for the postfix chain. A reference names a
+        // modifier resolved when it is *applied*, so `$xs:map(:foo)` reaches a
+        // declaration made anywhere above the call rather than a table the parser
+        // holds (`DESIGN.md` §"Modifiers").
+        valid_name(name).then(|| name.to_string())
     }
 
     /// The `with (…)` capture list after a lambda's parameters, or an empty list
@@ -7637,6 +7621,23 @@ fn modifier_name(name: &str) -> bool {
 /// names so the two vocabularies stay independent (`DESIGN.md` §"Modifiers").
 pub fn is_builtin_modifier(name: &str) -> bool {
     modifier_name(name)
+}
+
+/// What an attached `:name` naming no modifier is told — `ubuntu:latest`,
+/// `host:port`.
+///
+/// Said when the line **runs**, not when it is read: a user may declare a
+/// modifier, so the parser cannot hold the whole vocabulary and cannot tell a
+/// typo from a name bound elsewhere (`DESIGN.md` §"Modifiers"). What the grammar
+/// reserves is unchanged — `:` plus an identifier is a modifier position and
+/// never text — so both escapes the parse-time message named are still the
+/// escapes, and it keeps its wording at the new site.
+pub fn unknown_modifier_message(name: &str) -> String {
+    format!(
+        "`:{name}` is not a modifier; quote the whole word to keep it as text \
+         (`\"x:{name}\"`), or brace the name when it comes from a variable \
+         (`\"${{x}}:{name}\"`)"
+    )
 }
 
 /// Is `name` a modifier that **requires** a parenthesized argument list? Used to
