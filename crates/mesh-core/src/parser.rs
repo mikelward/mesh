@@ -1237,6 +1237,7 @@ pub fn parse(source: &str) -> Result<ParseOutcome, ParseError> {
         depth: 0,
         regex_slot: false,
         grouped: 0,
+        argument: false,
     };
     match parser.source(None) {
         Ok(tree) => Ok(ParseOutcome::Complete(tree)),
@@ -1366,6 +1367,7 @@ pub(crate) fn params_prefix_status(list: &str) -> PrefixStatus {
         depth: 0,
         regex_slot: false,
         grouped: 0,
+        argument: false,
     }
     .parameters_prefix()
 }
@@ -2022,6 +2024,7 @@ fn capture_in_string(
         depth,
         regex_slot: false,
         grouped: 0,
+        argument: false,
     };
     Ok((Expr::Capture(parser.source(Some(TokenKind::RParen))?), end))
 }
@@ -2161,6 +2164,7 @@ fn braced_expression_in_string(
         // expected and a body that merely broke across lines was a syntax error,
         // while `$( … )` and a bare group both took it.
         grouped: 1,
+        argument: false,
     };
     parser.newlines();
     let expression = parser.expression()?;
@@ -2970,6 +2974,16 @@ struct Parser<'a> {
     /// [`Parser::source`], since a block or a capture written inside a group is
     /// back to statements, where a newline separates again.
     grouped: usize,
+    /// Is the operand about to be parsed the **top level of a value argument**,
+    /// where a space ends the argument rather than continuing a postfix chain?
+    ///
+    /// The expression parser lets a call's `(` be spaced — `g ()` and `y = f (1)`
+    /// parse — but in argument position the spacing *is* the separator, so
+    /// `puts (a()) (b())` is two arguments rather than a call of the first on the
+    /// second. Cleared by [`Parser::postfix_operand`] before it descends, since a
+    /// nested expression is back to the ordinary rule, and put back by
+    /// [`Parser::postfix`] for the operands beside it.
+    argument: bool,
 }
 
 /// How deep a nesting the parser accepts before reporting [`ParseErrorKind::TooDeep`].
@@ -3511,7 +3525,15 @@ impl Parser<'_> {
                     Some(CommandItem::Redirect { target, .. }) => target.span.end == start,
                     _ => false,
                 };
-                let expression = self.binary(Self::COMPARISON_PRECEDENCE + 1)?;
+                // Argument position, so a spaced `(` is the next argument rather than
+                // a call on this one — see [`Parser::argument`]. Restored rather than
+                // cleared, since a command written inside a value argument (a capture,
+                // a lambda body) reaches `command` again from a context that is not
+                // itself one.
+                let outer = std::mem::replace(&mut self.argument, true);
+                let expression = self.binary(Self::COMPARISON_PRECEDENCE + 1);
+                self.argument = outer;
+                let expression = expression?;
                 let end = self.tokens[self.position - 1].span.end;
                 // A value argument is a whole argument, so text touching either side of
                 // it is **refused** rather than silently becoming a separate one:
@@ -5294,12 +5316,20 @@ impl Parser<'_> {
     /// still sees the group it is in.
     fn postfix(&mut self) -> Result<Expr, ParseError> {
         let grouped = std::mem::take(&mut self.grouped);
+        // Not taken: [`Parser::postfix_operand`] consumes it, and putting it back
+        // here is what keeps the *next* operand of the same argument at argument
+        // level — `puts (a()) + (b())` reads both under the spacing rule.
+        let argument = self.argument;
         let value = self.postfix_operand();
         self.grouped = grouped;
+        self.argument = argument;
         value
     }
 
     fn postfix_operand(&mut self) -> Result<Expr, ParseError> {
+        // Cleared before descending, so the rule covers this chain alone: written
+        // inside a group or an argument list, `f (1)` keeps its spacing freedom.
+        let argument = std::mem::take(&mut self.argument);
         let mut value = self.primary()?;
         // A glob's attached `(…)` is its qualifier list, so it is read before the
         // call loop below ever sees the `(` — `*(d)` narrows the glob rather than
@@ -5312,13 +5342,16 @@ impl Parser<'_> {
             word.span.end = self.tokens[self.position - 1].span.end;
         }
         loop {
-            // A `(` after a **modifier chain** has to abut it, so command position
-            // keeps `puts $x:upper (1)` a chain plus a separate `(1)` argument rather
-            // than calling the chain's result. Narrow to `Expr::Modifier` on purpose:
-            // a modifier yields a string, list or bool and is never callable, so
-            // nothing legal is refused, while `y = f (1)` keeps its spacing freedom.
+            // A `(` has to **abut** what it calls in two places. In an argument the
+            // spacing is the argument separator, so `puts (a()) (b())` passes two
+            // values rather than calling the first on the second. And after a
+            // **modifier chain** anywhere, so command position keeps
+            // `puts $x:upper (1)` a chain plus a separate `(1)`. The modifier half is
+            // narrow on purpose: a modifier yields a string, list or bool and is never
+            // callable, so nothing legal is refused. Elsewhere a call keeps its spacing
+            // freedom — `y = f (1)` calls, as `g ()` does.
             if self.same(&TokenKind::LParen)
-                && (!matches!(value, Expr::Modifier { .. })
+                && ((!argument && !matches!(value, Expr::Modifier { .. }))
                     || self
                         .peek()
                         .is_some_and(|token| token.span.start == self.previous_end()))
@@ -7643,6 +7676,7 @@ mod tests {
                 depth: 0,
                 regex_slot: false,
                 grouped: 0,
+                argument: false,
             };
             // The whole source, which is what the value parse would consume here.
             let end = parser.tokens.len();
@@ -8221,6 +8255,46 @@ mod tests {
             })
             .collect();
         assert_eq!(words, ["echo", "file.txt", "./tool", "key:2", "xs[0]"]);
+    }
+
+    #[test]
+    fn a_spaced_paren_after_a_value_argument_starts_another_argument() {
+        // A call's `(` may be spaced in an expression (`y = f (1)`), but in argument
+        // position the spacing is what separates arguments, so the second group is the
+        // next argument rather than a call of the first on it. Read as a call,
+        // `puts (a()) (b())` handed `b()`'s value to `a()`'s and passed one argument.
+        let items = |source| {
+            let tree = complete(source);
+            let Executable::Pipeline(pipeline) = &tree.statements[0].and_or.first else {
+                panic!("a pipeline")
+            };
+            pipeline.stages[0]
+                .as_command()
+                .expect("a command stage")
+                .items
+                .len()
+        };
+        // The command word plus two values, not the command word plus one call.
+        assert_eq!(items("puts (a()) (b())"), 3);
+        assert_eq!(items("puts (1 + 2) (3 + 4)"), 3);
+        assert_eq!(items("puts $(pwd) (b())"), 3);
+        // Attached, it is still the call it always was.
+        assert_eq!(items("puts (a())(b())"), 2);
+        assert_eq!(items("puts f(1)"), 2);
+        // Only the argument's own top level: inside a group the spacing freedom is
+        // back, so this is one argument holding one call.
+        assert_eq!(items("puts ((a()) (b()))"), 2);
+    }
+
+    #[test]
+    fn a_spaced_call_keeps_its_parentheses_outside_argument_position() {
+        // The rule is positional, so an expression elsewhere is untouched — `g ()`
+        // and `y = f (1)` are the spellings `GRAMMAR.md` says still parse.
+        let tree = complete("y = f (1)");
+        let Executable::Assignment { value, .. } = &tree.statements[0].and_or.first else {
+            panic!("an assignment")
+        };
+        assert!(matches!(value, Expr::Call { .. }), "{value:?}");
     }
 
     #[test]

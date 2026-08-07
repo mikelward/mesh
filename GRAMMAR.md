@@ -411,7 +411,12 @@ apart from a `WORD`:
 4. **Whole-argument.** Adjacent text on either side is a syntax error rather
    than a second item, so `pre$(x)post` does not silently become three
    arguments. Every step of an attached chain must abut the one before it:
-   `puts $x :upper` is two arguments, `puts $x:upper` is one value.
+   `puts $x :upper` is two arguments, `puts $x:upper` is one value. That
+   includes a call's `(`, which is spaceable elsewhere (`g ()`) but not here,
+   spacing being what separates one argument from the next: `puts (a()) (b())`
+   passes two values, while `puts (a())(b())` calls the first on the second.
+   The rule covers the argument's own top level only — written inside a group
+   or an argument list, `(a()) (b())` is a call again.
 
 ### Bindings and assignment
 
@@ -833,7 +838,9 @@ Argument-free modifiers take no empty parentheses — `:first()` is rejected whe
 **An index and a modifier must abut** what they apply to, and a modifier's
 argument list must abut its name: `$xs [0]`, `abc :upper`, and
 `abc:replaceall ("b", "-")` are all errors. Member access and a call are not
-held to this, so `$m .a` and `g ()` parse.
+held to this, so `$m .a` and `g ()` parse — except in argument position, where
+a call's `(` must abut too, since the spacing there separates arguments (rule 4
+under [value arguments](#value-arguments)).
 
 An attached `..` before a slash stays a path: `../x` is the parent directory,
 not a range. A lone `*` is the glob rather than multiplication, since a binary

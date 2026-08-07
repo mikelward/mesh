@@ -550,6 +550,15 @@ A value argument is a **whole** argument: text attached to it (`pre$(x)post`, `f
 is a syntax error rather than silently three arguments. Quote the word to glue them —
 `"pre$(x)post"`, which interpolates (see [Quoting](#quoting)).
 
+Spacing separates one from the next, so a `(` that does not abut what precedes it
+opens the next argument rather than calling it. An expression elsewhere is freer —
+`y = f (1)` calls — but here the space is doing the separating:
+
+```mesh
+puts (a()) (b())              # two arguments: a's value and b's
+puts (a())(b())               # one: a's value called on b's
+```
+
 A stage that carries a value evaluates it **in its own process**. So backgrounding
 one returns at once — `puts $(sleep 10) &` spends the ten seconds in the job, not at
 the prompt — and a call in a piped or backgrounded argument keeps its changes in that
