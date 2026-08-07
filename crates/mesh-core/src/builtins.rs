@@ -1416,7 +1416,29 @@ fn base64(bytes: &[u8]) -> String {
 /// is read here as a literal leading operand, the way `cd -` and `wait
 /// --timeout` read theirs, not by the parser. `exit status(5)` needs no rule at
 /// all; the call is one word that renders as its code.
+///
+/// The other channel word is refused **by name**. `return value X` is real, so
+/// `exit value 5` is the mistake the `status` spelling invites, and `too many
+/// arguments` answered a question nobody asked: the problem is not how many
+/// operands there are, it is that `exit` has no value channel to fill — a value
+/// needs somewhere to go, and a leaving shell has nowhere.
 fn exit(args: &[String], last: u8) -> Builtin {
+    if args.first().is_some_and(|word| word == "value") {
+        note!("mesh: exit: `exit` has no value channel, use `exit N` or `exit status N`");
+        // The message changes what is *said*, never what happens. This layer sees
+        // strings, so a written `exit value` and a quoted or computed
+        // `exit "value"` are the same bytes here — and a diagnostic must not be
+        // what decides whether the shell leaves, or one particular operand would
+        // silently stop being fatal. So the outcome is whatever the operand
+        // would have produced without the message: alone it is a non-numeric
+        // operand, which reports and still exits with `2`; with more after it,
+        // it is a surplus, which reports and stays.
+        return if args.len() > 1 {
+            Builtin::Status(1)
+        } else {
+            Builtin::Exit(2)
+        };
+    }
     let args = match args {
         [word, rest @ ..] if word == "status" => {
             if rest.is_empty() {

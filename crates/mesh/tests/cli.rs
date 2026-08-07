@@ -1199,6 +1199,58 @@ fn exit_takes_the_status_spelling_beside_the_bare_code() {
 }
 
 #[test]
+fn exit_refuses_the_value_channel_by_name() {
+    // `return value X` is real, so `exit value 5` is the mistake the `status`
+    // spelling invites — and `too many arguments` answered the wrong question.
+    // The problem is not the count: `exit` has no value channel to fill, because
+    // a value needs somewhere to go and a leaving shell has nowhere.
+    // The message changes what is *said*, never what happens. `exit` is
+    // dispatched from strings, so a written `exit value` and a quoted or computed
+    // `exit "value"` arrive identical — a diagnostic must not be what decides
+    // whether the shell leaves, or that one operand would silently stop being
+    // fatal. So each shape keeps the outcome it had before the message existed:
+    // alone it is a non-numeric operand and still exits `2`; with more after it,
+    // it is a surplus and the shell stays.
+    for (source, leaves) in [
+        ("exit value\n", true),
+        ("exit \"value\"\n", true),
+        ("code = \"value\"\nexit $code\n", true),
+        ("exit value 5\n", false),
+        ("exit value 5 7\n", false),
+    ] {
+        let out = run_with_input(&format!("{source}puts still here\n"));
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("`exit` has no value channel"),
+            "{source}: {stderr}"
+        );
+        assert!(
+            stderr.contains("use `exit N` or `exit status N`"),
+            "{source}: the message should name the spellings that work: {stderr}"
+        );
+        if leaves {
+            assert_eq!(out.status.code(), Some(2), "{source}");
+            assert_eq!(String::from_utf8_lossy(&out.stdout), "", "{source}");
+        } else {
+            assert_eq!(
+                String::from_utf8_lossy(&out.stdout),
+                "still here\n",
+                "{source}"
+            );
+        }
+    }
+
+    // Only the bare word is the channel; anything else is an ordinary operand.
+    let other = run_with_input("exit values\n");
+    assert_eq!(other.status.code(), Some(2));
+    assert!(
+        String::from_utf8_lossy(&other.stderr).contains("values: numeric argument required"),
+        "{:?}",
+        other.stderr
+    );
+}
+
+#[test]
 fn exit_rejects_surplus_operands_without_exiting() {
     // A typo like `exit 3 junk` should not terminate the shell; the following
     // command still runs, so the shell exits with echo's status (0), not 3.
