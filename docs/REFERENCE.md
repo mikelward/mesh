@@ -1039,6 +1039,7 @@ argument by hand, and repeating it walks back through earlier commands.
 | `exit [n]` · `exit status n` | Leave the shell with status `n` (default: the last command's status; masked to 0–255). **`exit status n` is the same thing**, written the way [`return status n`](#functions) is, so the two ways of leaving with a status read alike — it disambiguates nothing, since `exit` fills only the status channel. `exit status(n)` needs no rule: the call is one word that renders as its code. `exit status` with no code is an error, as `return status` is, and does not end the shell. `exit value n` is refused by name — `exit` has no value channel to fill, since a value needs somewhere to go and a leaving shell has nowhere. That message only changes what is *said*: `exit` reads words, so a quoted `exit "value"` cannot be told from the written one, and each keeps the outcome its operand would have had — alone it still exits `2`, with more after it the shell stays. Leaves the **whole shell**; to leave only the current function with a status, use `fail`. |
 | `fail [n]` | Leave the current function (or sourced file) with a nonzero status — `1` by default, `n` when given — carrying that status as its value. A **validating wrapper** over `return status(n)`, not exact sugar for it: `fail 0` is refused, where `status(0)` is legal. `return true` is how a function leaves with success. |
 | `prompt [text]` | Set the interactive prompt to `text`. With no arguments, print the current prompt; `--reset` restores the status-sensitive default, and `prompt -- --reset` sets that literal text. |
+| `title text` | Name the window and tab with `OSC 0` — `ESC k` inside screen or tmux, where the name belongs to the pane. The shell titles itself already (`user@host: dir` at the prompt, the command line while one runs); this is how a [`preprompt` or `preexec` hook](#custom-prompts-and-hooks) says something else. Control characters become spaces and the text is cut at 96 characters, as it is for the automatic titles. `title ""` clears it. `$sh.options.osc-title = false` silences this along with the rest, and a terminal off the allowlist is sent nothing. There is no `--reset`: the shell holds no title of its own to restore and a terminal cannot be asked what its title is, so the only question `title` answers is "write this now". **Calling `title` takes the window**: the shell stops naming it from then on, so what you set stays until you or a hook sets something else. A session with only an `on preexec` handler therefore loses the automatic idle title too — see `TODO.md`, which tracks replacing this rule with a shipped hook you can override. Goes to the terminal rather than stdout, as `clip` and `notify` do, so a redirect cannot swallow it: `title x > file` names the window and leaves the file empty. **Refused in a forked pipeline stage** (`title x \| cat`): the write would reach the terminal but the clear mesh owes on the way out would die with the stage, leaving the window named after a shell that has gone. A pipeline's *last* stage runs in the shell itself, so it is allowed. |
 | `on event name function` | Register a named function for a prompt lifecycle event. Reusing `name` within an event replaces that hook without changing its order. |
 | `jobs` | List the jobs, one `[id] State command` per line. |
 | `fg [job]` | Resume a job in the foreground and wait for it. No argument takes the most recent job. |
@@ -1581,6 +1582,35 @@ An external renderer works the same way:
 func refresh-prompt() { prompt "$(starship prompt)" }
 on preprompt renderer refresh-prompt
 ```
+
+The window title is two hooks rather than a setting, because it says two
+different things: where the shell is when it is waiting, and what it is running
+when it is busy. `preprompt` and `preexec` are exactly those two moments, so
+[`title`](#builtins) in each is the whole feature — and the pair is why there is
+no format string to learn. A title and a prompt that should agree share a
+function, not a syntax:
+
+```mesh
+func where-i-am() { "${sh.host}:$(pwd)" }
+
+func title-idle()      { title "${where-i-am()}" }
+func title-busy(cmd)   { title "$cmd — ${where-i-am()}" }
+
+on preprompt title title-idle
+on preexec   title title-busy
+```
+
+Registering either replaces what the shell writes for itself at that moment. The
+two get there differently, which matters only if you are reading the sequence on
+the wire: `preexec` runs after the running title is written, so the hook's simply
+lands second, while the prompt's own title is written after the `preprompt` hooks
+— so that a handler which `cd`s is titled from where it left the shell — and
+stands aside for the prompt where one of them called `title`. Either way the last
+title written is yours, and the halves are independent: titling the busy window
+does not cost you the idle one.
+
+`$sh.options.osc-title = false` turns off both the shell's titles and the hooks',
+so it stays the one switch that means "leave my title bar alone".
 
 Hooks are session-local and run in registration order. Re-registering the same
 event/name pair replaces it in place, making configuration safe to reload.
