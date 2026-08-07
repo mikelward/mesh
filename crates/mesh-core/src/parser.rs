@@ -7760,6 +7760,7 @@ const MODIFIER_NAMES: &[&str] = &[
     "stripend",
     "stripstart",
     "tabs",
+    "tilde",
     "trimend",
     "trimstart",
     "ts",
