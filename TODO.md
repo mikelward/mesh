@@ -5857,15 +5857,88 @@ unguarded, alongside fish and elvish, and carries a `TODO:` naming this entry.
         one also fixed the recorded defect where `p():capture` reported
         `value=1 status=0` while bare `p` left `$sh.status` 1.
 
-- [ ] **Cross-type comparison wants one pass over all types.** Carried over from
-      the status decision, which deliberately took no exception for `Status`:
-      `status(0) == 0` is silently `false`, as `1 == "1"` is, while `$s > 1` is
-      an error, as `1 > "1"` is. The questions to settle together are whether
-      cross-type `==` stays silently false or becomes an error naming the fix
-      (`if 0` already sets the loud precedent), why ordering errors where
-      equality does not, whether numeric types compare across (`1 == 1.0`, where
-      the document and the implementation disagree), and where `Status` lands
-      once those are answered. Whatever equality ends up doing, `match` arms do.
+- [x] **Cross-type `==` reports instead of answering `false`.** ✅ (landed) The
+      first of the four questions this entry collected is settled and built:
+      `==` / `!=` refuse when their two top-level operands are different types,
+      with a hint on the two status pairs naming the spelling that was wanted.
+      A styled value and a string stay one type, since a styled value must
+      behave exactly as its text.
+
+      The refusal is in the **operator**, not in `Value::eq`, and that is forced:
+      `:dedup` is a `HashSet<Value>`, map keys hash to agree with it, and a
+      `match` literal arm is `==` under first-match traversal — none can accept a
+      fallible answer. `DESIGN.md` §"Comparison across types" is canonical.
+
+      The reason `Status` gets no exception is now written down and is stronger
+      than the "the defect is general" one recorded with the status decision: a
+      status admits **two** projections, `$s:code` (int) and `not not $s` (bool),
+      so an equality respecting both forces `0 == status(0) == true`, hence
+      `0 == true`, which `if 0` refuses to let you even ask. The general rule —
+      *a type projecting into more than one other type gets no cross-type
+      equality* — is what leaves `1 == 1.0` open rather than answered.
+
+- [ ] **`match` arms still compare totally, so the seam is real.** `$s == 0`
+      reports while `match $s { 0 => … }` is silently skipped. Widening the
+      refusal to arms would break heterogeneous `match`, so the scope was left at
+      the operator — narrowing later accepts strictly less, so nothing written
+      against today's rule breaks. Decide whether arms should refuse once there
+      is a use that wants it. Same for `in` / `:has`, which answer `false`.
+
+- [ ] **Ordering across types is not settled, and its fall-through is a bug.**
+      `$s > 1` errors, as `1 > "1"` does, so equality and ordering now at least
+      agree that a type mismatch is loud. What is *not* settled is why ordering
+      never had the silent option, and whether the two should share one rule.
+      Separate and worse: ordering has a single numeric arm (int against int) and
+      otherwise compares `as_text`, so `10.0 < 2.0` is **`true`** and
+      `0.5 < 0.10` is **`false`** — see the float entry below.
+
+- [ ] **`and` / `or` are status-lossy — decide whether they yield an operand.**
+      They collapse to a bool and throw the code away, so a status that went in
+      does not come out:
+
+      ```mesh
+      (status(5) or status(3)):repr    # false — both codes gone
+      (status(0) and status(3)):repr   # false
+      (not status(7)):repr             # true
+      ```
+
+      The command chains do the opposite: `a || b` leaves *b*'s status when `a`
+      fails, which is the thing a wrapper forwards. Now that a status is a value
+      and `and` / `or` accept one (they inherit the condition rule), the two
+      spellings disagree about what a chain is worth. Options, cheapest first:
+      **(a)** keep the bool and document the loss; **(b)** yield the operand that
+      decided the answer, as Python and Lua do, so `status(5) or status(3)` is
+      `status(3)` and the bool cases are unchanged; **(c)** yield an operand only
+      when both sides are statuses, which avoids changing `$a or $b` for bools
+      but adds a type-dependent rule. (b) is the one that makes
+      `func f() { some-cmd or fallback-cmd }` forward a real status.
+
+      Note this is the same projection machinery as the equality entry above: the
+      bool that `and` produces *is* the success projection, reified. Whatever is
+      decided here should agree with the rule that a status has two readings and
+      the language does not silently pick one.
+
+- [ ] **There is no float type, and decimal text compares lexicographically.**
+      `Value` has no float variant, so `1.0` lexes as the string `'1.0'`. The
+      arithmetic half is a loud error (`(1.0 + 1)` says "expected integer"), but
+      the comparison half is silent and wrong, because ordering falls through to
+      `as_text` when it is not int-against-int:
+
+      ```mesh
+      (10.0 < 2.0)   # true
+      (0.5 < 0.10)   # false
+      (1.0 < 2.0)    # true — right answer, by coincidence of digit order
+      ```
+
+      Two separable pieces of work. The **defect** is the silent fall-through:
+      even with no float type, decimal-looking strings sorting as strings is a
+      wrong answer nobody asked for, and the error message
+      ("comparison requires two integers or two strings") is honest about a rule
+      that no longer matches what `DESIGN.md` §Arithmetic promises. The
+      **feature** is the float type itself, which that section specifies in full
+      — promotion on mixed arithmetic, exact cross-type comparison rather than an
+      `i64`→`f64` cast, `1 == 1.0` true, and a `Hash` that agrees. Both docs now
+      carry a not-implemented note so the sections stop reading as behavior.
 
 - [ ] **The callable-variable note only reaches an unstaged foreground command.**
       `double = func(x) { … }; double 5` reports ``command not found: double

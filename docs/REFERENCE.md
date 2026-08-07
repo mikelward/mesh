@@ -1743,11 +1743,24 @@ mesh already loses type there (the int `5` and the string `"5"` both write `5`, 
 `status(5)`, which is forced by its round-trip contract, and
 [`:code`](#modifiers) is how you reach the integer.
 
-It compares like every other type, which is to say **strictly**: `status(0) == 0` is
-`false` (as `1 == "1"` is), `$s > 1` is an error, and a `0` arm never matches a
-status. `$s == status(0)` and `$s:code == 0` are the spellings that work. So a
-`$sh.status == 0` written out of shell reflex says nothing — write the condition
-instead.
+It compares like every other type, which is to say **strictly**: a cross-type
+`==` **reports** rather than answering `false`, so `status(0) == 0` and
+`status(0) == true` are both errors naming the spelling to use instead, and
+`$s > 1` is an error too. `$s == status(0)` and `$s:code == 0` are what work. So
+a `$sh.status == 0` written out of shell reflex no longer says nothing quietly —
+it says what to write.
+
+The reason it compares with neither an int nor a bool is that a status **admits
+both readings**: `$s:code` is its integer and `not not $s` is its success, and an
+equality respecting both would make `0 == status(0) == true` — hence `0 == true`,
+which `if 0` refuses to let you even ask. It respects neither, and each reading
+keeps its own spelling.
+
+One seam, deliberate and worth knowing: the refusal is the `==` / `!=` operator
+only. Underneath, equality stays total — so a `0` arm in a `match` on a status is
+silently **skipped** rather than reported, `1 in [1, "a"]` answers, and
+`[1, 1, "1"]:dedup` gives two elements. That totality is what `:dedup`, map keys
+and `match` dispatch are built on.
 
 A **condition** — the subject of `if` / `while`, a `stmt if cond` guard, a `match`
 arm guard, or an operand of `and` / `or` / `not` — is a **bool, a status, or a
@@ -2889,11 +2902,25 @@ identifier rather than a quantity: a mode, a version segment, a zero-padded
 index. Arithmetic on one asks for the conversion (`$n:int + 1`), which is the
 rule every other string already follows.
 
-`1_0`, `0x10` and `1e3` are also strings today, but for a different reason: the
-grouped, radix and exponent forms are **not implemented yet**. `DESIGN.md`
-decides them as integer and float literals, so this is a gap rather than the rule
-above — and when they land, each will have to settle which text *it* renders back
-to, since `0x10` returning as `16` would lose a spelling exactly as `007` did.
+`1.0`, `1_0`, `0x10` and `1e3` are also strings today, but for a different reason:
+**there is no float type**, and the grouped, radix and exponent forms are **not
+implemented yet**. `DESIGN.md` decides them as integer and float literals, so this
+is a gap rather than the rule above — and when they land, each will have to settle
+which text *it* renders back to, since `0x10` returning as `16` would lose a
+spelling exactly as `007` did.
+
+Two consequences of the missing float are worth stating outright, because they
+read as working code:
+
+```mesh
+(1.0 + 1)      # error: expected integer — `1.0` is the string '1.0'
+(10.0 < 2.0)   # true  — ordering falls through to text, so decimals sort
+(0.5 < 0.10)   # false   lexicographically rather than numerically
+```
+
+Ordered comparison has one numeric path (int against int) and otherwise compares
+text, so a decimal-looking string sorts as a string. `1.0 < 2.0` answering
+correctly is a coincidence of digit order, not arithmetic.
 
 Integers and booleans have canonical
 command/interpolation renderings (`42`, `true`, and `false`). Lists and maps keep
@@ -2909,6 +2936,24 @@ membership (`in`), and boolean `not`, `and`, and `or`. Ordered comparisons
 require two integers or two strings; arithmetic never implicitly parses a
 string (use `:int` explicitly). Comparisons cannot be chained, and neither can
 ranges: `1 .. 2 .. 3` is a syntax error, since a range is not an endpoint.
+
+**Equality is same-type only.** `==` and `!=` **report** when their two operands
+are different types rather than answering `false`, because a quiet answer is
+indistinguishable from a real inequality:
+
+```mesh
+1 == "1"           # error: cannot compare an int with a string
+$sh.status == 0    # error: cannot compare a status with an int; …
+1 == 1             # true
+style("a", fg: red) == "a"   # true — a styled value is its text
+```
+
+A styled value and a plain string are one type for this, the only grouping the
+rule makes. The refusal is the **top-level operands of `==` / `!=`** and nothing
+else: nested pairs, `in`, `:dedup`, map keys and `match` literal arms all use
+total equality and answer `false` rather than reporting, since each of those can
+only accept a bool. `DESIGN.md`
+§"Comparison across types" states that seam and why it is scoped this way.
 
 `not` is a **reserved word**, and it negates one of two things: a **value**, or a
 **command's status**. Which one is decided by the operand — a value after it is the
