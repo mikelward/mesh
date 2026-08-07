@@ -6735,7 +6735,7 @@ fn hook_title_harness(exec: &MeshExec) -> i32 {
 }
 
 #[test]
-fn a_hand_typed_title_takes_the_window() {
+fn the_shipped_hooks_name_the_window() {
     let exec = MeshExec::with_environment(
         isolated_config_home(),
         &[("TERM", "xterm-256color"), ("USER", "tester")],
@@ -6748,7 +6748,7 @@ fn a_hand_typed_title_takes_the_window() {
     await_pty_harness(harness);
 }
 
-/// Calling `title` takes the window: the shell stops naming it from then on.
+/// The shipped `preprompt` / `preexec` hooks name the window, and keep naming it.
 ///
 /// The rule has no lifetime, which is the point — its predecessor was a per-prompt
 /// claim released at the next submitted command, and the *lifetime* went wrong
@@ -6788,9 +6788,10 @@ fn title_ownership_harness(exec: &MeshExec) -> i32 {
     let Some(reprompt) = pty_read_until_one_of(shell.master, &[INPUT_READY]) else {
         return 235;
     };
-    // The regression: the automatic title rides in with that redrawn prompt,
-    // overwriting CUSTOM even though nothing was submitted.
-    if occurrences(&reprompt, AUTOMATIC) != 0 {
+    // The redrawn prompt runs `preprompt` again, so the shipped hook titles again
+    // and CUSTOM is gone. `title` is the mechanism a hook calls, not a way to
+    // claim the window from one — replacing the hook is how you do that.
+    if occurrences(&reprompt, AUTOMATIC) == 0 {
         return 236;
     }
     // And a submitted command does not hand the window back either — the window
@@ -6810,11 +6811,9 @@ fn title_ownership_harness(exec: &MeshExec) -> i32 {
     let Some((seen, status)) = pty_read_until_command_done(shell.master) else {
         return 238;
     };
-    if status != 0 || occurrences(&seen, AUTOMATIC) != 0 {
+    // And `preexec` names the window after the command that is running.
+    if status != 0 || occurrences(&seen, b"\x1b]0;puts MARK\x07") == 0 {
         return 239;
-    }
-    if occurrences(&seen, b"\x1b]0;puts MARK\x07") != 0 {
-        return 228;
     }
     if !pty_write(shell.master, b"exit 0\n") {
         return 240;
@@ -20518,6 +20517,33 @@ fn a_bare_list_to_an_external_command_is_still_an_error() {
 }
 
 #[test]
+fn the_prelude_is_readable_from_the_shell() {
+    // The defaults are shipped as source so they can be read and replaced; a
+    // prelude nobody can print is just Rust with extra steps.
+    let out = run_with_input("puts $sh.prelude\n");
+    let text = String::from_utf8_lossy(&out.stdout);
+    for expected in [
+        "func mesh-title-idle()",
+        "func mesh-title-busy(command)",
+        "on preprompt title mesh-title-idle",
+        "on preexec title mesh-title-busy",
+        // Trimmed, or a command typed with leading spaces titles the window with
+        // a run of blanks — the behavior the deleted `running_title` had.
+        ":trimstart:trimend",
+    ] {
+        assert!(
+            text.contains(expected),
+            "prelude missing `{expected}`:\n{text}"
+        );
+    }
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
 fn tilde_writes_home_back_as_a_tilde() {
     // `$HOME` is set on the child rather than the test process, which shares one
     // environment across parallel tests.
@@ -28084,8 +28110,8 @@ fn the_sh_namespace_lists_its_runtime_entries() {
     let out = run_with_input("puts ...$sh:keys\n");
     assert_eq!(
         String::from_utf8_lossy(&out.stdout),
-        "status pipestatus pid ppid uid host fqdn version interactive width stdin stdout stderr \
-         jobs origin source options preprompt preexec postexec precd postcd jobdone exit \
+        "status pipestatus pid ppid uid host fqdn version prelude interactive width stdin stdout \
+         stderr jobs origin source options preprompt preexec postexec precd postcd jobdone exit \
          name args\n"
     );
 

@@ -36,9 +36,11 @@ func mesh-title-idle() {
     if $who == "" { title $where } else { title "$who: $where" }
 }
 
-# While a command runs: what is running.
+# While a command runs: what is running. Trimmed, or a command typed with
+# leading whitespace names the window with a run of spaces.
 func mesh-title-busy(command) {
-    title $command
+    name = $command:trimstart:trimend
+    title $name
 }
 
 on preprompt title mesh-title-idle

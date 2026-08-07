@@ -1353,6 +1353,13 @@ impl Vars {
                 "version".to_owned(),
                 Value::String(env!("CARGO_PKG_VERSION").to_owned()),
             ),
+            // The shipped defaults, as their own source. Readable is the point:
+            // they are ordinary functions a user replaces, so `puts $sh.prelude`
+            // has to show what it is they would be replacing.
+            (
+                "prelude".to_owned(),
+                Value::String(crate::repl::PRELUDE.to_owned()),
+            ),
             ("interactive".to_owned(), Value::Boolean(self.interactive)),
             // Read here, on each access, rather than cached and refreshed on
             // `SIGWINCH`. `TIOCGWINSZ` is what the kernel answers from, and it is

@@ -1356,7 +1356,18 @@ with its switch: add an `Opt` variant in `options.rs` and read it through
       error path. A rule with no lifetime cannot be any of those. What it costs is
       that it cannot tell "titles sometimes" from "owns the title", so a session
       with only an `on preexec` handler loses the automatic idle title as well.
-- [ ] **The automatic title as *default hook entries*** — `$sh.preprompt.title`
+- [ ] **Collapse `TitleSink` now that only `title` writes titles.** With the
+      shipped titles moved into the prelude, every title goes through the `title`
+      builtin to `/dev/tty`, so `TitleSink::Written` — the stdout arm — can no
+      longer be constructed outside its own tests. That variant and the machinery
+      under it (`written_on_stdout`, `stdout_is_terminal`, `report_failed_write`,
+      and the name-matching guard in `TitleSink::write`) is the whole of the
+      descriptor-and-recycled-pts saga from #452, and it is now unreachable.
+      Removing it collapses the debt to "the clear sequences owed to `/dev/tty`"
+      and deletes the two-terminal limitation with it. Left standing only to keep
+      the prelude change reviewable; it should not survive, since unreachable code
+      with tests pinning it reads as live.
+- [x] **The automatic title as *default hook entries*** — `$sh.preprompt.title`
       and `$sh.preexec.title`, reassignable and `unset`-able like any other hook,
       instead of Rust that a hook merely outranks. It is the shape the segment
       map already promises (`unset $sh.prompt.commit`), it would make the default
