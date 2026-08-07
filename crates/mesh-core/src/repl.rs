@@ -7348,6 +7348,54 @@ fn condition_hint(value: &Value) -> &'static str {
     }
 }
 
+/// How to ask the comparison you meant, where the pair has a ready spelling.
+///
+/// Only the two status pairs earn one. They are the shell reflexes — `$sh.status
+/// == 0` and `$sh.status == true` — so they are what a reader reaches for, and
+/// each has a spelling that says which of a status's two readings was wanted:
+/// its **code**, or its **success**. That a status admits both, and equality
+/// therefore respects neither, is the whole of `DESIGN.md` §"Comparison across
+/// types". Every other mismatch is a plain refusal, since a hint that only
+/// restated the two type names would be noise.
+///
+/// The hint is generated from **both** the operator and the operand the writer
+/// actually wrote, because discarding either one produces a hint that is worse
+/// than none: it looks pasteable and asks a different question. `$s != 0`
+/// answered with `$s:code == 0` reverses the predicate, and `status(3) == 5`
+/// answered with `:code == 0` turns a code-specific test into a success test.
+/// Both raised in review.
+fn comparison_hint(left: &Value, right: &Value, negated: bool) -> Option<String> {
+    let operator = if negated { "!=" } else { "==" };
+    match (left, right) {
+        (Value::Status(_), Value::Integer(code)) | (Value::Integer(code), Value::Status(_)) => {
+            // Only 0–255 names a status, so a code outside it gets the `:code`
+            // half alone — `status(300)` is itself an error, and a hint that
+            // does not run is worse than a shorter one.
+            Some(match u8::try_from(*code) {
+                Ok(code) => format!(
+                    "compare the code (`…:code {operator} {code}`) \
+                     or a status (`… {operator} status({code})`)"
+                ),
+                Err(_) => format!(
+                    "compare the code (`…:code {operator} {code}`); \
+                     no status carries a code outside 0-255"
+                ),
+            })
+        }
+        (Value::Status(_), Value::Boolean(wanted)) | (Value::Boolean(wanted), Value::Status(_)) => {
+            // Testing a status directly asks whether it *succeeded*, so the
+            // polarity is the operator and the literal together, not either
+            // alone: `== false` and `!= true` both ask about failure.
+            Some(if *wanted != negated {
+                "a status is already a condition, so test it directly (`if … { }`)".to_string()
+            } else {
+                "a status is already a condition, so test it directly (`if not … { }`)".to_string()
+            })
+        }
+        _ => None,
+    }
+}
+
 /// A value's type, with its article, for a diagnostic that reads as a sentence.
 fn type_phrase(value: &Value) -> &'static str {
     match value {
@@ -7400,34 +7448,40 @@ fn compile_regex(value: &RegexValue) -> Result<regex::Regex, String> {
 
 fn eval_binary(left: Value, op: parser::BinaryOp, right: Value) -> Result<Value, String> {
     use parser::BinaryOp::*;
-    // A flag compares to flags. Against anything else `==` and `!=` **refuse**
-    // rather than answering `false`, because a silent answer hides exactly the
-    // flag-versus-data confusion the type exists to surface: `x = --force;
-    // $x == "--force"` is a question whose two readings the writer has not told
-    // apart, and refusing beats guessing.
+    // A value compares to its own type. Across types `==` and `!=` **refuse**
+    // rather than answering `false`, because a quiet answer is indistinguishable
+    // from a real inequality: `$sh.status == 0` is the shell reflex, and as a
+    // silent `false` the writer cannot tell "the types do not meet" from "the
+    // command succeeded and this is somehow still false". Refusing names the
+    // fix. `if 0` already sets the loud precedent for a question mesh will not
+    // guess the meaning of.
     //
     // The refusal is the **top-level operand pair only**. Everything else uses
     // total equality — a nested pair (`[--help] == ["--help"]`) is unequal
-    // rather than an error, and `in` answers `false` — because drawing it
-    // deeper means a second, fallible comparator walking lists and map values
-    // beside `Value::eq`, to serve a case nobody writes.
+    // rather than an error, `in` answers `false`, and a `match` literal arm of
+    // another type simply does not match — because `Value::eq` is what
+    // `:dedup`, list `-`, hashing and `match` dispatch are built on, and each
+    // of those can only accept a bool. So the refusal has to live in the
+    // operator, never in the equality beneath it. `DESIGN.md` §"Comparison
+    // across types" states the resulting seam.
     if matches!(op, Equal | NotEqual) {
-        // The terminator is a type of its own, **not** a flag, so it has to be
-        // its own kind here: grouping the two made `--force == --` a silent
-        // `false`, which is the confusion this refusal exists to surface, one
-        // type over. Everything that is neither shares kind 0, so an ordinary
-        // pair like `1 == "1"` is untouched and answers `false` as before.
-        let kind = |value: &Value| match value {
-            Value::Flag(_) => 1,
-            Value::FlagTerminator => 2,
-            _ => 0,
-        };
-        if kind(&left) != kind(&right) {
-            return Err(format!(
+        // Kinds are `type_phrase`'s own groupings, which is what keeps a styled
+        // value comparable with its text — both answer "a string", as the rule
+        // that a styled value behaves exactly as its text requires — while every
+        // other variant stands alone. Deriving the kind from the phrase also
+        // means the message can never read "cannot compare a string with a
+        // string", and a new variant gets a kind the moment it gets a name.
+        if type_phrase(&left) != type_phrase(&right) {
+            let mut message = format!(
                 "cannot compare {} with {}",
                 type_phrase(&left),
                 type_phrase(&right)
-            ));
+            );
+            if let Some(hint) = comparison_hint(&left, &right, matches!(op, NotEqual)) {
+                message.push_str("; ");
+                message.push_str(&hint);
+            }
+            return Err(message);
         }
     }
     Ok(match op {

@@ -1402,6 +1402,23 @@ loud error, never a wrap. There is a **float** (`f64`, below) but no unsigned ty
 and no arbitrary-precision integer; `Duration` and `Instant` carry their own closed
 arithmetic, defined with the time model.
 
+> **Not implemented.** The float half of this section is **design only** — `Value`
+> has no float variant, so `1.0` lexes as the *string* `'1.0'` and every claim
+> below about float behavior describes what is intended, not what runs. Two
+> consequences are live defects rather than missing features, because they read as
+> working:
+>
+> ```mesh
+> (1.0 + 1)      # error: expected integer — not 2.5
+> (10.0 < 2.0)   # true  — decimal text compares lexicographically
+> (0.5 < 0.10)   # false — same cause
+> ```
+>
+> Ordering has one numeric arm (int vs int) and otherwise falls through to text,
+> so decimal-looking strings sort as strings. `1.0 < 2.0` giving the right answer
+> is a coincidence of digit order. Tracked in `TODO.md`; until a float type
+> exists, do not read this section as describing behavior.
+
 **Where arithmetic happens** *(decided)*. A bare word is a command, so arithmetic
 needs a context that is unambiguously a value. There are two, following nushell and
 PowerShell:
@@ -1561,7 +1578,12 @@ compares the two exactly for this reason; JavaScript before BigInt is the
 cautionary tale.
 
 **`1 == 1.0` is true**, and equality stays type-strict against everything else
-(`1 == "1"` is still false). This is a **choice**, not something rendering forces:
+(`1 == "1"` **reports**, per
+[Comparison across types](#comparison-across-types) — it was a silent `false`
+when this paragraph was written). The two rules agree rather than conflict: int
+and float share a single projection, the number, so respecting it forces no
+contradiction, which is exactly the test that entry sets for when a cross-type
+equality is allowed at all. This is a **choice**, not something rendering forces:
 `42` and `"42"` already display identically and compare unequal, so "renders the
 same" has never implied "is the same" here. The reason is that every language that
 widens on mixed arithmetic — Python, Lua, Ruby — compares numerically across its
@@ -4387,6 +4409,93 @@ relations (`-nt`/`-ot`/`-ef`) are settled above as `$a:mtime > $b:mtime` and
 through the value-side `:match` extractor, and a `/re/` `match` arm does **not**
 auto-bind (see [Matching](#matching-match)) — so `~` stays a pure predicate.
 
+#### Comparison across types
+
+`==` and `!=` **refuse** when their two operands are different types, rather than
+answering `false`:
+
+```mesh
+$sh.status == 0    # error: cannot compare a status with an int;
+                   #        compare the code (`…:code == 0`) or a status (`… == status(0)`)
+1 == "1"           # error: cannot compare an int with a string
+status(0) == true  # error: cannot compare a status with a bool;
+                   #        a status is already a condition, so test it directly (`if … { }`)
+```
+
+A silent `false` is unfalsifiable at the call site: the writer cannot tell "these
+types do not meet" from "these values are genuinely unequal", so the answer looks
+like data when it is really a category error. `$sh.status == 0` is the case that
+forces the issue — it is the spelling shell reflex reaches for, and as a quiet
+`false` it is *always* wrong and *never* says so. [`if 0`](#conditions) already
+sets the loud precedent for a question mesh declines to guess the meaning of.
+
+A **styled value and a plain string are one type** here, the single grouping the
+rule keeps, because a styled value has to behave exactly as its text. The kinds
+are the diagnostic's own type names, so the message can never read "cannot
+compare a string with a string".
+
+**The refusal lives in the operator, not in equality.** This is forced, not
+stylistic. `Value`'s equality is what [`:dedup`](#modifiers) (a hash set), map
+keys (whose `Hash` must agree with it), and [`match`](#matching-match) literal
+arms are built on, and each of those can only accept a bool — a fallible equality
+would have nothing to hand them. So the refusal is scoped to the **top-level
+operand pair of `==` / `!=`**, and everything beneath it stays total:
+
+```mesh
+[1] == ["1"]                # false — nested, not an error
+1 in [1, "a"]               # true;  "x" in [1] is false
+[1, 1, "1"]:dedup:len       # 2 — `1` and `"1"` are distinct, not a report
+match $sh.status { 0 => … } # the arm is silently skipped, not an error
+```
+
+That last line is the **seam, and it is deliberate**: `$s == 0` reports while a
+`0` arm against the same status quietly does not match. Widening the refusal to
+arms would break heterogeneous `match`, which is a real use, so the seam is the
+accepted cost of the operator-level scope. It can be narrowed later — refusing in
+more places accepts strictly less, so nothing written against today's rule breaks
+— which is why the scope went here first.
+
+##### Why `Status` gets no cross-type equality
+
+Not squeamishness about a new type: a `Status` **admits two projections**, and
+both are reachable as values today.
+
+| projection | spelling | yields |
+|---|---|---|
+| its code | `$s:code` | an int |
+| its success | `not not $s` | a bool |
+
+Equality could respect one or the other, and each is defensible alone. It cannot
+respect both, because `==` is transitive and holding both gives
+
+```
+0 == status(0) == true    ⟹    0 == true
+```
+
+which is exactly the proposition `if 0` refuses to let you even ask. Nothing
+picks between them on principle, so equality respects **neither**, and each
+projection keeps its own spelling.
+
+That generalizes past `Status`, and is the rule to apply to any type added later:
+
+> **A type that projects into more than one other type gets no cross-type
+> equality.** A type with a single projection may have one.
+
+Which is why `1 == 1.0` is a *different* question and stays open — int and float
+share one projection, the number, so respecting it creates no contradiction. (No
+float type exists yet; see [Arithmetic](#arithmetic).)
+
+Note also that **truthiness is not equality**. `if $s { … }` works because a
+status is admitted as a condition directly — success and failure are the whole of
+what it encodes — and that reading never produces a `Boolean` value for anything
+to compare against. So `$s == true` is refused rather than true, and there is no
+inconsistency between the two.
+
+*TODO — ordering (`<` `<=` `>` `>=`) is not settled by this entry.* It still
+errors across types, which leaves equality and ordering answering type mismatch
+in the same voice for the first time, but the fall-through to lexicographic text
+comparison is a separate defect (see the TODO on numeric text).
+
 ### Error handling
 
 mesh keeps **two distinct failure channels** and deliberately does not merge them
@@ -6523,41 +6632,37 @@ remain under-specified.
     yields *instead* is `Status(0)` per the rule below — not the bare int `0` it
     produces today.
 
-  **`Status` follows the existing cross-type comparison rules, whatever they are.**
-  No exception is carved for it. Measured on `main`, those rules are asymmetric:
+  **`Status` carves no exception in comparison**, and cross-type `==` now
+  **reports** rather than answering `false` — settled under
+  [Comparison across types](#comparison-across-types), which is canonical for
+  this. In short:
 
   ```mesh
-  1 == "1"    # false — silently
-  1 > "1"     # error: comparison requires two integers or two strings
+  $s == 0            # error, naming both spellings below
+  $s == status(0)    # the status comparison
+  $s:code == 0       # the integer one
+  $s > 1             # still an error; ordering is not settled by that entry
   ```
 
-  So `status(0) == 0` is **`false`**, `$s > 1` is an **error**, and
-  `match f() { 0 => … }` never matches a `Status` — that arm is silently dead.
-  The spellings that work are `$s == status(0)` and **`$s:code`** for the integer
-  (`$s:code == 0`, `$s:code > 1`). Arithmetic stays refused.
+  Two earlier drafts of this entry tried to fix the ergonomics locally — first by
+  erroring on `Status`-vs-int alone, then by making the two compare equal — and
+  both were wrong, though not for the reason recorded at the time. The recorded
+  reason was that the defect is general rather than about `Status`; the *stronger*
+  one is that a `Status` admits **two** projections, its code and its success,
+  both reachable as values (`$s:code` and `not not $s`), so an equality respecting
+  both would force `0 == true` by transitivity. It respects neither, and the
+  general rule that falls out — a type projecting into more than one other type
+  gets no cross-type equality — is what also leaves `1 == 1.0` open rather than
+  answered, since int and float share only one projection.
 
-  This is deliberately *not* the ergonomic choice, and the cost is real: a
-  `$sh.status == 0` written out of shell reflex is always false and says nothing.
-  Two earlier drafts of this entry tried to fix that locally — first by erroring
-  on `Status`-vs-int, then by making them compare equal — and both were wrong for
-  the same reason. **The problem is not about `Status`.** `1 == "1"` being
-  silently false is the identical trap, this document already calls it "a trap
-  those quotes are all that hold shut," and `1 == 1.0` is a third instance where
-  the [`:repr`](#modifiers) rationale and the implementation *disagree about the
-  answer*. A special case for one new type would paper over one corner of a
-  general defect and make the language less predictable in the process.
+  It also removes a cost the compare-equal draft carried: `Value`'s hand-written
+  `PartialEq` and `Hash` have nothing to reconcile when no equivalence is claimed,
+  so `:dedup` needs no special handling — and that totality is precisely what
+  forced the refusal into the *operator* rather than into equality itself.
 
-  It also removes a cost that the compare-equal draft carried: `Value`'s
-  hand-written `PartialEq` and `Hash` have nothing to reconcile when no
-  equivalence is claimed, so `:dedup` needs no special handling.
-
-  *TODO — cross-type comparison wants one pass over all types, not per-type
-  patches.* The questions to settle together: whether cross-type `==` stays
-  silently `false` or becomes an error naming the fix (`if 0` already sets the
-  loud precedent for conditions); why ordering errors where equality does not;
-  whether numeric types compare across (`1 == 1.0`) and which of the document or
-  the implementation is right about it; and where `Status` lands once those are
-  answered. Whatever equality ends up doing, arms do.
+  *TODO — `match` arms still compare totally*, so `match f() { 0 => … }` against a
+  status is silently skipped where `$s == 0` reports. That seam is stated and
+  accepted in the canonical entry; narrowing it later accepts strictly less.
 
   **Rendering is the bare number** — `status(5)` displays as `5`. A "`status 5`"
   rendering was considered on the grounds that `5` is confusable with the

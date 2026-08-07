@@ -289,7 +289,9 @@ command, so a first `puts` would replace what a second one reports.
 Because a status is a value, it travels: `exit status $sh.status` leaves the
 shell with the one the last command left, and `exit 3` is the same thing written
 out. `:code` gives the integer when you need to compare against a number, since
-a status compares only with another status.
+a status compares only with another status — `$sh.status == 0` reports and tells
+you to write `$sh.status:code == 0` or `$sh.status == status(0)`, rather than
+quietly answering `false`.
 
 `not` in front of a command inverts what it reports:
 

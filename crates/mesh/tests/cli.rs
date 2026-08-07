@@ -14772,20 +14772,91 @@ fn a_status_is_a_condition_and_the_boolean_words_take_one() {
 
 #[test]
 fn a_status_compares_only_with_another_status() {
-    // No exception is carved for the type: it follows the cross-type rules
-    // already in force, which are asymmetric — `==` is silently false where `>`
-    // is an error, exactly as for `1 == "1"` and `1 > "1"`.
+    // No exception is carved for the type: it follows the cross-type rule now in
+    // force for every pair, which **refuses** rather than answering `false`.
     let out = run_with_input(
         "s = status(0)\n\
-         puts ($s == 0)\n\
          puts ($s == status(0))\n\
          puts ($s != status(1))\n\
          puts ($s:code == 0)\n",
     );
-    assert_eq!(
-        String::from_utf8_lossy(&out.stdout),
-        "false\ntrue\ntrue\ntrue\n"
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "true\ntrue\ntrue\n");
+
+    // `$sh.status == 0` is the shell reflex, so it is the pair the diagnostic
+    // has to teach rather than merely refuse. A status admits two readings — its
+    // code and its success — and the hint names the spelling for each, which is
+    // why equality itself respects neither (`DESIGN.md` §"Comparison across
+    // types").
+    let against_int = run_with_input("s = status(0)\nputs ($s == 0)\nputs after\n");
+    let stderr = String::from_utf8_lossy(&against_int.stderr);
+    assert!(
+        stderr.contains("cannot compare a status with an int")
+            && stderr.contains(":code == 0")
+            && stderr.contains("status(0)"),
+        "{stderr:?}"
     );
+    assert_eq!(String::from_utf8_lossy(&against_int.stdout), "after\n");
+
+    // The other projection, refused the same way: a status is truthy as a
+    // *condition* without being equal to `true`, and conflating the two is what
+    // would force `0 == true` by transitivity.
+    let against_bool = run_with_input("s = status(0)\nputs ($s == true)\nputs after\n");
+    let stderr = String::from_utf8_lossy(&against_bool.stderr);
+    assert!(
+        stderr.contains("cannot compare a status with a bool")
+            && stderr.contains("already a condition"),
+        "{stderr:?}"
+    );
+    assert_eq!(String::from_utf8_lossy(&against_bool.stdout), "after\n");
+
+    // A hint is built from the operator **and** the operand, because dropping
+    // either produces something that looks pasteable and asks a different
+    // question: `$s != 0` hinted as `$s:code == 0` inverts the branch, and
+    // `status(3) == 5` hinted as `:code == 0` turns a code test into a success
+    // test. Both raised in review.
+    for (source, code_form, status_form) in [
+        ("$s == 0", "`…:code == 0`", "`… == status(0)`"),
+        ("$s != 0", "`…:code != 0`", "`… != status(0)`"),
+        ("$s == 5", "`…:code == 5`", "`… == status(5)`"),
+        ("$s != 5", "`…:code != 5`", "`… != status(5)`"),
+    ] {
+        let out = run_with_input(&format!("s = status(3)\nputs ({source})\n"));
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains(code_form) && stderr.contains(status_form),
+            "{source} should hint {code_form} and {status_form}: {stderr:?}"
+        );
+    }
+
+    // A code outside 0-255 has no status to name, so the `status(N)` half is
+    // dropped rather than suggesting `status(300)`, which is itself an error.
+    for source in ["$s == 300", "$s == -1"] {
+        let out = run_with_input(&format!("s = status(3)\nputs ({source})\n"));
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("no status carries a code outside 0-255")
+                && !stderr.contains("or a status"),
+            "{source}: {stderr:?}"
+        );
+    }
+
+    // The bool pair's polarity is the operator and the literal together: `==
+    // false` and `!= true` both ask about failure, so both want `not`.
+    for (source, wants_not) in [
+        ("$s == true", false),
+        ("$s != true", true),
+        ("$s == false", true),
+        ("$s != false", false),
+    ] {
+        let out = run_with_input(&format!("s = status(0)\nputs ({source})\n"));
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(
+            stderr.contains("`if not … { }`"),
+            wants_not,
+            "{source} should{} want `not`: {stderr:?}",
+            if wants_not { "" } else { " not" }
+        );
+    }
 
     let ordered = run_with_input("s = status(3)\nputs ($s > 1)\nputs after\n");
     assert!(
@@ -14804,6 +14875,77 @@ fn a_status_compares_only_with_another_status() {
          puts $x\n",
     );
     assert_eq!(String::from_utf8_lossy(&arms.stdout), "status-arm\n");
+}
+
+/// Cross-type `==` **refuses**, and the refusal lives in the *operator* so that
+/// `Value::eq` stays total underneath it.
+///
+/// The split is forced rather than stylistic. `:dedup` is a `HashSet<Value>`, a
+/// map key hashes to agree with that equality, and a `match` literal arm is `==`
+/// under first-match traversal — each can only accept a bool, so a fallible
+/// equality would have nothing to hand them. Refusing at the operator fixes the
+/// reflex spelling where it is written and leaves all three total, at the cost
+/// of a seam `DESIGN.md` §"Comparison across types" states outright.
+#[test]
+fn cross_type_equality_refuses_at_the_operator_and_stays_total_beneath() {
+    // Every mismatched pair reports, naming both types. `!=` refuses with it —
+    // answering `true` there is the same guess wearing the opposite sign.
+    for (source, message) in [
+        ("1 == \"1\"", "cannot compare an int with a string"),
+        ("1 != \"1\"", "cannot compare an int with a string"),
+        ("0 == false", "cannot compare an int with a bool"),
+        ("status(0) == 0", "cannot compare a status with an int"),
+        ("[1] == 1", "cannot compare a list with an int"),
+    ] {
+        let out = run_with_input(&format!("puts ({source})\nputs after\n"));
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains(message),
+            "{source} should refuse: {:?}",
+            out.stderr
+        );
+        assert_eq!(String::from_utf8_lossy(&out.stdout), "after\n");
+    }
+
+    // Same type still compares, and a styled value still equals its text — the
+    // single grouping the rule keeps, since a styled value must behave exactly
+    // as its text. Both answer "a string", so they are one kind.
+    let same = run_with_input(
+        "puts (1 == 1)\n\
+         puts (\"a\" == \"a\")\n\
+         puts (style(\"a\", fg: red) == \"a\")\n",
+    );
+    assert_eq!(String::from_utf8_lossy(&same.stdout), "true\ntrue\ntrue\n");
+
+    // Beneath the operator, equality stays total in all four places that need a
+    // bool. Nested in a list, nested in a map value, `in`, and `:dedup` telling
+    // `1` from `"1"` rather than reporting.
+    let total = run_with_input(
+        "puts ([1] == [\"1\"])\n\
+         a = [k: 1]\n\
+         b = [k: \"1\"]\n\
+         puts ($a == $b)\n\
+         puts (1 in [1, \"a\"])\n\
+         puts (\"x\" in [1])\n\
+         puts ([1, 1, \"1\"]:dedup:len)\n",
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&total.stdout),
+        "false\nfalse\ntrue\nfalse\n2\n"
+    );
+    assert!(total.stderr.is_empty(), "{:?}", total.stderr);
+
+    // And a `match` literal arm of another type simply does not match. This is
+    // the seam: `$s == 0` reports while a `0` arm against the same status is
+    // quietly skipped. Widening the refusal to arms would break heterogeneous
+    // `match`, so it is left as the documented cost of the operator-level scope.
+    let arms = run_with_input(
+        "func f() { return status 0 }\n\
+         x = match f() { 0 => int-arm\n\
+           _ => fell-through }\n\
+         puts $x\n",
+    );
+    assert_eq!(String::from_utf8_lossy(&arms.stdout), "fell-through\n");
+    assert!(arms.stderr.is_empty(), "{:?}", arms.stderr);
 }
 
 #[test]
@@ -31539,10 +31681,15 @@ fn a_flag_renders_as_bytes_but_is_not_a_string() {
         "terminators\nflags\n"
     );
 
-    // And an ordinary mismatched pair is untouched — both are kind 0, so this
-    // still answers `false` rather than reporting.
+    // The flag refusal is no longer a special case: an ordinary mismatched pair
+    // reports by the same rule, since a silent `false` hides "the types do not
+    // meet" behind "these are unequal" for every pair, not just this one.
     let ordinary = run_with_input("if 1 == \"1\" { puts eq } else { puts unequal }\n");
-    assert_eq!(String::from_utf8_lossy(&ordinary.stdout), "unequal\n");
+    assert!(
+        String::from_utf8_lossy(&ordinary.stderr).contains("cannot compare an int with a string"),
+        "{:?}",
+        ordinary.stderr
+    );
 
     // The refusal is the top-level pair only: nested, equality stays total, so
     // a list holding a flag is merely unequal to one holding its text.
