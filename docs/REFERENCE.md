@@ -2560,6 +2560,7 @@ a different failure from an unknown name, which never parses.
 | `:exts` | string or list | All extensions, without the first dot. |
 | `:stem` | string or list | Basename without the last extension. |
 | `:bare` | string or list | Basename without any extensions. |
+| `:tilde` | string or list | `$HOME` written back as `~` — the inverse of the `~` a word expands. Whole components only, so `/home/username` is not `~name` when `$HOME` is `/home/user`. A path outside `$HOME`, and any path when `$HOME` is unset or `/`, is unchanged. Never asks the filesystem, so it cannot fail. |
 | `:real` | path or list | The path with every symlink, `.` and `..` resolved, absolute. Errors on a path it cannot resolve. |
 | `:url` | path or list | The path as a `file://host/path` URL, absolutized but not resolved. Errors on a path holding a `..`, and on the empty string. |
 | `:upper` / `:lower` | string or list | Change case; maps over list elements. |

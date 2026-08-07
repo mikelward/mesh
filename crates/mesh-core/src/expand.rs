@@ -90,6 +90,11 @@ pub enum Modifier {
     /// on `:repr`, so that `:repr` keeps meaning exactly one line — `$a:repr ==
     /// $b:repr` compares values today, and its output is what you paste back.
     Pretty,
+    /// `:tilde` — the path with `$HOME` written back as `~`, the inverse of the
+    /// `~` a word expands. A *string* transform like the other path components,
+    /// not a filesystem question: it never asks whether the path exists, so it
+    /// cannot fail the way `:real` can.
+    Tilde,
     /// `:real` — the path with every symlink, `.` and `..` resolved, absolute.
     /// Grouped with the path components in `DESIGN.md` and maps over a list like
     /// them, but it is the one that **asks the filesystem** rather than slicing
@@ -131,6 +136,7 @@ impl Modifier {
             "exts" => Self::Exts,
             "stem" => Self::Stem,
             "bare" => Self::Bare,
+            "tilde" => Self::Tilde,
             "real" => Self::Real,
             "url" => Self::Url,
             "len" => Self::Len,
@@ -2519,6 +2525,7 @@ fn modifier_name(modifier: Modifier) -> &'static str {
         Modifier::Exts => "exts",
         Modifier::Stem => "stem",
         Modifier::Bare => "bare",
+        Modifier::Tilde => "tilde",
         Modifier::Real => "real",
         Modifier::Url => "url",
         Modifier::Len => "len",
@@ -2658,6 +2665,10 @@ fn modify_string(value: String, modifier: Modifier) -> String {
             .map_or_else(String::new, |p| p.to_string_lossy().into_owned()),
         Modifier::Exts => extensions(path.file_name().and_then(|p| p.to_str())).to_string(),
         Modifier::Bare => bare_name(path.file_name().and_then(|p| p.to_str())).to_string(),
+        Modifier::Tilde => {
+            let home = home();
+            abbreviated_home(path, home.as_deref().map(Path::new))
+        }
         Modifier::Upper => value.to_uppercase(),
         Modifier::Lower => value.to_lowercase(),
         Modifier::TrimStart => value.trim_start().to_string(),
@@ -2766,6 +2777,27 @@ fn home() -> Option<String> {
     env::var_os("HOME").map(|h| h.to_string_lossy().into_owned())
 }
 
+/// `/home/user/src` as `~/src`, when it is under `home` — the inverse of the
+/// `~` [`apply_tilde`] expands.
+///
+/// Whole-component matching, so `/home/username` is not `~name` when `$HOME` is
+/// `/home/user`. A `$HOME` of `/` is ignored rather than turning every path into
+/// `~`-something, which is why the length guard is there.
+///
+/// Shared with the shell's own prompt title, which shows the same abbreviation:
+/// `:tilde` exists so mesh code can say what that title says, and two
+/// implementations would be free to disagree about the edge cases above.
+pub(crate) fn abbreviated_home(path: &std::path::Path, home: Option<&std::path::Path>) -> String {
+    let Some(home) = home.filter(|home| home.as_os_str().len() > 1) else {
+        return path.to_string_lossy().into_owned();
+    };
+    match path.strip_prefix(home) {
+        Ok(rest) if rest.as_os_str().is_empty() => "~".to_owned(),
+        Ok(rest) => format!("~/{}", rest.to_string_lossy()),
+        Err(_) => path.to_string_lossy().into_owned(),
+    }
+}
+
 fn has_glob_meta(text: &str) -> bool {
     text.chars().any(|c| matches!(c, '*' | '?' | '['))
 }
@@ -2834,6 +2866,51 @@ pub(crate) fn text_globs(text: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+
+    /// `:tilde` writes `$HOME` back, and knows where a component ends.
+    ///
+    /// Shared with the shell's own prompt title, so these cases pin both. The
+    /// prefix case is the one worth having: `/home/username` starts with
+    /// `/home/user` as *text* while being an unrelated directory, and a naive
+    /// `strip_prefix` on the string would render it `~name`.
+    #[test]
+    fn tilde_abbreviates_whole_components_only() {
+        use std::path::Path;
+        let home = Some(Path::new("/home/user"));
+        assert_eq!(
+            super::abbreviated_home(Path::new("/home/user/src/mesh"), home),
+            "~/src/mesh"
+        );
+        assert_eq!(super::abbreviated_home(Path::new("/home/user"), home), "~");
+        assert_eq!(
+            super::abbreviated_home(Path::new("/etc/passwd"), home),
+            "/etc/passwd"
+        );
+        assert_eq!(
+            super::abbreviated_home(Path::new("/home/username/notes"), home),
+            "/home/username/notes",
+            "a shared text prefix is not a shared component"
+        );
+    }
+
+    /// No `$HOME`, or a `$HOME` of `/`, abbreviates nothing.
+    ///
+    /// `/` would otherwise match every absolute path and turn `/etc/passwd` into
+    /// `~/etc/passwd`, which is why the length guard exists rather than only a
+    /// `None` check.
+    #[test]
+    fn tilde_leaves_paths_alone_without_a_usable_home() {
+        use std::path::Path;
+        assert_eq!(
+            super::abbreviated_home(Path::new("/etc/passwd"), None),
+            "/etc/passwd"
+        );
+        assert_eq!(
+            super::abbreviated_home(Path::new("/etc/passwd"), Some(Path::new("/"))),
+            "/etc/passwd"
+        );
+    }
+
     use super::{
         Access, ExpandError, Modifier, ModifierStep, VarRef, accessible_c, apply_modifier,
         apply_tilde, entries_pattern, get_value, has_glob_meta, has_value, join_value, map_strings,

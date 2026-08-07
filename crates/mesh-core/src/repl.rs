@@ -10850,21 +10850,8 @@ fn prompt_title(user: &str, host: &[u8], cwd: &Path, home: Option<&Path>) -> Str
     if !title.is_empty() {
         title.push_str(": ");
     }
-    title.push_str(&abbreviated_home(cwd, home));
+    title.push_str(&crate::expand::abbreviated_home(cwd, home));
     title
-}
-
-/// `/home/mikel/src` as `~/src`, when it is under `home`. Whole-component
-/// matching, so `/home/mikelward` is not `~ward` when `$HOME` is `/home/mikel`.
-fn abbreviated_home(cwd: &Path, home: Option<&Path>) -> String {
-    let Some(home) = home.filter(|home| home.as_os_str().len() > 1) else {
-        return cwd.to_string_lossy().into_owned();
-    };
-    match cwd.strip_prefix(home) {
-        Ok(rest) if rest.as_os_str().is_empty() => "~".to_owned(),
-        Ok(rest) => format!("~/{}", rest.to_string_lossy()),
-        Err(_) => cwd.to_string_lossy().into_owned(),
-    }
 }
 
 /// The title while a command runs: the command line itself, so a tab says what it

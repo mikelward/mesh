@@ -20518,6 +20518,44 @@ fn a_bare_list_to_an_external_command_is_still_an_error() {
 }
 
 #[test]
+fn tilde_writes_home_back_as_a_tilde() {
+    // `$HOME` is set on the child rather than the test process, which shares one
+    // environment across parallel tests.
+    let mut command = mesh_command();
+    command.env("HOME", "/home/user");
+    command.stdin(Stdio::piped());
+    command.stdout(Stdio::piped());
+    command.stderr(Stdio::piped());
+    let mut child = command.spawn().expect("spawn mesh");
+    write_stdin(
+        child.stdin.take(),
+        concat!(
+            // Under `$HOME`, exactly `$HOME`, and outside it.
+            "puts '/home/user/src/mesh':tilde\n",
+            "puts '/home/user':tilde\n",
+            "puts '/etc/passwd':tilde\n",
+            // Whole components only: this shares a prefix with `$HOME` as *text*
+            // but is a different directory, so it is left alone.
+            "puts '/home/username/notes':tilde\n",
+            // The inverse of what a bare `~` expands to, which is the point of
+            // having it: round-tripping lands back where it started.
+            "puts ~/src:tilde\n",
+        )
+        .as_bytes(),
+    );
+    let out = child.wait_with_output().expect("wait for mesh");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "~/src/mesh\n~\n/etc/passwd\n/home/username/notes\n~/src\n"
+    );
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
 fn path_and_string_modifiers_transform_values_and_chain() {
     let out = run_with_input(
         "file = src/archive.tar.gz\nputs $file:dir $file:base $file:ext $file:exts $file:stem $file:bare\nputs $file:base:upper\n",
