@@ -33334,6 +33334,86 @@ fn a_declared_modifier_is_element_wise_unless_its_subject_is_a_rest() {
     );
 }
 
+/// `...` reaches an **argument-taking** modifier at a command boundary.
+///
+/// `puts ...$x:split(":")` was a syntax error — "a value argument cannot have text
+/// attached" — because the `(` sent the run down the value-argument path, which
+/// had no spread of its own, and the word path stopped in front of the paren. The
+/// argument-free spelling (`...$x:words`) worked all along, so the chain was split
+/// by whether its last step happened to take an argument.
+#[test]
+fn a_spread_reaches_an_argument_taking_modifier() {
+    let out = run_with_input(
+        "x = \"a:b:c\"\n\
+         puts ...$x:split(\":\")\n\
+         puts pre ...$x:split(\":\") post\n\
+         puts ...$(echo d e):words\n",
+    );
+    assert!(
+        out.stderr.is_empty(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    // The arguments either side of it are still the arguments they were written as.
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "a b c\npre a b c post\nd e\n"
+    );
+
+    // …and they arrive as *three* arguments rather than one string that prints the
+    // same, which is the whole difference a spread makes. A fixed signature is
+    // what can tell them apart: one argument would be an arity error.
+    let arity = run_with_input(
+        "func third(_a, _b, _c) { puts $_c }\nx = \"a:b:c\"\nthird ...$x:split(\":\")\n",
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&arity.stdout),
+        "c\n",
+        "{}",
+        String::from_utf8_lossy(&arity.stderr)
+    );
+
+    // Spacing still separates one argument from the next, so a detached `:name` is
+    // a modifier reference rather than a chain, and the argument-free spelling is
+    // untouched.
+    let spaced = run_with_input("x = \"a b\"\nputs ...$x:words\nxs = [p q]\nputs ...$xs\n");
+    assert_eq!(String::from_utf8_lossy(&spaced.stdout), "a b\np q\n");
+
+    // A spread element that was written as a flag still arrives as one, which is
+    // the classification the *word* path did — it must not be lost by taking the
+    // value path instead.
+    let flags = run_with_input(
+        "wrapper func w(...args) { puts ...$args }\n\
+         x = \"--help:--force\"\n\
+         w ...$x:split(\":\")\n",
+    );
+    assert_eq!(String::from_utf8_lossy(&flags.stdout), "--help --force\n");
+
+    // A long adjacent run of `...` is malformed input, so it gets a **parser
+    // error** — not a stack overflow. The lookahead that steps over a leading
+    // `...` recursed at first, which left `MAX_DEPTH` behind and turned this into
+    // `fatal: out of stack`, a toolchain failure rather than a diagnostic. It
+    // steps exactly once now, matching the single `eat` that consumes one: a
+    // doubled `...` is not a spread of a spread, since there is no such value.
+    // Raised in review as a P2.
+    let deep = run_with_input(&format!(
+        "x = \"a:b\"\nputs {}$x:split(\":\")\n",
+        "...".repeat(20_000)
+    ));
+    let stderr = String::from_utf8_lossy(&deep.stderr);
+    assert!(stderr.contains("syntax error"), "{stderr}");
+    assert!(!stderr.contains("out of stack"), "{stderr}");
+
+    // Not a list is a run-time answer now rather than a syntax error, and it says
+    // what is wrong with the value rather than with the punctuation.
+    let scalar = run_with_input("x = \"a:b\"\nputs ...$x:split(\":\"):len\n");
+    assert!(
+        String::from_utf8_lossy(&scalar.stderr).contains("value is not a list"),
+        "{}",
+        String::from_utf8_lossy(&scalar.stderr)
+    );
+}
+
 /// A spread naming no variable names no variable.
 ///
 /// `expansion_word` resolves a declared chain before expansion, so a spread word

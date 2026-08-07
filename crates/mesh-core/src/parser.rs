@@ -965,7 +965,15 @@ pub enum CommandItem {
     ///
     /// Kept unevaluated here because running it needs the shell — a `$(…)` launches a
     /// command and a call runs a function — which the parser does not have.
-    Value(Spanned<Expr>),
+    ///
+    /// `spread` records a leading `...`, which hands the value over one element at
+    /// a time rather than whole — `puts ...$x:split(":")`. It rides here rather
+    /// than in the expression because it is a fact about the *argument*, not about
+    /// the value: the same expression means one argument without it.
+    Value {
+        expression: Spanned<Expr>,
+        spread: bool,
+    },
     Redirect {
         kind: RedirectKind,
         /// The descriptor named by a `N>`-style prefix, if any. `None` means the
@@ -3557,6 +3565,10 @@ impl Parser<'_> {
                 && !self.qualified_glob_at(0)
             {
                 let start = self.peek().map_or(0, |token| token.span.start);
+                // Taken here rather than left to the expression parser: a spread is
+                // about how the argument is *handed over*, and `UnaryOp::Spread`
+                // would build a value nothing at this boundary consumes.
+                let spread = self.eat(&TokenKind::Spread).is_some();
                 // Parsed **above comparison precedence**, so a following `<` / `>` is
                 // left for the redirect parser above rather than swallowed as a
                 // comparison: `puts (1 + 2) > out` has to write a file, not print
@@ -3605,10 +3617,13 @@ impl Parser<'_> {
                         span: start..end,
                     });
                 }
-                items.push(CommandItem::Value(Spanned {
-                    value: expression,
-                    span: start..end,
-                }));
+                items.push(CommandItem::Value {
+                    expression: Spanned {
+                        value: expression,
+                        span: start..end,
+                    },
+                    spread,
+                });
             } else {
                 let mut word = self.command_word()?;
                 // Read after the word rather than before it: `[ab]*(f)` and `*(f)`
@@ -3650,6 +3665,37 @@ impl Parser<'_> {
     /// would break working scripts, so a list literal or a range in an argument stays
     /// a separate decision.
     fn value_argument_starts(&mut self) -> bool {
+        // A leading `...` spreads whatever follows, so the question is asked of what
+        // it spreads: `...$x:split(":")` is the very value argument
+        // `$x:split(":")` is, handed over one element at a time. Asked by moving
+        // the cursor rather than by a second copy of the checks below, so the two
+        // spellings cannot drift about what counts as a value.
+        //
+        // **Exactly one**, matching the single `eat` that consumes it — a doubled
+        // `...` is not a spread of a spread, since there is no such value, so
+        // `......$x` stays the syntax error it was. Written as a step rather than a
+        // loop or a recursion for that reason and one more: a recursive walk of a
+        // long run of `...` left `MAX_DEPTH` behind and overflowed the stack, which
+        // turns malformed input into a toolchain failure. Raised in review as a P2.
+        if self.same(&TokenKind::Spread)
+            && self
+                .tokens
+                .get(self.position + 1)
+                .zip(self.peek())
+                .is_some_and(|(next, spread)| next.span.start == spread.span.end)
+        {
+            self.position += 1;
+            let starts = self.value_argument_starts_here();
+            self.position -= 1;
+            return starts;
+        }
+        self.value_argument_starts_here()
+    }
+
+    /// [`Parser::value_argument_starts`] with any leading `...` already stepped
+    /// over. Split out so the spread case reaches these checks without recursing
+    /// back into the step that got it here.
+    fn value_argument_starts_here(&mut self) -> bool {
         // `$( … )` and `( … )` have no word spelling at all.
         if matches!(
             self.peek().map(|token| &token.value),
@@ -8430,7 +8476,7 @@ mod tests {
             .iter()
             .map(|item| match item {
                 CommandItem::Word(word) => word.value.text(),
-                CommandItem::Redirect { .. } | CommandItem::Value(_) => panic!(),
+                CommandItem::Redirect { .. } | CommandItem::Value { .. } => panic!(),
             })
             .collect();
         assert_eq!(words, ["echo", "file.txt", "./tool", "key:2", "xs[0]"]);

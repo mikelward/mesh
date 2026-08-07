@@ -3002,10 +3002,9 @@ Raw binding is a property of the *spelling*, not of the bytes: once a capture is
 in a variable it is an ordinary string, so `x = $(cmd)` then `$x:split(":")`
 splits the already-trimmed value. Whether a line binds raw is readable from that
 line. Argument-taking modifiers work in expression position (an assignment right-hand
-side or other value context) and in command-argument position
-(`echo $dirs:join(":")`). Not yet: the **spread** of one at a command boundary —
-`puts ...$x:split(":")` is a syntax error, so bind it first (`xs = $x:split(":")`,
-then `puts ...$xs`).
+side or other value context), in command-argument position
+(`echo $dirs:join(":")`), and **spread** at a command boundary —
+`puts ...$x:split(":")` hands over one argument per element.
 
 Bare decimal literals and `true` / `false` produce typed integer and boolean
 values. Arithmetic requires integers, comparisons return booleans, and strings
@@ -4308,10 +4307,7 @@ default form, the affix family (`:stripstart`, `:stripend`, `:trimstart`,
 and `:map` / `:filter` / `:each`; the rest of the `DESIGN.md` set (`:match`, the
 first-only `:replace`, the time and sort families) is not implemented, and
 neither are the regex capture modifiers or a capture backreference in a
-replacement. One of them **spread** at a command boundary
-(`puts ...$x:split(":")`) is also not implemented — bind it first, which is the
-same gap a spread value call hits (`ls ...glob($p)` → `found = glob($p)`,
-`ls ...$found`).
+replacement.
 Of heredocs, the command-redirection form documented under
 Commands works, as do here-strings; a value-producing heredoc spelling does not.
 The history designators `!!`, `!string`, and `!n` are not implemented — only
