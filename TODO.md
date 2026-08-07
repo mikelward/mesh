@@ -1356,20 +1356,40 @@ with its switch: add an `Opt` variant in `options.rs` and read it through
       error path. A rule with no lifetime cannot be any of those. What it costs is
       that it cannot tell "titles sometimes" from "owns the title", so a session
       with only an `on preexec` handler loses the automatic idle title as well.
-- [ ] **Decide hook ordering, and where the shipped title sits in it.** The
+- [ ] **Decide where the shipped title sits among `preprompt` handlers.** The
       prelude registers before the user's startup files, so a user's own
       `preprompt` handler under a different name runs *after* `mesh-title-idle`.
       A handler that `cd`s therefore leaves the title naming the directory it just
       left, until the next prompt. The deleted Rust path wrote the title after all
-      `preprompt` hooks precisely to avoid this, and moving it into a hook gave
-      that up. Raised by Codex on #458 and confirmed.
+      `preprompt` hooks precisely to avoid this.
 
-      Registering the prelude *after* the user's files would fix the ordering and
-      break overriding — the prelude would re-register `title` over the user's own.
-      So this needs a real ordering concept rather than a swap: an explicit "runs
-      last" position, or hooks sorted by something other than registration, or the
-      shipped title registered at the end of startup rather than the start. It
-      overlaps the entry below on turning hooks off, so decide them together.
+      **Early registration stays for now; this gap is accepted.** Not because it
+      is right, but because the alternative was tried and is worse — see below.
+
+      *Correction to an earlier version of this entry:* hook order does **not**
+      need a new concept. `$sh.preprompt` is an ordered map and position is
+      already expressible — `Hooks::register` replaces in place for a name already
+      present and appends for a new one, so `unset $sh.preprompt.title` followed by
+      re-registering moves a handler to the end today. A user hitting the stale
+      title can fix it themselves that way.
+
+      **Late guarded registration was tried in #462 and reverted.** Running the
+      prelude *after* the startup files, registering each hook only when the name
+      is free, gives the default last place — and breaks two things:
+
+      - `unset $sh.preprompt.title` in `rc.mesh` stops working entirely. The hook
+        does not exist yet, so the `unset` errors, and the guard then installs the
+        default anyway. The documented opt-out becomes unreachable from a startup
+        file. Fixing it needs a tombstone state telling "user removed this" apart
+        from "name never claimed" — a third state on every hook, to prop up an
+        ordering rule.
+      - The prelude's own success becomes the last status recorded, so an
+        `rc.mesh` ending in `false` leaves `$sh.status == 0` at the first prompt
+        while `run_startup_files` returns the saved nonzero status.
+
+      Both found by Codex on #462. So "first free name wins" costs more than it
+      buys, and the real question is whether a hook should be able to *ask* for
+      last place rather than get it by being registered last.
 
 - [ ] **Decide how a user turns hooks off.** Now that the hooks are
       authoritative, a `title` typed at the prompt lasts only until the next
