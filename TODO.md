@@ -1850,6 +1850,27 @@ all under "Beyond M3 — External tool integration".
       name arrives lossily in the call and byte-exact from the command form: a
       mesh string is UTF-8, the same boundary `precd` / `postcd` already hand a
       path across.
+- [ ] **Should the cwd have a variable form too — `$sh.pwd` or `$sh.cwd`?** Three
+      spellings already answer this question (`pwd`, `pwd()`, `$env.PWD`), and the
+      case for a fourth is **interpolation**: a prompt segment is mostly a string,
+      and `"$sh.pwd> "` reads better than `"${pwd()}> "`, which needs the braces
+      precisely because a call cannot interpolate bare. The case against is that
+      it splits which spelling is authoritative, where the point of `pwd()` was to
+      have one — and `$sh.*` has so far earned its place for state with *no*
+      command form (`$sh.status`, `$sh.pid`, `$sh.jobs`, `$sh.width`).
+  - [ ] **Leave it at `pwd()`** — one authoritative read, and `${…}` around a
+        call is a general rule rather than a cwd tax.
+  - [ ] **Add a read-only `$sh.pwd`** — a third view of one value, but no new
+        question about what it means.
+  - [ ] **Add an assignable one** (`$sh.cwd = /tmp` moves the shell) — the shape
+        that has to be decided rather than assumed: whether it fires `precd` /
+        `postcd`, and what a failed move leaves behind. `$sh.width` is read-only
+        and nothing in the syntax says so, which is the ambiguity a writable one
+        would inherit.
+
+      The name is a second question and a smaller one: `pwd` matches the builtin
+      and every shell's muscle memory, `cwd` matches what the rest of the docs
+      call it in prose.
 - [x] **`CDPATH` search in `cd`** — *landed*. A plain relative operand is looked
       for in each `$env.CDPATH` entry in order, first hit wins; a miss falls back
       to the current directory, so setting it never breaks a plain `cd subdir`.
