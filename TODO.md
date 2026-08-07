@@ -154,6 +154,50 @@ Delete an entry once you have agreed with it or reversed it.
       refusal would break any config relying on it. Reviewed and kept as built —
       left listed rather than deleted, to be judged once it has been used.
 
+## Build and toolchain
+
+- [ ] **Nothing nags when the pinned Rust release falls behind.**
+      `rust-toolchain.toml` now pins an exact release rather than floating on
+      `stable`, which is what makes a months-old container install a working
+      compiler instead of resolving `stable` to one below the MSRV floor. The
+      cost is that the pin only moves when somebody remembers, and a pin eight
+      releases old looks exactly like a fresh one — the `stable` CI job catches
+      *breakage* under a new compiler, but never *drift*. Two candidates, both
+      free, either acceptable:
+
+      1. A drift check in CI: compare the pin against the current stable from
+         rustup's release manifest and fail when it is more than ~2 releases
+         (about 12 weeks) behind. Run it on `main` only, so an upstream release
+         cannot redden an unrelated PR; a red `main` is then the next task, per
+         `AGENTS.md`. One job of a few seconds.
+      2. A scheduled workflow that opens an issue instead of failing the build.
+         Same comparison, no red build, ~10 lines against the GitHub API.
+
+      Renovate handles `rust-toolchain.toml` natively and would open the bump PR
+      itself, but it is ruled out on past experience with it. Dependabot cannot
+      do this at all — it has no rust-toolchain manager.
+
+- [ ] **The session-start hook may not be worth keeping.** With an exact pin,
+      rustup installs the right compiler on the first cargo command, so
+      `.claude/hooks/session-start.sh` no longer has a job to do: it now only
+      catches a pin that has fallen below `rust-version`. Against that, it is
+      ~180 lines of bash plus 37 test cases. Decide whether it earns its keep as
+      a backstop or should go.
+
+- [ ] **The hook is not registered when the project root sits above the repo.**
+      Claude Code loads hooks from the project root's `.claude/settings.json` and
+      from `~/.claude`, never from a subdirectory. A session opened over a
+      directory holding several clones side by side therefore has a project root
+      *above* this repo, so `mesh/.claude/settings.json` is never read and the
+      hook never runs — and `$CLAUDE_PROJECT_DIR` would point at that parent
+      anyway, so the registered command path resolves to a file that does not
+      exist. The existing "settings.json registers the hook" test passes because
+      it reads mesh's own settings file, which is precisely the file nothing
+      loads. Fixing this means a dispatcher one level up (a project-root
+      `settings.json`, or a `~/.claude` hook shipped from the dotfiles repo),
+      which is outside this repo and cannot be verified by its CI. Only worth
+      doing if the hook survives the item above.
+
 ## M0 — It runs `ls` ✅ (done)
 
 - [x] Cargo workspace, edition 2024, MSRV 1.85, `rust-toolchain.toml`

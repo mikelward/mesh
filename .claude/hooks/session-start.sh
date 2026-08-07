@@ -1,11 +1,11 @@
 #!/bin/bash
 # Bring the Rust toolchain up to what the workspace actually requires.
 #
-# `rust-toolchain.toml` floats on the stable channel rather than pinning, and
-# the sandbox image ships whatever stable was current when the image was
-# built. A container more than a release or two old therefore resolves
-# "stable" to a compiler older than the workspace's `rust-version`, and every
-# cargo command fails before compiling a single line:
+# This is now a backstop, not the mechanism. `rust-toolchain.toml` pins an exact
+# release, and rustup installs a pinned release it does not have on the first
+# cargo command, so the toolchain normally fixes itself with nothing running
+# here. What this still catches is a pin that has fallen below the workspace's
+# own `rust-version`, where cargo fails before compiling a line:
 #
 #     error: rustc 1.94.1 is not supported by the following packages:
 #       mesh@0.0.0 requires rustc 1.95
@@ -13,6 +13,9 @@
 # Nothing builds and no test runs, so an unfixable toolchain is fatal here
 # rather than a thinner session: this hook reports and exits non-zero instead
 # of letting the failure surface later as a confusing cargo error.
+#
+# Whether this hook is worth keeping at all is an open question in TODO.md; it
+# is also not registered in a session whose project root sits above the repo.
 set -euo pipefail
 
 # Local checkouts manage their own toolchain; only the ephemeral remote

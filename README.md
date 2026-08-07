@@ -12,7 +12,8 @@ code.
 
 ## Building
 
-Unix only, stable Rust (pinned via `rust-toolchain.toml`). From a checkout:
+Unix only. `rust-toolchain.toml` pins the exact Rust release, which rustup
+installs for you on the first `cargo` command. From a checkout:
 
 ```sh
 make install   # build and install the mesh binary into ~/.cargo/bin

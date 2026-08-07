@@ -29,9 +29,12 @@ group and registers it in the job table; background stdin defaults to
 
 ## Prerequisites
 
-- A stable Rust toolchain. [`rust-toolchain.toml`](rust-toolchain.toml) pins
-  `stable` with `rustfmt` and `clippy`, so `rustup` installs the right thing
-  automatically on first `cargo` invocation.
+- `rustup`. [`rust-toolchain.toml`](rust-toolchain.toml) pins an exact Rust
+  release with `rustfmt` and `clippy`, and rustup installs it automatically on
+  the first `cargo` invocation inside the checkout — once per machine, into
+  `~/.rustup`, not once per clone. Without rustup the file is ignored and a
+  compiler below the MSRV floor fails with cargo's `rustc … is not supported`
+  rather than installing anything.
 - A Unix host (see [Supported systems](#supported-systems)).
 
 Per [`AGENTS.md`](AGENTS.md), install tools via direct binary downloads or
@@ -156,15 +159,19 @@ A block that cannot run — one that waits on a background job, or asks about th
 host — says so in the prose above it, as `<!-- no-run: reason -->`. A test
 bounds how many may do that.
 
-Two suites sit outside `cargo`, both run by CI alongside the Rust tests and both
-by `make test`. `session_start_hook_test.sh` covers
-[`.claude/hooks/session-start.sh`](.claude/hooks/session-start.sh), the hook
-that brings a web session's Rust toolchain up to the `rust-version` floor
-before anything tries to build. `makefile_test.sh` covers the
+Three suites sit outside `cargo`, all run by CI alongside the Rust tests and all
+by `make test`. `toolchain_test.sh` covers
+[`rust-toolchain.toml`](rust-toolchain.toml): that it pins an exact release
+rather than a floating channel, that the pin has not fallen below the MSRV
+floor, and that the CI jobs which deliberately override the pin still do.
+`session_start_hook_test.sh` covers
+[`.claude/hooks/session-start.sh`](.claude/hooks/session-start.sh), the backstop
+for a toolchain that cannot build the tree. `makefile_test.sh` covers the
 [`Makefile`](Makefile): that `make install` names a package that exists, and
 that `make check` is still the set of commands CI runs.
 
 ```sh
+sh toolchain_test.sh            # reads the manifests; installs nothing
 sh session_start_hook_test.sh   # stubs rustc/rustup; downloads nothing
 sh makefile_test.sh             # `make -n` dry runs; builds nothing
 ```
@@ -216,7 +223,7 @@ mesh/
 ├── Cargo.lock              # committed — mesh is a binary
 ├── Makefile                # one-line entry points over cargo (make install, make check)
 ├── makefile_test.sh        # asserts those entry points match the docs and CI
-├── rust-toolchain.toml     # pins stable + rustfmt + clippy
+├── rust-toolchain.toml     # pins an exact release + rustfmt + clippy
 ├── .github/workflows/ci.yml
 ├── crates/
 │   ├── mesh/               # thin shell executable

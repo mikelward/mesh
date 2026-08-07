@@ -15,8 +15,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install stable toolchain
-        run: rustup toolchain install stable --profile minimal --component rustfmt,clippy
+      # Read the pin from rust-toolchain.toml rather than naming a version here,
+      # the same way the msrv job reads the floor from Cargo.toml. rustup would
+      # install it on the first cargo command anyway; doing it as its own step
+      # keeps a toolchain download from looking like a slow build.
+      - name: Install the pinned toolchain
+        run: |
+          channel="$(grep '^channel' rust-toolchain.toml | sed -E 's/.*"(.*)".*/\1/')"
+          rustup toolchain install "$channel" --profile minimal --component rustfmt,clippy
 
       - name: Format
         run: cargo fmt --all -- --check
@@ -31,11 +37,18 @@ jobs:
       # build this workspace at all, so it gets the same treatment as the Rust
       # code: a suite that runs on every PR. Its own tests stub rustc/rustup,
       # so nothing here downloads a toolchain.
-      - name: Shellcheck the session-start hook
+      - name: Shellcheck the hook and the shell suites
         run: |
           shellcheck -s bash -S error .claude/hooks/session-start.sh
           shellcheck -s sh -S error session_start_hook_test.sh
           shellcheck -s sh -S error makefile_test.sh
+          shellcheck -s sh -S error toolchain_test.sh
+
+      # The pin in rust-toolchain.toml is what installs a working compiler on a
+      # stale machine, and it only works while it stays at or above the MSRV
+      # floor -- which no build failure reports as such.
+      - name: Test the toolchain pin
+        run: sh toolchain_test.sh
 
       - name: Test the session-start hook
         run: sh session_start_hook_test.sh
@@ -97,6 +110,30 @@ jobs:
       - name: Install MSRV toolchain
         run: rustup toolchain install ${{ steps.msrv.outputs.version }} --profile minimal
 
-      # `+toolchain` overrides rust-toolchain.toml, which floats on stable.
+      # `+toolchain` overrides the exact release rust-toolchain.toml pins.
       - name: Check
         run: cargo +${{ steps.msrv.outputs.version }} check --workspace --locked
+
+  # rust-toolchain.toml pins an exact release, which buys reproducibility at the
+  # cost of never noticing that a new compiler broke something. This job is that
+  # notice: it overrides the pin with `+stable` and runs the two gates most
+  # likely to move under a new release.
+  #
+  # Pushes to main only. On pull requests it would mean an upstream release
+  # turning someone's unrelated PR red, which teaches everyone to ignore it. A
+  # red main is the next task instead, per AGENTS.md.
+  stable:
+    name: stable (early warning)
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install stable toolchain
+        run: rustup toolchain install stable --profile minimal --component clippy
+
+      - name: Clippy
+        run: cargo +stable clippy --all-targets --all-features -- -D warnings
+
+      - name: Test
+        run: cargo +stable test --workspace
