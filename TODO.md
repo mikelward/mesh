@@ -1335,6 +1335,78 @@ with its switch: add an `Opt` variant in `options.rs` and read it through
       having *written* a title rather than on the setting, so turning it off
       mid-session still cleans up after the titles already written, and a session
       that never titled anything emits nothing at all — not even the clear.
+- [x] **A custom title** — the `title` builtin, and the `preprompt` / `preexec`
+      pair it is written for. Those are the two moments a title says something
+      different, so a hook in each is the whole feature: no format mini-language,
+      and a title and prompt that should agree share a mesh function rather than
+      a second vocabulary. `$sh.host` / `$sh.fqdn` landed alongside, since the
+      short host name is the commonest thing a title wants and `$(hostname)` was
+      a fork per prompt to learn something that never changes.
+      The pairing needed a fix to work at all: the prompt's title is written
+      *after* the `preprompt` hooks — deliberately, so a handler that `cd`s is
+      titled from where it left the shell — so a hook's title was overwritten a
+      few lines later, every prompt. `Shell::title_owned_by_caller` is the
+      smallest rule that makes it work: calling `title` takes the window and the
+      shell stops naming it.
+      **That flag is scaffolding for the entry below and should not outlive it.**
+      The first version made it a per-prompt claim, released when the next command
+      was submitted, and the *lifetime* — not the suppression — went wrong three
+      times in review on #452: spent a prompt early by a `mem::take`, documented
+      backwards in `REFERENCE.md`, and never released on the history-expansion
+      error path. A rule with no lifetime cannot be any of those. What it costs is
+      that it cannot tell "titles sometimes" from "owns the title", so a session
+      with only an `on preexec` handler loses the automatic idle title as well.
+- [ ] **The automatic title as *default hook entries*** — `$sh.preprompt.title`
+      and `$sh.preexec.title`, reassignable and `unset`-able like any other hook,
+      instead of Rust that a hook merely outranks. It is the shape the segment
+      map already promises (`unset $sh.prompt.commit`), it would make the default
+      legible — you could print the hook and read what mesh does — and it would
+      give a per-half off switch, where `$sh.options.osc-title` is all-or-nothing.
+      **Not blocked on `docs/HOOKS.md` D1**, which an earlier draft of this entry
+      claimed. D1 asks how a hook can name something that is *not* a mesh
+      function; a prelude sidesteps it by making the defaults ordinary mesh
+      functions, which `shell.funcs` already holds and `register_hook` already
+      accepts. Two pieces, both routine:
+
+      1. **A `~`-abbreviating path modifier** (`:tilde`, say), so the default
+         title text is sayable in mesh. `repl::abbreviated_home` already does the
+         work in Rust; mesh script simply cannot reach it. Adding it is a name in
+         the table in `expand.rs`, an enum variant, an apply arm, a parser keyword,
+         docs and tests — the same shape as the ~40 modifiers already there.
+      2. **A prelude** — mesh source shipped in the binary (`include_str!`) and run
+         before the user's startup files, defining something like
+         `mesh-title-idle` / `mesh-title-busy` and registering them on `preprompt`
+         and `preexec`.
+
+      **What it buys, which is the point.** The default stops being Rust that a
+      hook outranks and becomes a function you can print, copy, edit or replace,
+      so there is *one* mechanism rather than a built-in path plus a rule about
+      when it defers. Overriding is then just `$sh.preprompt.title = my-func`, or
+      `unset` for no title at all — which also gives the per-half switch
+      `$sh.options.osc-title` cannot, and restores the `on preexec` only case that
+      `title_owned_by_caller` breaks. And it deletes that flag rather than
+      refining it: "the user took the window" stops being a state the shell
+      tracks, because replacing the shipped handler *is* taking it.
+
+      **Decided: embedded source of truth, reachable text.** `include_str!` holds
+      the prelude, so the binary is always self-consistent and startup cannot fail
+      on a missing or version-skewed file — but the text is *reachable* rather than
+      merely executed: printable, and `source`-able from a path mesh resolves
+      itself. That keeps the legibility this whole entry exists for, since you can
+      print the handler you are about to override and start from it, without an
+      installed file's failure modes.
+
+      The two rejected shapes, so this is not relitigated. **A real installed
+      file** needs a prefix to find, which is a packaging problem across cargo,
+      distro and homebrew; a missing or skewed copy becomes a startup failure in
+      the one place a shell can least afford one; and a file users can edit gets
+      edited, after which upgrades either clobber their changes or silently keep
+      the old copy. **Functions with no readable text** gives up most of the point
+      — being able to *call* a default you cannot *read* is half a feature.
+
+      Watch the startup cost when building it: this parses mesh source on every
+      shell start, which is the hot path the rest of this file keeps guarding.
+      Keeping the prelude small is part of the design, not a later optimization.
 - [x] **Asking terminfo which sequence the terminal takes — investigated, and it
       does not work.** The plan was to read `hs`, `tsl` and `fsl` and retire the
       `OSC_TERMS` allowlist along with the multiplexer special case. The database
