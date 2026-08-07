@@ -5474,17 +5474,51 @@ two other shells' answers turned out to be strictly better than ours.
       Worth settling before the language is widely written, since it changes
       every existing single-quoted string.
 
+## Expand a word once per command
+
+**Asked by the repo owner** while declared modifiers landed: the intent was one
+expansion per word, and today it is two to four. Long term, not blocking.
+
+A stage word is walked by several passes, each asking a different question of the
+same text, and each re-resolving it from the reference up:
+
+1. `expand::written_of` — is this word a written `--flag`? Resolves the whole
+   value when the word is one unquoted reference.
+2. `expand::spread_written` — for `...$xs`, the same question per element.
+   Resolves the list.
+3. `stage_argument` → `output_words` for `puts` / `print`: `expand_values` first,
+   and `expand` again when every value turned out to be a scalar. Everything else
+   goes straight to `expand`.
+
+So `puts "$x:m"` resolves twice and `puts ...$xs:m` up to four times. That was
+free while expansion was a pure read, which is exactly why it grew: nothing could
+observe the repeats. A **declared** modifier is the first thing in a word that
+runs code, and it made them visible — `expansion_word` now pre-resolves such a
+chain into a `Piece::Value` so the body runs once, which fixes the observable half
+and leaves the structural waste in place.
+
+- [ ] **One pass producing everything the callers ask for.** Expand a word once
+      into its elements, each carrying its `Written` mark *and* its value, and
+      derive the argv text from that rather than walking the word again. The
+      three questions above are all answerable from one such result.
+  - [ ] **What makes it a real change rather than a rename:** the value path and
+        the text path do not apply the same rules. Globbing, tilde expansion and
+        the argv scalar rendering happen on the text side only, and the value side
+        preserves types (`w = 2; --n=$w` carries the integer). One pass has to
+        produce both without either rule leaking into the other — which is why
+        `output_words` currently *re-expands* rather than rendering the values it
+        already has.
+  - [ ] **Measure before and after.** The repeats are hash lookups and small
+        allocations, not syscalls, so the case for this is the layering rather
+        than the speed. Say which it bought.
+
 ## Beyond M3 — User-defined modifiers (`func _s:name()`)
 
 Decided in design discussion; see `docs/DESIGN.md` §"Modifiers".
 
-**The declaration half is built, and the parse-time gate is open; applying a
-declaration is what remains.** Declaring a modifier, refusing a built-in name, and
-reporting an unknown `:name` when the line runs rather than when it is read are done
-and tested. Applying one is not: `$x:foo` now reaches run time, where nothing yet
-looks in `Funcs::modifiers` for it, so a declared modifier still reports `` `:foo` is
-not a modifier ``. Both spellings say so together, which is what the resolution item
-below has to keep true when it starts answering. The `source` boundary that an earlier revision blocked
+**Declaring a modifier and applying one are both built.** What remains here is the
+regex-literal flag suffix and the attached-parentheses reading, each below. The
+`source` boundary that an earlier revision blocked
 this on is **not reached** — that block came from a load-time check being unable to see
 a sourced library's modifiers, and resolution now happens at call time. The one
 *smaller* question call-time resolution raised in its place — what attached parentheses
@@ -5494,7 +5528,7 @@ rather than being carved out, since a flag is a modifier whose subject is a patt
 so the remaining work here is implementation throughout. (The wider
 interpolation *shape* is open in `docs/DESIGN.md` §Open questions and deliberately not
 for now; nothing in this section depends on it, since the braces rule holds under either
-spelling.) A declared modifier currently stores and never runs.
+spelling.)
 
 - [x] **A declaration form with the subject left of the colon.** *(Built.)*
       `func _s:foo()`, `func _s:bar(_n)`, `func ..._xs:baz(_sep)`. The subject is
@@ -5508,19 +5542,22 @@ spelling.) A declared modifier currently stores and never runs.
       find an ordinary `func f`. `wrapper func _s:name()` is refused — the two markers
       have no combined reading. One consequence: `func a:b()` used to report
       ``a:b` is not a name` and is now a declaration.
-- [ ] **Element-wise by default, `...` for the collection.** *(Waits on the resolution
-      item — there is no way to apply a modifier yet.)* A plain subject parameter
+- [x] **Element-wise by default, `...` for the collection.** *(Built —
+      `run_declared_modifier` in `crates/mesh-core/src/repl.rs`.)* A plain subject parameter
       receives one element, so a list subject calls the modifier per element — the
       auto-mapping the built-ins already do. A rest subject receives the whole list
       once. Implement the subject as *spread into* the parameter so this is one rule
-      rather than a special case.
-- [ ] **Resolve a modifier when it is called**, the same rule as command position —
+      rather than a special case. *Built as written:* the subject's `ParamKind` is the
+      whole of the rule, and a scalar met by a rest subject spreads into it as the one
+      element it is.
+- [x] **Resolve a modifier when it is called**, the same rule as command position —
       not at parse time, and not by a load-time pre-pass. `$x:foo` looks `:foo` up at
       the moment the line runs; redefining a modifier changes what an already-written
       use runs, and one arriving from a `source` a statement earlier is found. A
       modifier declaration binds when it executes, like a `func`, and may sit anywhere
       a `func` may sit — nested and conditional declarations included. An unknown
-      modifier is a **run-time** error naming it.
+      modifier is a **run-time** error naming it. *(Built. `Funcs::modifier` is asked
+      per application, never cached at the point a chain is written.)*
   - [x] **Open the parse-time gate everywhere it stands.** *(Done for the value
         subject and the reference; the regex-literal suffix below is still gated.)*
         `modifier_name` consulted
@@ -5542,7 +5579,7 @@ spelling.) A declared modifier currently stores and never runs.
         and `carries_attached_modifier`, which is what keeps `if:nope` a chain on the
         word `if` rather than a conditional. **Found building it:** every affected
         spelling exits 1 now instead of 2, which is the visible half of the change.
-    - [ ] **Opening the gate is not enough for an interpolation — the expansion path
+    - [x] **Opening the gate is not enough for an interpolation — the expansion path
           cannot see `Funcs`.** `expansion_variable` (`crates/mesh-core/src/repl.rs`)
           lowers each `:name` through `modifier_step`, which knows built-ins only, and
           the value is resolved by `expand::resolve_value(&reference, &shell.vars)` —
@@ -5554,7 +5591,19 @@ spelling.) A declared modifier currently stores and never runs.
           paths land together." Land them together here too — `y = $x:foo` and
           `"$x:foo"` disagreeing is the failure to avoid — either by giving the
           expansion path shell-aware resolution or by carrying an unresolved name out
-          to a caller that has `Funcs`.
+          to a caller that has `Funcs`. *Built as the second: `expansion_word` splits
+          the chain at the first declared step and resolves the reference itself, so
+          the word carries a `Piece::Value` and `expand` stays a `&Vars` pure walk —
+          the same division of labor the `$(…)` piece beside it already makes.*
+      - [x] **And it had to be, not just could be.** A word is expanded **more than
+            once** per command — to classify a spread's elements, then to render them,
+            and `puts` asks a third time — so resolving a declaration inside `expand`
+            ran its body two or three times per line, and said its diagnostics as often.
+            Pre-resolving is what makes a body with an effect run exactly once per
+            element; `a_declared_modifier_body_runs_once_per_element` pins it. The cost
+            is that a spread word can now carry an already-evaluated value
+            (`expand::Spread`), which nothing else spells — `...$(…)` is still a
+            syntax error.
     - [ ] **The regex-literal flag suffix opens with the rest — a flag *is* a
           modifier.** Its subject is a pattern and its result is a pattern, which is
           what `docs/DESIGN.md` already settled, and the shipped tables already agree:
@@ -5667,8 +5716,8 @@ spelling.) A declared modifier currently stores and never runs.
       are their own vocabulary: the built-in *modifier* names must be checked only
       against *modifier* declarations, so the check needs declaration-kind context,
       matching the diagnostic shape rather than the name set.
-- [ ] **A map subject errors**, naming `:keys` / `:values`. *(Blocked with the
-      resolution item.)* A placeholder, not a
+- [x] **A map subject errors**, naming `:keys` / `:values`. *(Built, in
+      `run_declared_modifier`, in the words `:join` already uses.)* A placeholder, not a
       decision — see the open question below.
   - [ ] **What element-wise means over a map.** Loop iteration does *not* settle it:
         `for host, addr in $known_hosts` is shipped, but two loop **binders** are a

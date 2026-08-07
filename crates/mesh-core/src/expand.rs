@@ -209,7 +209,7 @@ pub enum ModifierStep {
 }
 
 impl ModifierStep {
-    fn name(&self) -> &str {
+    pub(crate) fn name(&self) -> &str {
         match self {
             ModifierStep::Apply { name, .. } | ModifierStep::Unavailable { name, .. } => name,
         }
@@ -539,10 +539,9 @@ pub fn written_of_value(value: &Value) -> Written {
 /// `[--help]` keeps its flag one element down, which is what [`written_of`]
 /// says of it. Raised in review.
 pub fn spread_written(word: &Word, vars: &Vars) -> Option<Vec<Written>> {
-    let vref = spread_var(word)?;
     // Anything other than a list is an error the caller's own expansion
     // reports; this only classifies, so it declines rather than guessing.
-    let Ok(Value::List(values)) = resolve_value(vref, vars) else {
+    let Ok((_, Value::List(values))) = spread_of(word)?.resolve(vars) else {
         return None;
     };
     Some(values.iter().map(written_of_value).collect())
@@ -551,8 +550,8 @@ pub fn spread_written(word: &Word, vars: &Vars) -> Option<Vec<Written>> {
 pub fn expand(words: Vec<Word>, vars: &Vars) -> Result<Vec<String>, ExpandError> {
     let mut out = Vec::new();
     for word in words {
-        if let Some(vref) = spread_var(&word) {
-            out.extend(spread_strings(vref, vars)?);
+        if let Some(spread) = spread_of(&word) {
+            out.extend(spread_strings(spread, vars)?);
             continue;
         }
         expand_word(word, vars, &mut out)?;
@@ -584,8 +583,8 @@ pub fn expand_call_values(
 ) -> Result<Vec<(Value, bool)>, ExpandError> {
     let mut out = Vec::new();
     for word in words {
-        if let Some(vref) = spread_var(&word) {
-            out.extend(spread_values(vref, vars)?.into_iter().map(|v| (v, false)));
+        if let Some(spread) = spread_of(&word) {
+            out.extend(spread_values(spread, vars)?.into_iter().map(|v| (v, false)));
         } else if let Some(value) = whole_value(&word, vars) {
             out.push((value?, false));
         } else if let Some(value) = scalar_literal(&word) {
@@ -671,14 +670,18 @@ pub fn expand_call_values(
     Ok(out)
 }
 
-fn spread_values(vref: &VarRef, vars: &Vars) -> Result<Vec<Value>, ExpandError> {
-    match resolve_value(vref, vars)? {
+fn spread_values(spread: Spread<'_>, vars: &Vars) -> Result<Vec<Value>, ExpandError> {
+    let (name, value) = spread.resolve(vars)?;
+    match value {
         Value::List(values) => Ok(values),
         // A styled value is a string, so it is not a list for the same reason.
         // A flag is one option, not a list of them.
-        Value::String(_) | Value::Styled(_) | Value::Flag(_) | Value::FlagTerminator => Err(
-            ExpandError::Unsupported(format!("...${}: value is not a list", vref.name)),
-        ),
+        Value::String(_) | Value::Styled(_) | Value::Flag(_) | Value::FlagTerminator => {
+            Err(ExpandError::Unsupported(format!(
+                "{}: value is not a list",
+                spread_subject(name.as_ref())
+            )))
+        }
         Value::Map(_) => Err(ExpandError::Unsupported(
             "a map cannot be spread here".into(),
         )),
@@ -689,25 +692,26 @@ fn spread_values(vref: &VarRef, vars: &Vars) -> Result<Vec<Value>, ExpandError> 
         | Value::Glob(_)
         | Value::Stream(_)
         | Value::Job(_) => Err(ExpandError::Unsupported(format!(
-            "...${}: value is not a list",
-            vref.name
+            "{}: value is not a list",
+            spread_subject(name.as_ref())
         ))),
-        Value::Function(_) => Err(ExpandError::NoTextForm {
-            name: vref.name.clone(),
-            kind: "function value",
-        }),
+        Value::Function(_) => Err(spread_has_no_text_form(name, "function value")),
     }
 }
 
 /// Resolve a `...$name` spread to its element strings (a whole list or a slice).
 /// An indexed element can itself be a list. A string, scalar element, or unbound
 /// name is an error, matching the command-position spread rules.
-fn spread_strings(vref: &VarRef, vars: &Vars) -> Result<Vec<String>, ExpandError> {
-    match resolve_value(vref, vars)? {
-        Value::List(values) => strings(values, &vref.name),
-        Value::String(_) | Value::Styled(_) | Value::Flag(_) | Value::FlagTerminator => Err(
-            ExpandError::Unsupported(format!("...${}: value is not a list", vref.name)),
-        ),
+fn spread_strings(spread: Spread<'_>, vars: &Vars) -> Result<Vec<String>, ExpandError> {
+    let (name, value) = spread.resolve(vars)?;
+    match value {
+        Value::List(values) => strings(values, name.as_ref()),
+        Value::String(_) | Value::Styled(_) | Value::Flag(_) | Value::FlagTerminator => {
+            Err(ExpandError::Unsupported(format!(
+                "{}: value is not a list",
+                spread_subject(name.as_ref())
+            )))
+        }
         Value::Map(_) => Err(ExpandError::Unsupported(
             "a map cannot be spread into argv".into(),
         )),
@@ -718,41 +722,13 @@ fn spread_strings(vref: &VarRef, vars: &Vars) -> Result<Vec<String>, ExpandError
         | Value::Glob(_)
         | Value::Stream(_)
         | Value::Job(_) => Err(ExpandError::Unsupported(format!(
-            "...${}: value is not a list",
-            vref.name
+            "{}: value is not a list",
+            spread_subject(name.as_ref())
         ))),
-        Value::Function(_) => Err(ExpandError::NoTextForm {
-            name: vref.name.clone(),
-            kind: "function value",
-        }),
+        Value::Function(_) => Err(spread_has_no_text_form(name, "function value")),
     }
 }
 
-/// The text a **value argument** contributes to argv — the same bytes-only rule
-/// every other command argument meets, since an external takes bytes.
-///
-/// This is the fallback, not the main path: a word that is *only* a value argument
-/// reaches [`whole_value`] first and stays typed, so `puts style(x, fg: red)` keeps
-/// its attributes. Rendering here is for the cases that genuinely need bytes — an
-/// external command, or a value argument glued to text (`ls dir$(suffix)`).
-/// Parse the text of a written option into a [`FlagValue`], or say why it is not
-/// one.
-///
-/// The payload types the way a **bare** word would, so `"--n=2":flag` holds the
-/// integer `2` — that is what leaves `flag<int>` constructible before the parser
-/// lands, and a cast that only ever produced `flag<string>` would not.
-///
-/// **Bare, and only bare.** Quoting is not re-read here: `"--tag=\"v 2\""` holds
-/// the five characters `"v 2"`, quote marks and all, exactly as the written
-/// `--tag='"v 2"'` does — the two are equal, which is the round trip that
-/// matters. The cast is not a second parser, and treating it as one would have
-/// to answer what `"--tag=v 2":flag` means, where the source it claims to be
-/// reading is two words.
-///
-/// The tension that leaves, recorded rather than resolved: `v = "2"; x = --n=$v`
-/// keeps a *string*, so interpolating and casting disagree about the same
-/// characters. They are different acts — one hands over a value, the other text
-/// to type — but a reader may reasonably expect them to agree. See `TODO.md`.
 fn flag_from_text(text: &str) -> Result<crate::vars::FlagValue, String> {
     let Some(body) = text.strip_prefix("--") else {
         let hint = if text.starts_with('-') {
@@ -819,7 +795,15 @@ fn value_argument_text(value: &Value) -> Result<String, ExpandError> {
     }
 }
 
-fn strings(values: Vec<Value>, name: &str) -> Result<Vec<String>, ExpandError> {
+/// The argv strings a spread's elements contribute, or why one has no byte form.
+///
+/// `name` is the **bare** variable the spread came from, or `None` for one whose
+/// value was resolved before expansion and has no name left to give. Bare because
+/// the two families of diagnostic here spell different sigils — `...$xs` for the
+/// argv rules, `$xs` for the ones about a missing byte form — and prefixing a
+/// sigil to a stand-in made `...` read as a variable called `...`.
+fn strings(values: Vec<Value>, name: Option<&String>) -> Result<Vec<String>, ExpandError> {
+    let subject = spread_subject(name);
     values
         .into_iter()
         .map(|value| match value {
@@ -830,13 +814,13 @@ fn strings(values: Vec<Value>, name: &str) -> Result<Vec<String>, ExpandError> {
             Value::Boolean(value) => Ok(value.to_string()),
             Value::Status(code) => Ok(code.to_string()),
             Value::List(_) => Err(ExpandError::Unsupported(format!(
-                "...${name}: nested list element cannot be a command argument"
+                "{subject}: nested list element cannot be a command argument"
             ))),
             Value::Map(_) => Err(ExpandError::Unsupported(format!(
-                "...${name}: map element cannot be a command argument"
+                "{subject}: map element cannot be a command argument"
             ))),
             Value::Regex(_) | Value::Glob(_) => Err(ExpandError::Unsupported(format!(
-                "...${name}: pattern element cannot be a command argument"
+                "{subject}: pattern element cannot be a command argument"
             ))),
             // A spread element that is a flag renders, like one reaching argv
             // directly: past this boundary it is bytes.
@@ -844,18 +828,9 @@ fn strings(values: Vec<Value>, name: &str) -> Result<Vec<String>, ExpandError> {
             Value::FlagTerminator => Ok("--".to_owned()),
             // A handle belongs with the function value, not the patterns: what
             // it lacks is a byte form, not a way to be matched against.
-            Value::Stream(_) => Err(ExpandError::NoTextForm {
-                name: name.to_string(),
-                kind: "stream handle",
-            }),
-            Value::Job(_) => Err(ExpandError::NoTextForm {
-                name: name.to_string(),
-                kind: "job handle",
-            }),
-            Value::Function(_) => Err(ExpandError::NoTextForm {
-                name: name.to_string(),
-                kind: "function value",
-            }),
+            Value::Stream(_) => Err(spread_has_no_text_form(name.cloned(), "stream handle")),
+            Value::Job(_) => Err(spread_has_no_text_form(name.cloned(), "job handle")),
+            Value::Function(_) => Err(spread_has_no_text_form(name.cloned(), "function value")),
         })
         .collect()
 }
@@ -1071,7 +1046,51 @@ pub(crate) fn typed_scalar(text: &str) -> Value {
 
 /// Recognize the deliberately narrow first spread form: `...$name` as a whole
 /// word. General expression spreading arrives with the parser.
-fn spread_var(word: &Word) -> Option<&VarRef> {
+/// What a `...` word spreads: a reference for this layer to resolve, or a value
+/// the caller resolved already.
+///
+/// The second is not a convenience. A chain naming a **declared** modifier has to
+/// run shell code, which happens once where the shell is (`repl::expansion_word`)
+/// — and once is the point: a word is expanded more than once per command, to
+/// classify its elements and then to render them, so resolving a declaration here
+/// would run its body several times per line (`DESIGN.md` §"Modifiers").
+enum Spread<'w> {
+    Ref(&'w VarRef),
+    Value(&'w Value),
+}
+
+impl Spread<'_> {
+    /// The value spread, beside the **bare** name to blame for it — `xs` for a
+    /// reference, `None` for a value already in hand, which has no name left to
+    /// give. Bare because the diagnostics spell their own sigils, and two of them
+    /// spell different ones (`...$xs` and `$xs`).
+    fn resolve(self, vars: &Vars) -> Result<(Option<String>, Value), ExpandError> {
+        match self {
+            Spread::Ref(vref) => Ok((Some(vref.name.clone()), resolve_value(vref, vars)?)),
+            Spread::Value(value) => Ok((None, value.clone())),
+        }
+    }
+}
+
+/// How a spread names itself in a diagnostic: `...$xs`, or a bare `...` where the
+/// value arrived already resolved.
+fn spread_subject(name: Option<&String>) -> String {
+    name.map_or_else(|| "...".to_string(), |name| format!("...${name}"))
+}
+
+/// What a spread of a value with no byte form says.
+///
+/// Split out because the two halves name it differently: with a variable in hand
+/// [`ExpandError::NoTextForm`] blames `$xs`, and without one there is no `$name`
+/// to render, so the sentence stands on its own.
+fn spread_has_no_text_form(name: Option<String>, kind: &'static str) -> ExpandError {
+    match name {
+        Some(name) => ExpandError::NoTextForm { name, kind },
+        None => ExpandError::Unsupported(format!("...: a {kind} has no text form")),
+    }
+}
+
+fn spread_of(word: &Word) -> Option<Spread<'_>> {
     match word.pieces.as_slice() {
         [
             Piece::Text {
@@ -1079,7 +1098,14 @@ fn spread_var(word: &Word) -> Option<&VarRef> {
                 expandable: true,
             },
             Piece::Var(vref),
-        ] if text == "..." => Some(vref),
+        ] if text == "..." => Some(Spread::Ref(vref)),
+        [
+            Piece::Text {
+                text,
+                expandable: true,
+            },
+            Piece::Value(value),
+        ] if text == "..." => Some(Spread::Value(value)),
         _ => None,
     }
 }
@@ -1383,7 +1409,17 @@ fn glob_pattern(pieces: &Pieces) -> String {
 /// the variable store (unbound is an error). Member access on any namespace
 /// other than `env` and `sh`, and a bare `$env`, are not supported yet.
 pub(crate) fn resolve(vref: &VarRef, vars: &Vars) -> Result<String, ExpandError> {
-    match resolve_value(vref, vars)? {
+    text_of(resolve_value(vref, vars)?, &vref.name)
+}
+
+/// The text a resolved value contributes to a string context, or why it has none.
+///
+/// Split from [`resolve`] so a caller holding a value it resolved *itself* — a
+/// heredoc body carrying a declared modifier, which only the shell can run —
+/// renders it by the same rules rather than by a second set. `name` is what the
+/// diagnostics blame, which is the reference the value came from.
+pub(crate) fn text_of(value: Value, name: &str) -> Result<String, ExpandError> {
+    match value {
         Value::String(value) => Ok(value),
         // `"$x"` and an argv word see the text: only a renderer reads the
         // attributes (`DESIGN.md` §"Hooks and the prompt").
@@ -1397,20 +1433,20 @@ pub(crate) fn resolve(vref: &VarRef, vars: &Vars) -> Result<String, ExpandError>
         // The bare number, as at argv: `"exited ${sh.status}"` interpolates `5`.
         Value::Status(code) => Ok(code.to_string()),
         Value::List(_) | Value::Map(_) | Value::Regex(_) | Value::Glob(_) => {
-            Err(ExpandError::ListNeedsSpread(vref.name.clone()))
+            Err(ExpandError::ListNeedsSpread(name.to_string()))
         }
         // A stream handle has no byte form at all, so it never crosses to argv
         // or into a string — `DESIGN.md` puts it in the same row as a regex.
         Value::Stream(_) => Err(ExpandError::NoTextForm {
-            name: vref.name.clone(),
+            name: name.to_string(),
             kind: "stream handle",
         }),
         Value::Job(_) => Err(ExpandError::NoTextForm {
-            name: vref.name.clone(),
+            name: name.to_string(),
             kind: "job handle",
         }),
         Value::Function(_) => Err(ExpandError::NoTextForm {
-            name: vref.name.clone(),
+            name: name.to_string(),
             kind: "function value",
         }),
     }

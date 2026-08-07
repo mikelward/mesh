@@ -775,6 +775,7 @@ mod tests {
                 body: body(),
                 captures: Vec::new(),
                 wrapper: false,
+                subject: None,
             },
         );
         let found = look_up("deploy", &funcs, &Vars::new());
@@ -993,6 +994,7 @@ mod tests {
                 body: body(),
                 captures: Vec::new(),
                 wrapper: false,
+                subject: None,
             },
         );
         let found = look_up("fork", &funcs, &Vars::new());

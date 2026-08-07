@@ -457,7 +457,7 @@ fn check_heredoc_bodies(text: &str, shell: &Shell) -> Result<(), String> {
         if body.raw {
             continue;
         }
-        if let Err(message) = interpolate_heredoc(&body.text, None) {
+        if let Err(HeredocProblem::Message(message)) = interpolate_heredoc(&body.text, None) {
             // Located at the body's first line. The scan reports offsets within
             // the body, which would need threading out to point at the exact
             // character; naming the heredoc is enough to find it.
@@ -2057,6 +2057,7 @@ fn run_executable(
                 body,
                 captures: captured,
                 wrapper: *wrapper,
+                subject: subject.clone(),
             };
             if subject.is_some() {
                 shell.funcs.define_modifier(name, def);
@@ -2285,20 +2286,38 @@ fn not_backgroundable(node: &parser::Executable) -> Option<&'static str> {
 /// word order, before its targets. It gives up the isolation the deferral buys,
 /// which is why backgrounding one stays refused rather than silently running in the
 /// wrong process.
-fn can_defer(words: &[parser::Word], redirs: &[Redir], env: &[parser::EnvBinding]) -> bool {
-    redirs.is_empty() && (words.iter().any(word_carries_a_value) || env_carries_a_value(env))
+fn can_defer(
+    words: &[parser::Word],
+    redirs: &[Redir],
+    env: &[parser::EnvBinding],
+    shell: &Shell,
+) -> bool {
+    redirs.is_empty()
+        && (words.iter().any(|word| word_carries_a_value(word, shell))
+            || env_carries_a_value(env, shell))
 }
 
 /// Does this word carry a value — `puts $(pwd)`, `puts "$(pwd)"`, `cmd f()`?
 ///
 /// Asked of a stage that is about to **fork**, since a value is the one thing in a
 /// word whose expansion runs code, and running it here would run it in the wrong
-/// process. Everything else in a word — a variable, a glob, a tilde — is a pure
-/// read, so where it happens cannot be observed.
-fn word_carries_a_value(word: &parser::Word) -> bool {
-    word.pieces
-        .iter()
-        .any(|piece| matches!(piece, parser::WordPiece::Value { .. }))
+/// process. Everything else in a word — a glob, a tilde, an ordinary reference —
+/// is a pure read, so where it happens cannot be observed.
+///
+/// A reference is only *ordinarily* pure. A chain naming a **declared** modifier
+/// runs a body, which is code in a variable's clothing: without this
+/// `puts "$x:foo" | cat` ran that body in the parent, so a `global` inside it
+/// changed the parent's binding and a slow one held a background launch. Which
+/// names are declared is the session's to say, which is why this asks the shell
+/// (raised in review as a P1).
+fn word_carries_a_value(word: &parser::Word, shell: &Shell) -> bool {
+    word.pieces.iter().any(|piece| match piece {
+        parser::WordPiece::Value { .. } => true,
+        parser::WordPiece::Variable { name, quote } => {
+            reference_needs_the_shell(&expansion_variable(name, *quote), shell)
+        }
+        parser::WordPiece::Text { .. } => false,
+    })
 }
 
 /// What a job listing shows for a stage that has not expanded its words yet.
@@ -2361,7 +2380,11 @@ fn deferred_words(words: &[parser::Word]) -> Vec<String> {
 ///
 /// A heredoc body is not checked because it does not interpolate a capture at all
 /// (`TODO.md`).
-fn carries_a_value(items: &[parser::CommandItem], env: &[parser::EnvBinding]) -> bool {
+fn carries_a_value(
+    items: &[parser::CommandItem],
+    env: &[parser::EnvBinding],
+    shell: &Shell,
+) -> bool {
     let redirects = items
         .iter()
         .any(|item| matches!(item, parser::CommandItem::Redirect { .. }));
@@ -2373,9 +2396,14 @@ fn carries_a_value(items: &[parser::CommandItem], env: &[parser::EnvBinding]) ->
     redirects
         && (items.iter().any(|item| match item {
             parser::CommandItem::Value(_) => true,
-            parser::CommandItem::Word(word) => word_carries_a_value(&word.value),
-            parser::CommandItem::Redirect { target, .. } => word_carries_a_value(&target.value),
-        }) || env_carries_a_value(env))
+            parser::CommandItem::Word(word) => word_carries_a_value(&word.value, shell),
+            parser::CommandItem::Redirect { target, body, .. } => {
+                word_carries_a_value(&target.value, shell)
+                    || body
+                        .as_ref()
+                        .is_some_and(|body| heredoc_carries_a_value(&body.value, shell))
+            }
+        }) || env_carries_a_value(env, shell))
 }
 
 /// Does this one-word body name a **command**?
@@ -3073,9 +3101,9 @@ impl StageEnv<'_> {
 /// Conservative on purpose: anything that is not a plain word defers. Deferring a
 /// pure expression costs nothing but doing it in the child, while evaluating an
 /// impure one early is exactly the bug.
-fn env_carries_a_value(bindings: &[parser::EnvBinding]) -> bool {
+fn env_carries_a_value(bindings: &[parser::EnvBinding], shell: &Shell) -> bool {
     bindings.iter().any(|binding| match &binding.value {
-        parser::Expr::Scalar(word) => word_carries_a_value(&word.value),
+        parser::Expr::Scalar(word) => word_carries_a_value(&word.value, shell),
         // A bare variable reference runs no code, exactly as one inside a word
         // does not — `A=$x` and `A="$x"` differ in spelling and in nothing else, so
         // they must not differ in *where* they are evaluated. They did: the quoted
@@ -3566,7 +3594,7 @@ fn run_ast_pipeline(
         // left the call's write in the shell, and `A=$(sleep 2) cmd > out &` held the
         // prompt, while the identical unredirected forms were refused or deferred.
         // Raised in review as a P1.
-        if background && carries_a_value(&command.items, &command.env) {
+        if background && carries_a_value(&command.items, &command.env, shell) {
             note!(
                 "mesh: a value cannot be backgrounded with a redirection yet; \
                  bind it first — `m = $(…)` then `cmd $m > out &`"
@@ -3685,7 +3713,18 @@ fn run_ast_pipeline(
 /// expanded, globbed, or word-split. Only the variable and escape rules a `"…"`
 /// string uses carry over, which is what an unquoted `<< END` promises in
 /// `DESIGN.md`.
-/// Expand a heredoc body, or — with no `vars` — merely check that it *could* be
+/// Why a heredoc body could not be interpolated.
+enum HeredocProblem {
+    /// The body itself: a bad escape, a malformed reference, an unbound name.
+    /// Rendered by the caller, which knows where the body sits.
+    Message(String),
+    /// A **declared** modifier's body ran and did not finish. It has already said
+    /// why, and how it left — an `exit` — is a step rather than a message, so the
+    /// step travels rather than a string standing in for it.
+    Unwound(Step),
+}
+
+/// Expand a heredoc body, or — with no session — merely check that it *could* be
 /// expanded.
 ///
 /// The checking half is what `-n` needs: the body's escapes and references have
@@ -3693,7 +3732,13 @@ fn run_ast_pipeline(
 /// session, and an unbound variable is a runtime failure rather than a syntax
 /// error. One walk rather than two, so the check cannot drift from the thing it
 /// is checking.
-fn interpolate_heredoc(text: &str, vars: Option<&Vars>) -> Result<String, String> {
+///
+/// The session rather than its variables, because a body may carry `$x:foo`: a
+/// declared modifier's body is shell code, and only the shell runs it.
+fn interpolate_heredoc(
+    text: &str,
+    mut shell: Option<&mut Shell>,
+) -> Result<String, HeredocProblem> {
     let mut out = String::with_capacity(text.len());
     let mut i = 0;
     while i < text.len() {
@@ -3721,8 +3766,12 @@ fn interpolate_heredoc(text: &str, vars: Option<&Vars>) -> Result<String, String
                 // rather than literal text — `"\u{zz}"` is a syntax error and a
                 // heredoc promises the same escape set. Only an escape the set
                 // does not contain at all falls through to the rule below.
-                let (decoded, end) = parser::decode_unicode_escape(text, i + 2)
-                    .ok_or("heredoc: syntax error: invalid \\u{…} escape")?;
+                let (decoded, end) =
+                    parser::decode_unicode_escape(text, i + 2).ok_or_else(|| {
+                        HeredocProblem::Message(
+                            "heredoc: syntax error: invalid \\u{…} escape".to_string(),
+                        )
+                    })?;
                 out.push(decoded);
                 i = end;
                 continue;
@@ -3736,35 +3785,21 @@ fn interpolate_heredoc(text: &str, vars: Option<&Vars>) -> Result<String, String
             continue;
         }
         if c == '$' {
-            // Extent comes from the command grammar itself — `variable_end` plus
-            // the `variable_access_prefix` continuation the tokenizer applies to
-            // the text after a reference — so a heredoc and a `"…"` string agree
-            // on where `$outer.inner.key` or `$m.key[0]:upper` ends. A malformed
-            // reference is a syntax error here exactly as it is in a string, so
-            // `${bad` cannot quietly become literal text.
-            let end = parser::variable_end(text, i).map_err(|error| format!("heredoc: {error}"))?;
-            if end > i + 1 {
-                // A braced `${…}` is already delimited and absorbs no following
-                // access, the same exception the tokenizer's merge step makes.
-                // Otherwise the continuation runs over the *word* after the
-                // reference, which is what the tokenizer hands it: in a command
-                // the following text piece is already split at whitespace, while
-                // a body is one long run, so `$xs:len` at end of line would
-                // otherwise offer `len\n…` as the modifier name and be rejected.
-                let end = if text[i..end].ends_with('}') {
-                    end
-                } else {
-                    let tail = &text[end..];
-                    let word = tail.find(char::is_whitespace).unwrap_or(tail.len());
-                    end + parser::variable_access_prefix(&tail[..word]).map_err(|kind| {
-                        format!("heredoc: {}", parser::ParseError { kind, span: 0..0 })
-                    })?
-                };
+            let end = heredoc_reference_end(text, i).map_err(HeredocProblem::Message)?;
+            if let Some(end) = end {
                 // Checking stops at "the reference is well-formed"; only an
                 // expansion resolves it.
-                if let Some(vars) = vars {
+                if let Some(shell) = shell.as_deref_mut() {
                     let reference = expansion_variable(&text[i..end], parser::QuoteMode::Double);
-                    out.push_str(&expand::resolve(&reference, vars).map_err(|e| e.to_string())?);
+                    // Through the same split resolver an interpolation uses, so a
+                    // declared modifier works in a body exactly as it does in a
+                    // `"…"` string. Rendered as text, which is what a body is.
+                    let value =
+                        resolve_reference(&reference, shell).map_err(HeredocProblem::Unwound)?;
+                    out.push_str(
+                        &expand::text_of(value, &reference.name)
+                            .map_err(|error| HeredocProblem::Message(error.to_string()))?,
+                    );
                 }
                 i = end;
                 continue;
@@ -3774,6 +3809,81 @@ fn interpolate_heredoc(text: &str, vars: Option<&Vars>) -> Result<String, String
         i += c.len_utf8();
     }
     Ok(out)
+}
+
+/// Where the `$…` reference starting at `i` ends, or `None` when the `$` starts
+/// no reference at all.
+///
+/// Extent comes from the command grammar itself — `variable_end` plus the
+/// `variable_access_prefix` continuation the tokenizer applies to the text after a
+/// reference — so a heredoc and a `"…"` string agree on where `$outer.inner.key`
+/// or `$m.key[0]:upper` ends. A malformed reference is an error here exactly as it
+/// is in a string, so `${bad` cannot quietly become literal text.
+///
+/// Shared by the walk that expands a body and the one that only asks whether it
+/// holds a declared modifier, so the two cannot come to disagree about what a
+/// reference *is*.
+fn heredoc_reference_end(text: &str, i: usize) -> Result<Option<usize>, String> {
+    let end = parser::variable_end(text, i).map_err(|error| format!("heredoc: {error}"))?;
+    if end <= i + 1 {
+        return Ok(None);
+    }
+    // A braced `${…}` is already delimited and absorbs no following access, the
+    // same exception the tokenizer's merge step makes. Otherwise the continuation
+    // runs over the *word* after the reference, which is what the tokenizer hands
+    // it: in a command the following text piece is already split at whitespace,
+    // while a body is one long run, so `$xs:len` at end of line would otherwise
+    // offer `len\n…` as the modifier name and be rejected.
+    if text[i..end].ends_with('}') {
+        return Ok(Some(end));
+    }
+    let tail = &text[end..];
+    let word = tail.find(char::is_whitespace).unwrap_or(tail.len());
+    let extra = parser::variable_access_prefix(&tail[..word])
+        .map_err(|kind| format!("heredoc: {}", parser::ParseError { kind, span: 0..0 }))?;
+    Ok(Some(end + extra))
+}
+
+/// Does this heredoc body interpolate a chain only the shell can apply?
+///
+/// A body is **data**: it takes the `"…"` escape and reference rules and nothing
+/// else, and a `$(…)` in one is literal text — which is why [`carries_a_value`]
+/// never looked inside one. A declared modifier changes that: `$x:foo` in a body
+/// runs a body, so a stage about to fork has to count it like any other value.
+/// Raised in review as a P1.
+///
+/// A malformed reference answers `false` and is left to the expansion, which
+/// reports it where the body's own diagnostics are given.
+fn heredoc_carries_a_value(body: &parser::HeredocBody, shell: &Shell) -> bool {
+    // A quoted delimiter takes no interpolation at all, so its body is data all
+    // the way down.
+    if body.raw {
+        return false;
+    }
+    let text = &body.text;
+    let mut i = 0;
+    while i < text.len() {
+        let c = text[i..].chars().next().expect("i is a char boundary");
+        // `\$` is a literal `$`, so whatever follows an escape starts nothing.
+        if c == '\\'
+            && let Some(next) = text[i + 1..].chars().next()
+        {
+            i += 1 + next.len_utf8();
+            continue;
+        }
+        if c == '$'
+            && let Ok(Some(end)) = heredoc_reference_end(text, i)
+        {
+            let reference = expansion_variable(&text[i..end], parser::QuoteMode::Double);
+            if reference_needs_the_shell(&reference, shell) {
+                return true;
+            }
+            i = end;
+            continue;
+        }
+        i += c.len_utf8();
+    }
+    false
 }
 
 /// Turn a parsed word into an expansion word, evaluating any **value** piece on
@@ -3797,7 +3907,27 @@ fn expansion_word(
                 expandable: matches!(quote, parser::QuoteMode::Bare),
             },
             parser::WordPiece::Variable { name, quote } => {
-                Piece::Var(expansion_variable(name, *quote))
+                let reference = expansion_variable(name, *quote);
+                // A chain naming a **declared** modifier is resolved here, where
+                // the shell is, and the word carries the value rather than the
+                // reference — the same division of labor the `$(…)` arm below
+                // makes, and for the same reason. Expansion is asked of a word
+                // more than once per command (to classify a spread's elements,
+                // then to render them), so leaving a body to be run down there
+                // would run it several times for one line. Nothing else is
+                // pre-resolved: an ordinary reference is pure, so repeating it
+                // costs nothing and the argv rules keep their say over it.
+                if reference_needs_the_shell(&reference, shell) {
+                    let value = resolve_reference(&reference, shell)?;
+                    // Inside `"…"` the quotes say "make this text", exactly as
+                    // they do for an evaluated `$(…)` piece.
+                    match quote {
+                        parser::QuoteMode::Double => Piece::Value(interpolated_value(value)?),
+                        _ => Piece::Value(value),
+                    }
+                } else {
+                    Piece::Var(reference)
+                }
             }
             parser::WordPiece::Value { expression, quote } => {
                 // Through `eval_operand_of`, which puts `shell.result` /
@@ -4580,7 +4710,7 @@ fn eval_expr(
         E::Glob(pattern) => Ok(Value::Glob(pattern.clone())),
         E::Variable(name) => {
             let reference = expansion_variable(&name.value, parser::QuoteMode::Bare);
-            expand::resolve_value(&reference, &shell.vars).map_err(runtime_message)
+            resolve_reference(&reference, shell)
         }
         E::List(items) => {
             let mut out = Vec::new();
@@ -4850,6 +4980,21 @@ fn eval_expr(
             let Some(value) = eval_operand(value, last, in_function, shell)? else {
                 return Ok(control_placeholder());
             };
+            // A declaration answers before the built-in vocabulary — and before the
+            // arity guard below, whose "does not take arguments" is a statement
+            // about built-ins that a user's own signature has no part in. It cannot
+            // shadow a built-in: that name is refused at the declaration, so
+            // reaching here means `:name` is the user's.
+            if shell.funcs.modifier(name).is_some() {
+                return run_declared_modifier(
+                    name,
+                    value,
+                    arguments.as_deref(),
+                    last,
+                    in_function,
+                    shell,
+                );
+            }
             if let Some(arguments) = arguments {
                 if matches!(value, Value::Regex(_)) {
                     return runtime_error(format!("modifier :{name} does not take arguments"));
@@ -5547,6 +5692,213 @@ fn glob_path_argument(
         }
     }
     Ok(path)
+}
+
+/// Resolve a reference whose chain may name a **declared** modifier.
+///
+/// [`expand`] applies a chain against `&Vars` and cannot run shell code, so a
+/// `func _s:foo()` body is out of its reach. The chain is split instead: every
+/// step up to the first declared one goes to `expand` as before, and from there
+/// each step is applied here — the declared ones by running their bodies, the
+/// built-in ones through the very same applier, so a mixed chain cannot come to
+/// mean two different things depending on where the split fell.
+///
+/// Asked **per step** rather than once up front, because a declared modifier's
+/// body may itself declare one: what `:foo` names is whatever is bound at the
+/// moment the chain reaches it (`DESIGN.md` §"Modifiers").
+fn resolve_reference(vref: &expand::VarRef, shell: &mut Shell) -> Result<Value, Step> {
+    let Some(split) = vref
+        .modifiers
+        .iter()
+        .position(|step| shell.funcs.modifier(step.name()).is_some())
+    else {
+        return expand::resolve_value(vref, &shell.vars).map_err(runtime_message);
+    };
+    let head = expand::VarRef {
+        name: vref.name.clone(),
+        accesses: vref.accesses.clone(),
+        modifiers: vref.modifiers[..split].to_vec(),
+        quoted: vref.quoted,
+    };
+    let mut value = expand::resolve_value(&head, &shell.vars).map_err(runtime_message)?;
+    for step in &vref.modifiers[split..] {
+        value = if shell.funcs.modifier(step.name()).is_some() {
+            run_declared_modifier(step.name(), value, None, 0, false, shell)?
+        } else {
+            expand::apply_modifier_step(value, step).map_err(runtime_message)?
+        };
+    }
+    Ok(value)
+}
+
+/// Does this reference's chain name a modifier only the shell can apply?
+///
+/// The question a word has to ask **before** it is expanded, since expansion is
+/// asked more than once per command — to classify a spread's elements, then to
+/// render them — and a body with an effect must run exactly once.
+fn reference_needs_the_shell(vref: &expand::VarRef, shell: &Shell) -> bool {
+    vref.modifiers
+        .iter()
+        .any(|step| shell.funcs.modifier(step.name()).is_some())
+}
+
+/// Apply the modifier `name` declares to `subject`.
+///
+/// **Element-wise is the default and `...` takes the collection**: the subject is
+/// *spread into* its parameter exactly as an argument is, so a plain parameter
+/// receives one element — calling the body once per element of a list, which is
+/// the auto-mapping the built-ins already do — and a rest parameter receives the
+/// whole list once (`DESIGN.md` §"Modifiers"). One rule, not a special case.
+fn run_declared_modifier(
+    name: &str,
+    subject: Value,
+    arguments: Option<&[parser::Argument]>,
+    last: u8,
+    in_function: bool,
+    shell: &mut Shell,
+) -> Result<Value, Step> {
+    let Some((subject_param, params, body, captured)) = shell.funcs.modifier(name).map(|def| {
+        (
+            def.subject
+                .clone()
+                .expect("a declared modifier carries its subject"),
+            def.params.clone(),
+            def.body.clone(),
+            def.captures.clone(),
+        )
+    }) else {
+        return runtime_error(parser::unknown_modifier_message(name));
+    };
+    let label = format!(":{name}");
+    // **Once**, before the subject is split: `$xs:pad(8)` reads the `8` on the line
+    // it is written on, not once per element. Evaluated in the caller's scope, with
+    // its own control flow answered there, exactly as `call_signature_for_value`
+    // does for a written call.
+    let caller_result = shell.result.clone();
+    let caller_produced = shell.produced;
+    let scanned = evaluate_value_arguments(
+        &label,
+        &params,
+        arguments.unwrap_or(&[]),
+        true,
+        last,
+        in_function,
+        shell,
+    );
+    if shell.control.is_some() {
+        shell.result = caller_result;
+        shell.produced = caller_produced;
+        if shell.loop_depth == 0 {
+            shell.control = None;
+            return Err(Step::Error(1));
+        }
+        return Ok(Value::String(String::new()));
+    }
+    let scanned = match scanned {
+        Ok(scanned) => scanned,
+        Err(step) => {
+            shell.result = caller_result;
+            shell.produced = caller_produced;
+            return Err(step);
+        }
+    };
+    // A map is neither one element nor a spreadable collection, and which it should
+    // be is an open question rather than an oversight — see `TODO.md`. Worded as
+    // `:join` already words it, so the two answers agree.
+    if matches!(subject, Value::Map(_)) {
+        return runtime_error(format!(
+            "modifier {label} requires a list; for a map use `:keys` or `:values` first"
+        ));
+    }
+    let elements = match (&subject_param.kind, subject) {
+        // The collection, once. A scalar spreads into a rest parameter as the one
+        // element it is, which is what that parameter would have received had the
+        // subject been written as an argument.
+        (parser::ParamKind::Rest, Value::List(values)) => vec![Value::List(values)],
+        (parser::ParamKind::Rest, scalar) => vec![Value::List(vec![scalar])],
+        (_, Value::List(values)) => values,
+        (_, scalar) => {
+            return run_modifier_body(
+                &label,
+                &subject_param,
+                scalar,
+                &params,
+                &captured,
+                &body,
+                &scanned,
+                shell,
+            );
+        }
+    };
+    // An **empty** list makes no calls, and `bind_scanned` inside the body call is
+    // the only thing that checks the arguments — so `$xs:wrap` with no argument was
+    // silently fine on `[]` and reported the moment `xs` had an element. A
+    // signature is wrong or right on the line it is written on, not by how long the
+    // subject happens to be.
+    //
+    // The **count** only, through the half of the binder that evaluates nothing:
+    // running the whole of it here would evaluate every omitted default for a body
+    // that never runs, so `func _s:foo(x = $(touch marker))` would fire on `[]` and
+    // not on `[a]`. A default is needed by a call, and there is no call. Raised in
+    // review as two P2s.
+    if elements.is_empty() {
+        check_positional_arity(&label, &params, scanned.0.len())?;
+    }
+    let mut mapped = Vec::with_capacity(elements.len());
+    for element in elements {
+        mapped.push(run_modifier_body(
+            &label,
+            &subject_param,
+            element,
+            &params,
+            &captured,
+            &body,
+            &scanned,
+            shell,
+        )?);
+    }
+    // A rest subject took the whole list in one call, so its single result *is* the
+    // answer rather than a one-element list holding it.
+    Ok(match subject_param.kind {
+        parser::ParamKind::Rest => mapped.pop().expect("a rest subject makes exactly one call"),
+        _ => Value::List(mapped),
+    })
+}
+
+/// One call of a declared modifier's body, with the subject bound beside the
+/// parameters.
+#[allow(clippy::too_many_arguments)]
+fn run_modifier_body<'p>(
+    label: &str,
+    subject_param: &parser::Param,
+    subject: Value,
+    params: &'p [parser::Param],
+    captured: &[(String, Value)],
+    body: &parser::Source,
+    scanned: &ScannedArguments<'p>,
+    shell: &mut Shell,
+) -> Result<Value, Step> {
+    let caller_result = shell.result.clone();
+    let caller_produced = shell.produced;
+    // Cloned per call because a list subject makes one call per element and
+    // `bind_scanned` consumes what it binds. The arguments themselves were
+    // evaluated once, by the caller; this is the copy each element's frame gets.
+    let (positionals, switches_on, flag_values) = scanned.clone();
+    run_call_body_for_value(
+        body,
+        caller_result,
+        caller_produced,
+        |shell| {
+            bind_captured(captured, shell);
+            // Not a positional: the subject arrives through the call site's `$x:`
+            // rather than through the parens, so it is set beside the parameters
+            // and `bind_scanned` never sees it — a signature's count is about the
+            // arguments alone.
+            shell.vars.set_value(&subject_param.name, subject);
+            bind_scanned(label, params, positionals, switches_on, flag_values, shell)
+        },
+        shell,
+    )
 }
 
 /// Apply an argument-free modifier to a value.
@@ -6868,10 +7220,19 @@ fn capture_status_of(expr: &parser::Expr, shell: &Shell) -> u8 {
 /// this is concerned, so a new expression kind defaults to "assume it runs".
 fn runs_nothing(expr: &parser::Expr) -> bool {
     match expr {
-        parser::Expr::Variable(_) | parser::Expr::Regex(_) | parser::Expr::Glob(_) => true,
-        // A word runs something only if a spliced value does.
+        parser::Expr::Regex(_) | parser::Expr::Glob(_) => true,
+        // A reference is a pure read *unless* its chain names a modifier the
+        // vocabulary does not hold — a declared one runs a body. Asked here as
+        // well as at the tail, since an argument runs after the subject and would
+        // be what recorded last. Raised in review as a P2.
+        parser::Expr::Variable(name) => {
+            !interpolated_chain_runs(&name.value, parser::QuoteMode::Bare)
+        }
+        // A word runs something only if a spliced value, or a reference's chain,
+        // does.
         parser::Expr::Scalar(word) => word.value.pieces.iter().all(|piece| match piece {
-            parser::WordPiece::Text { .. } | parser::WordPiece::Variable { .. } => true,
+            parser::WordPiece::Text { .. } => true,
+            parser::WordPiece::Variable { name, quote } => !interpolated_chain_runs(name, *quote),
             parser::WordPiece::Value { expression, .. } => runs_nothing(&expression.value),
         }),
         parser::Expr::Group(inner) => runs_nothing(inner),
@@ -6923,7 +7284,15 @@ fn capture_tail(expr: &parser::Expr) -> bool {
             name,
             arguments,
         } => {
-            let invokes = matches!(name.as_str(), "map" | "filter" | "each" | "capture");
+            // A name outside the shipped vocabulary is either a **declared**
+            // modifier, whose body is ordinary mesh, or a typo, which fails —
+            // neither is the pure transform this rule passes over. Asked of the
+            // name rather than of the session, keeping the answer readable from
+            // the line: a declaration cannot make an already-written
+            // `$(cmd):upper` stop reporting for `cmd`, because `:upper` is a
+            // built-in and cannot be redeclared. Raised in review as a P2.
+            let invokes = matches!(name.as_str(), "map" | "filter" | "each" | "capture")
+                || !parser::is_builtin_modifier(name);
             let inert_arguments = arguments.as_ref().is_none_or(|arguments| {
                 arguments.iter().all(|argument| match argument {
                     parser::Argument::Positional(expr) | parser::Argument::Named(_, expr) => {
@@ -6943,12 +7312,35 @@ fn capture_tail(expr: &parser::Expr) -> bool {
                 parser::WordPiece::Value { expression, .. } => {
                     Some(capture_tail(&expression.value))
                 }
+                // A reference whose chain runs something is the last thing to
+                // record a status, so a capture before it no longer owns the
+                // line's — the same rule the postfix form above states, asked of
+                // the only thing a word piece carries, its reference text.
+                parser::WordPiece::Variable { name, quote }
+                    if interpolated_chain_runs(name, *quote) =>
+                {
+                    Some(false)
+                }
                 // Runs nothing, so it records no status and the scan continues.
                 parser::WordPiece::Text { .. } | parser::WordPiece::Variable { .. } => None,
             })
             .unwrap_or(false),
         _ => false,
     }
+}
+
+/// Does an interpolated `$…` reference's chain run something?
+///
+/// Asked of the reference *text*, which is all a word piece carries. A built-in
+/// argument-free modifier is a pure transform, so the scan passes over it as it
+/// does over plain text; `:capture` is the one built-in that invokes. Anything the
+/// vocabulary does not hold is a declared modifier or a typo, and neither is
+/// transparent.
+fn interpolated_chain_runs(name: &str, quote: parser::QuoteMode) -> bool {
+    expansion_variable(name, quote)
+        .modifiers
+        .iter()
+        .any(|step| step.name() == "capture" || !parser::is_builtin_modifier(step.name()))
 }
 
 /// A capture's output **exactly as the command wrote it** — no trim, no split.
@@ -7774,7 +8166,7 @@ fn run_single(
     // that runs code: applying it here held the prompt for the length of
     // `A=$(sleep 2) cmd &`, where the same capture in an *argument* returned at
     // once. The deferring branch below carries the bindings down unevaluated.
-    if !env.is_empty() && !(background && can_defer(&words, &redirs, env)) {
+    if !env.is_empty() && !(background && can_defer(&words, &redirs, env, shell)) {
         let (saved, failure) = apply_env_bindings(env, last, in_function, shell);
         let step = failure.unwrap_or_else(|| {
             run_single(
@@ -7812,7 +8204,7 @@ fn run_single(
     // than at the prompt. A foreground redirected command has no fork to defer to:
     // a builtin or function runs in the shell with the targets around the call, so
     // its arguments were always this process's to evaluate.
-    if background && can_defer(&words, &redirs, env) {
+    if background && can_defer(&words, &redirs, env, shell) {
         let opened = match expand_redirs(redirs, last, in_function, shell) {
             Ok(redirs) => redirs,
             Err(step) => return step,
@@ -8075,7 +8467,7 @@ fn run_multi(
         // Asked **before** the prefix is evaluated, because the prefix is one of
         // the things that can carry a value: deciding after would already have run
         // it here, which is the thing being avoided.
-        let deferring = can_defer(&words, &redirs, env);
+        let deferring = can_defer(&words, &redirs, env, shell);
         // Evaluated here only when this stage is not deferring — a prefix of plain
         // words runs no code, so where it happens cannot be observed — and carried
         // to the stage's fork so only that child inherits it. `FOO=1 a | FOO=2 b`
@@ -8664,7 +9056,13 @@ fn expand_redirs(
             let text = if body.raw {
                 body.text
             } else {
-                interpolate_heredoc(&body.text, Some(&shell.vars)).map_err(bad)?
+                interpolate_heredoc(&body.text, Some(shell)).map_err(|problem| match problem {
+                    // The body already said why, and how it left may be an
+                    // `exit` — so the step travels rather than being flattened
+                    // into another message.
+                    HeredocProblem::Unwound(step) => step,
+                    HeredocProblem::Message(message) => bad(message),
+                })?
             };
             out.push(exec::Redirection {
                 fd: libc::STDIN_FILENO,
@@ -11366,7 +11764,7 @@ fn call_callable_for_value(
     // and nothing it can do to the caller's result — so none of the save/restore
     // `run_call_body_for_value` exists for applies.
     if let Some(modifier) = function.modifier_name() {
-        return apply_modifier_ref(modifier, argument);
+        return apply_modifier_ref(modifier, argument, shell);
     }
     // Resolved per element rather than once for the whole `:map`, which is what
     // late binding means: a handler that redefines its own target mid-traversal
@@ -11506,7 +11904,7 @@ fn call_modifier_ref(
             positionals.len()
         ))
     })?;
-    apply_modifier_ref(modifier, argument)
+    apply_modifier_ref(modifier, argument, shell)
 }
 
 /// Apply the modifier a bare `:name` reference denotes.
@@ -11515,7 +11913,13 @@ fn call_modifier_ref(
 /// `:split` need a separator and `:map`/`:filter`/`:each` need a callable, so there
 /// is no one-argument function for them to denote. A name the parser recognized but
 /// the engine cannot yet apply reports that rather than being silently dropped.
-fn apply_modifier_ref(name: &str, argument: Value) -> Result<Value, Step> {
+fn apply_modifier_ref(name: &str, argument: Value, shell: &mut Shell) -> Result<Value, Step> {
+    // Before the built-in questions below, for the reason the postfix path gives:
+    // `modifier_requires_arguments` describes the shipped vocabulary, and a
+    // declared `:foo` is not in it.
+    if shell.funcs.modifier(name).is_some() {
+        return run_declared_modifier(name, argument, None, 0, false, shell);
+    }
     // Checked here rather than left to the shared path: a reference to `:join` is
     // wrong whatever it would be applied to, so say that instead of complaining
     // about the value it met.
@@ -11526,6 +11930,15 @@ fn apply_modifier_ref(name: &str, argument: Value) -> Result<Value, Step> {
     }
     apply_argument_free_modifier(name, argument)
 }
+
+/// What a call's argument list scans to: the positionals in order, the switches
+/// written on, and the values written for valued flags. Borrowed from `params`,
+/// since a switch or a flag is identified by the parameter it matched.
+type ScannedArguments<'p> = (
+    Vec<Value>,
+    std::collections::HashSet<&'p str>,
+    std::collections::HashMap<&'p str, Value>,
+);
 
 /// Match `args` against `params` and bind each parameter in the current (already
 /// pushed) scope. Positionals bind left to right, `--flags` in any order, and a
@@ -11590,18 +12003,22 @@ fn bind_arguments(
 /// order. Shared by the command-mode [`bind_arguments`] (which parses `--flag`
 /// tokens) and the value-mode `bind_value_arguments` (which reads `key: value`
 /// options), so both modes bind identically once arguments are separated.
-fn bind_scanned<'p>(
+/// Does this many positionals fit `params`? Every required one must be filled, and
+/// without a `...rest` a surplus is an error.
+///
+/// Split out of [`bind_scanned`] because it is the half that **evaluates
+/// nothing**. A declared modifier mapped over an empty list makes no call at all,
+/// and its arguments still have to be right — but running the binder there would
+/// evaluate every omitted default for a body that never runs, so a default with an
+/// effect (`x = $(touch marker)`) would fire on `[]` and not on `[a]`. Raised in
+/// review as a P2.
+fn check_positional_arity(
     name: &str,
-    params: &'p [parser::Param],
-    positional_values: Vec<Value>,
-    switches_on: std::collections::HashSet<&'p str>,
-    mut flag_values: std::collections::HashMap<&'p str, Value>,
-    shell: &mut Shell,
+    params: &[parser::Param],
+    supplied: usize,
 ) -> Result<(), Step> {
     use parser::ParamKind;
 
-    // Arity: every required positional must be filled; without a rest, surplus
-    // positionals are an error.
     let required = params
         .iter()
         .filter(|param| matches!(param.kind, ParamKind::Required))
@@ -11613,7 +12030,6 @@ fn bind_scanned<'p>(
     let has_rest = params
         .iter()
         .any(|param| matches!(param.kind, ParamKind::Rest));
-    let supplied = positional_values.len();
     if supplied < required {
         if has_rest || maximum > required {
             note!("mesh: {name}: expected at least {required} argument(s), got {supplied}");
@@ -11630,6 +12046,20 @@ fn bind_scanned<'p>(
         }
         return Err(Step::Error(2));
     }
+    Ok(())
+}
+
+fn bind_scanned<'p>(
+    name: &str,
+    params: &'p [parser::Param],
+    positional_values: Vec<Value>,
+    switches_on: std::collections::HashSet<&'p str>,
+    mut flag_values: std::collections::HashMap<&'p str, Value>,
+    shell: &mut Shell,
+) -> Result<(), Step> {
+    use parser::ParamKind;
+
+    check_positional_arity(name, params, positional_values.len())?;
 
     // Bind every parameter in declaration order, consuming supplied positionals in
     // sequence. Binding in order means a default — positional or flag — can
@@ -11692,14 +12122,7 @@ fn evaluate_value_arguments<'p>(
     last: u8,
     in_function: bool,
     shell: &mut Shell,
-) -> Result<
-    (
-        Vec<Value>,
-        std::collections::HashSet<&'p str>,
-        std::collections::HashMap<&'p str, Value>,
-    ),
-    Step,
-> {
+) -> Result<ScannedArguments<'p>, Step> {
     let mut positionals: Vec<Value> = Vec::new();
     let mut switches_on: std::collections::HashSet<&'p str> = std::collections::HashSet::new();
     let mut flag_values: std::collections::HashMap<&'p str, Value> =
