@@ -13,6 +13,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, IsTerminal, Read};
 use std::mem::ManuallyDrop;
 use std::os::fd::FromRawFd;
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -98,11 +99,50 @@ struct Shell {
     /// A counter rather than a list of compound node kinds, so a new kind of
     /// executable cannot forget to be on it.
     status_records: u64,
-    /// Has this session written a window title? The clear on the way out is owed
-    /// to any title mesh put there, so this is remembered rather than re-derived
-    /// from `$sh.options.osc-title`, which may have been turned off since — see
-    /// [`set_title`].
-    title_written: bool,
+    /// How to undo the window title this session put there, if it put one there:
+    /// the sequence that clears it, and where that sequence has to go.
+    ///
+    /// The *sequence* rather than a bool, because the clear has to speak the
+    /// dialect the title was written in and that is not always the one in force
+    /// at exit. A startup file may `title` under one `$env.TERM` and then correct
+    /// it — `title` reads the terminal live before the session settles, by
+    /// design — so clearing through whatever `session_term` ends up holding can
+    /// emit nothing at all and leave the startup title on the window after mesh
+    /// is gone.
+    ///
+    /// The *sink* for the same reason one step further out: the two writers do
+    /// not share a channel. `title` goes to `/dev/tty` so a redirect cannot
+    /// swallow it, while the loop's own titles go to the stdout it owns, and a
+    /// session that redirects stdout for good (`exec >log`) would otherwise write
+    /// the clear somewhere the terminal never sees. Recording both at the moment
+    /// of the write is what keeps a title and its undo pointed at one place in
+    /// one dialect. Both halves raised in review on #452.
+    ///
+    /// Remembered rather than re-derived from `$sh.options.osc-title`, which may
+    /// have been turned off since: a shell that stops updating the title still
+    /// has to stop *owning* it. A terminal that never took a title is owed
+    /// nothing, which is why this records the write rather than the setting.
+    /// One entry per terminal, not one for the session: the two writers can
+    /// reach *different* terminals — `title` writes `/dev/tty` while the
+    /// automatic title writes stdout, which a session can point at another tty —
+    /// and a single slot let the second title's debt evict the first, leaving a
+    /// title stranded on a window nothing would clear. Raised in review on #452.
+    title_clear: Vec<(TitleSink, String)>,
+    /// Has anything called `title`? Once something has, the window is theirs and
+    /// the shell stops naming it.
+    ///
+    /// Without this the feature does not work at all: the prompt's own title is
+    /// written *after* the `preprompt` hooks — so a handler which `cd`s is titled
+    /// from where it left the shell — and a hook's `title` was overwritten a few
+    /// lines later, every prompt.
+    ///
+    /// Set once and never cleared. It does not distinguish "titles sometimes" from
+    /// "owns the title", so a session with only an `on preexec` handler loses the
+    /// automatic idle title too. **Scaffolding**: this whole flag goes when the
+    /// shipped title becomes an overridable hook, where taking the window is just
+    /// replacing the shipped handler — `TODO.md`, *A single mechanism for the
+    /// title*.
+    title_owned_by_caller: bool,
     /// Inside a `precd` / `postcd` handler. A handler may `cd` — the design
     /// allows it — but that move must not dispatch the hooks again, or
     /// `$sh.postcd.track = func(from) { cd $from }` would recurse until the
@@ -156,6 +196,45 @@ impl Shell {
     fn settle_error(&mut self) {
         let pending = self.pending_error.take();
         self.settle(pending);
+    }
+
+    /// Record the clear owed for one title, keeping one debt per destination *and*
+    /// dialect.
+    ///
+    /// Per destination, because a title on a different terminal is a separate debt
+    /// nothing else will pay. Per dialect, because one destination can hold two
+    /// titles at once: under screen or tmux, `ESC k` names the pane while `OSC 0`
+    /// names the outer window, and a startup file that titles either side of an
+    /// `$env.TERM` change writes both. Keying on the destination alone let the
+    /// second evict the first, so logout cleared the pane and left the window
+    /// named. Both raised in review on #452.
+    ///
+    /// The clear *is* the dialect — `title_sequence(term, "")` depends on nothing
+    /// else — so two titles in one dialect to one terminal collapse to a single
+    /// entry, which is the "newest title is what its clear undoes" rule falling
+    /// out rather than being enforced.
+    fn owe_clear(&mut self, sink: TitleSink, clear: String) {
+        if !self
+            .title_clear
+            .iter()
+            .any(|(owed, sequence)| *owed == sink && *sequence == clear)
+        {
+            self.title_clear.push((sink, clear));
+        }
+    }
+
+    /// Mark this copy of the shell as the **child** of a fork.
+    ///
+    /// The title debt is dropped here rather than at each call site, because the
+    /// clear is the *parent's* to write: the parent is still running and still
+    /// owns the window, so a child that inherited the debt and exited would clear
+    /// a title the session was still wearing. The same principle refuses `title`
+    /// in a forked stage. Raised in review on #452, where the debt also held a
+    /// duplicated terminal descriptor a child could leak; the sink records a path
+    /// now, so the leak is gone and the ownership rule is the whole reason.
+    fn became_forked(&mut self) {
+        self.forked = true;
+        self.title_clear.clear();
     }
 
     /// Copy the live job table into the variable store, where `$sh.jobs` reads
@@ -255,7 +334,8 @@ impl Shell {
             result: Value::String(String::new()),
             produced: Produced::Status,
             status_records: 0,
-            title_written: false,
+            title_clear: Vec::new(),
+            title_owned_by_caller: false,
             in_cd_hooks: false,
             input_error: None,
             pending_error: None,
@@ -1275,9 +1355,11 @@ fn run_logout(options: &StartupOptions, last: u8, shell: &mut Shell) -> u8 {
     //
     // Gated on having written one rather than on `$sh.options.osc-title`, so
     // turning the setting off mid-session still cleans up: the debt is from when
-    // it was on. `true` rather than the setting for the same reason.
-    if shell.title_written {
-        set_title(true, "");
+    // it was on. The stored sequence rather than a fresh one for the same reason
+    // it is stored at all — it speaks the dialect the title was written in, which
+    // is not always the one `session_term` ends up holding.
+    for (sink, clear) in std::mem::take(&mut shell.title_clear) {
+        sink.write(&clear);
     }
     last
 }
@@ -3048,7 +3130,7 @@ fn run_forked_block(body: &parser::Source, in_function: bool, shell: &mut Shell)
         // `jobs` must not `waitpid` on them — that fails with `ECHILD` and
         // reports every running job as finished — and `$sh.jobs` keeps the
         // snapshot it inherited. The same flag a forked pipeline stage sets.
-        shell.forked = true;
+        shell.became_forked();
         // Any capture this block was forked inside of belongs to the parent:
         // its reader threads did not survive the fork, so this process holds no
         // live capture and `exec` is free to replace it.
@@ -8294,7 +8376,7 @@ fn run_stage_in_shell(
     shell: &mut Shell,
 ) -> u8 {
     if forked {
-        shell.forked = true;
+        shell.became_forked();
         // A capture live at the fork is the parent's: its reader threads are not in
         // this process, so no capture holds this stage back from an `exec`.
         shell.captures = 0;
@@ -9650,7 +9732,7 @@ fn bounded_run(
     let outcome = exec::fork_and_wait(shell.vars.owns_terminal(), Some(deadline), || {
         // As in `fork`: this is the child, and it is not the parent of the pids
         // in the job table it inherited.
-        shell.forked = true;
+        shell.became_forked();
         shell.captures = 0;
         body(shell)
     });
@@ -9773,6 +9855,10 @@ fn run_expanded(mut argv: Argv, last: u8, shell: &mut Shell) -> Step {
     let words = &mut argv.words;
     match words[0].as_str() {
         "prompt" => return configure_prompt(&words[1..], shell),
+        // `title` writes through the same gate the automatic title does and
+        // records the debt on *this* shell, neither of which
+        // `builtins::dispatch` is handed.
+        "title" => return set_title_builtin(&words[1..], shell),
         "on" => return configure_hook(&words[1..], shell),
         // `cd` fires the `precd` / `postcd` hooks, which are this shell's, so it
         // cannot go through `builtins::dispatch` either.
@@ -9976,6 +10062,94 @@ fn configure_prompt(args: &[String], shell: &mut Shell) -> Step {
             Step::Error(2)
         }
     }
+}
+
+/// `title TEXT` — name the window and tab, per `DESIGN.md` "terminal control".
+///
+/// The user-facing half of the same write the shell makes automatically, and
+/// deliberately the *same* write: it goes through [`set_title`], so a custom
+/// title gets the `OSC_TERMS` allowlist, the `ESC k` spelling inside a
+/// multiplexer, the control-character scrub and the 96-character cut without a
+/// caller having to know any of it exists. Text from a user is not safer than
+/// text from a filename — a title built from `$(git log -1 --format=%s)` carries
+/// whatever a commit subject holds — so it gets the same treatment.
+///
+/// `$sh.options.osc-title` gates it, which is the point of routing through
+/// [`decoration`] rather than writing here: an off switch that a configured title
+/// walks straight past is not an off switch. Turning it off silences the
+/// automatic title and the hook that replaces it alike.
+///
+/// The sequence goes to `/dev/tty` rather than stdout, which is where this parts
+/// company with [`set_title`] and joins [`builtins::clip`] and `notify`: it is a
+/// message to the terminal, not program output, and a builtin can be redirected
+/// where the loop's own writes cannot. `title x > file` would otherwise put
+/// escape bytes in the file and leave the window holding whatever it held
+/// before — while still claiming the prompt below, so the automatic title that
+/// would have corrected it never ran. Raised in review on #452.
+///
+/// An **action, not a setting** — there is no `--reset` and no stored text. The
+/// shell holds no title of its own to restore, and a terminal cannot be asked
+/// what its title is, so the only honest question is "write this now". The
+/// automatic title returning at the next prompt is what a reset would have been
+/// for, and it already happens.
+///
+/// `title ""` is the way to clear one, which is the reset every terminal
+/// understands and what the shell itself writes on the way out.
+fn set_title_builtin(args: &[String], shell: &mut Shell) -> Step {
+    let [text] = args else {
+        note!("mesh: title: expected one title string");
+        return Step::Error(2);
+    };
+    // Refused where the bookkeeping cannot survive. A forked stage writes to
+    // `/dev/tty`, which is the *terminal's* state and outlives the fork, but
+    // records the clear it owes on a `Shell` that dies with the stage: `title X |
+    // cat` named the window and left nobody holding the debt, so the window kept
+    // that name after mesh exited. Refusing beats titling irrevocably — the point
+    // of tracking the clear is that mesh does not walk away owning someone's
+    // title bar. Raised in review on #452.
+    //
+    // `forked` alone, unlike the job-control builtins, which refuse
+    // `in_stage_here` too: a pipeline's last stage runs *in the shell*, so its
+    // debt is recorded where `run_logout` will find it, and `puts x | title NAME`
+    // is honest. Job control refuses that case for a different reason — the
+    // descriptors it is standing in for — which does not apply to a write that
+    // goes to `/dev/tty` regardless.
+    //
+    // Before the terminal gate, so it is a usage error everywhere rather than a
+    // silent no-op in the sessions that happen not to title at all.
+    if shell.forked {
+        note!("mesh: title: no window title from a pipeline stage");
+        return Step::Error(1);
+    }
+    if !decoration(&shell.vars, Opt::OscTitle) {
+        return Step::Continue(0);
+    }
+    // `None` is a terminal with no title to set, which is not a failure: the
+    // automatic titles are silent there too, and so is the prompt title this
+    // would otherwise stand aside for — so there is nothing to claim either.
+    // [`current_term`], not [`session_term`]: a startup file can reach this, and
+    // taking the session's snapshot here would let it decide the dialect before
+    // the startup files have finished saying what `$env.TERM` is.
+    let term = current_term();
+    let Some(sequence) = title_sequence(term.as_deref(), text) else {
+        return Step::Continue(0);
+    };
+    let status = builtins::write_terminal("title", &sequence);
+    if status != 0 {
+        return Step::Continue(status);
+    }
+    // All three recorded only on a write that reached the terminal. The clear at
+    // exit is owed for what was actually put there — and owed in *this* dialect,
+    // since a startup file may correct `$env.TERM` afterwards and leave the
+    // session holding one that cannot clear what this just wrote. The prompt's
+    // own title must stand aside only for a title that is really on the window:
+    // claiming otherwise leaves the terminal showing the last command it ran,
+    // with the write that would have corrected it suppressed.
+    if let Some(clear) = title_sequence(term.as_deref(), "") {
+        shell.owe_clear(TitleSink::Terminal, clear);
+    }
+    shell.title_owned_by_caller = true;
+    Step::Continue(0)
 }
 
 fn configure_hook(args: &[String], shell: &mut Shell) -> Step {
@@ -10219,37 +10393,208 @@ const TITLE_LIMIT: usize = 96;
 /// glance. `enabled` is [`decoration`] with [`Opt::OscTitle`]; failure to write is
 /// ignored for the same reason as [`semantic_mark`].
 ///
-/// **Returns whether a sequence was actually written**, which the caller records
-/// on the [`Shell`]. The clear on the way out is owed to any title this session
-/// put there — including one written before the setting was turned off, since a
-/// shell that stops updating the title still has to stop *owning* it. A terminal
-/// that never took one (`$env.TERM` off the allowlist) is owed nothing, which is
-/// why this answers about the write rather than about the setting.
-fn set_title(enabled: bool, text: &str) -> bool {
-    if !enabled {
-        return false;
+/// **Returns the sequence that clears what it wrote**, for the caller to record
+/// on the [`Shell`] as the debt — `None` when nothing was written, which is a
+/// terminal with no title to set (`$env.TERM` off the allowlist) or the setting
+/// off. Handing back the clear rather than a bool is what keeps a title and its
+/// clear in one dialect; see [`Shell::title_clear`].
+fn set_title(enabled: bool, text: &str) -> Option<(TitleSink, String)> {
+    // Stdout has to *be* the terminal, not merely belong to a session that owns
+    // one. `decoration` answers the second — `owns_terminal` is a session flag —
+    // and a session that redirects stdout for good would otherwise have its
+    // automatic titles written into the file: escape bytes in someone's log, and
+    // a cleanup debt recorded against a sink the terminal never saw, displacing
+    // one that `title` had correctly recorded against `/dev/tty`. Asking the
+    // descriptor is the only question that separates the two. Raised in review
+    // on #452.
+    if !enabled || !stdout_is_terminal() {
+        return None;
     }
-    let Some(sequence) = title_sequence(session_term().as_deref(), text) else {
-        return false;
-    };
+    let term = session_term();
+    let sequence = title_sequence(term.as_deref(), text)?;
+    let clear = title_sequence(term.as_deref(), "")?;
+    // The sink before the write, not after: a title written without a recorded
+    // debt is one nothing can undo. `written_on_stdout` has its own way to fail —
+    // `ttyname_r` may have no name to give for fd 1 even where the write would
+    // have landed — so resolving it first is what makes that cost a title rather
+    // than the window. Raised in review on #452, when the sink was a duplicated
+    // descriptor and a full descriptor table was the failure; the mechanism is a
+    // path now, and the ordering matters for the same reason.
+    let sink = TitleSink::written_on_stdout()?;
+    write_stdout(&sequence);
+    Some((sink, clear))
+}
+
+/// Is the shell's own stdout a terminal *now*?
+///
+/// Read per write rather than cached: unlike `$env.TERM`, which describes a
+/// terminal that does not change, this describes a descriptor the session can
+/// replace at any point with `exec >file`.
+fn stdout_is_terminal() -> bool {
+    // SAFETY: `isatty` reads a descriptor number and returns a flag; an invalid
+    // or non-terminal descriptor is a return of 0 rather than a fault.
+    unsafe { libc::isatty(libc::STDOUT_FILENO) == 1 }
+}
+
+/// Where a title sequence was written, so its clear can follow it there.
+///
+/// Two channels rather than one because the two writers answer to different
+/// constraints: see [`Shell::title_clear`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum TitleSink {
+    /// The terminal the title went to, **by name** — `/dev/pts/3`, say.
+    ///
+    /// A name rather than a held descriptor, though the descriptor came first and
+    /// took three rounds of review to get wrong three ways: inheritable across
+    /// `exec`, inherited across `fork`, and allocated into the standard range. The
+    /// fourth was the one that settled it — every descriptor above 2 is
+    /// user-addressable, so `exec 3>log` could `dup2` over the saved handle, and
+    /// dropping it at the next prompt would close a descriptor the session was
+    /// using. A name occupies no descriptor namespace at all, so none of that
+    /// class exists.
+    ///
+    /// The name is a *label to check*, not an address to reopen — see
+    /// [`TitleSink::write`], which will only write where the name still matches
+    /// the terminal on fd 1. Raised in review on #452.
+    Written(PathBuf),
+    /// `/dev/tty`, which a redirection cannot reach — [`set_title_builtin`].
+    Terminal,
+}
+
+impl TitleSink {
+    /// Name the terminal the shell's stdout is currently connected to.
+    ///
+    /// `None` when it has no name to give, which leaves no debt recorded rather
+    /// than one aimed somewhere unknown. Callers have already established that
+    /// stdout is a terminal — see [`stdout_is_terminal`].
+    fn written_on_stdout() -> Option<TitleSink> {
+        let mut name = [0 as libc::c_char; libc::PATH_MAX as usize];
+        // SAFETY: `ttyname_r` writes at most `name.len()` bytes into `name` and
+        // returns 0 on success; the buffer outlives the call.
+        let failure =
+            unsafe { libc::ttyname_r(libc::STDOUT_FILENO, name.as_mut_ptr(), name.len()) };
+        if failure != 0 {
+            return None;
+        }
+        // SAFETY: on success `ttyname_r` leaves a NUL-terminated string in `name`.
+        let terminal = unsafe { std::ffi::CStr::from_ptr(name.as_ptr()) };
+        Some(TitleSink::Written(PathBuf::from(
+            std::ffi::OsStr::from_bytes(terminal.to_bytes()),
+        )))
+    }
+
+    /// Write a sequence to the terminal this names, **if it is still there**.
+    ///
+    /// A failure to reach `/dev/tty` is *reported* but does not change the status:
+    /// this runs on the way out, where there is no longer a caller to answer to,
+    /// and a shell that could not undo its title must not also change what the
+    /// session exits with.
+    fn write(&self, sequence: &str) {
+        match self {
+            // On the descriptor, never by reopening the name. A pts name is
+            // recycled: the terminal that took the title can close and the kernel
+            // hand `/dev/pts/5` to an unrelated one before mesh exits, which would
+            // put the clear in a stranger's window. Comparing device identity does
+            // not settle it either — devpts derives both `st_rdev` and `st_ino`
+            // from the pty index, so a recycled index is indistinguishable. So the
+            // name is kept only to *recognize* the terminal still on fd 1, the
+            // descriptor the title went out on. Anything else — retargeted to a
+            // file, to a second terminal, closed — leaves the title standing, which
+            // is the right way to be wrong: a stale title in a window the shell no
+            // longer holds costs a name, writing to the wrong terminal costs
+            // someone else's. Raised in review on #452.
+            Self::Written(_) => {
+                if stdout_is_terminal() && Self::written_on_stdout().as_ref() == Some(self) {
+                    // Reporting, unlike the *title* write on this same descriptor.
+                    // A title is a decoration and a failed one costs nothing; a
+                    // failed clear leaves mesh's name on the window after mesh is
+                    // gone, which is the whole reason the debt is tracked. Raised
+                    // in review on #452.
+                    report_failed_write("title", &mut io::stdout(), sequence);
+                }
+            }
+            // `/dev/tty` is this process's controlling terminal, which a redirection
+            // cannot retarget and a recycled pts cannot become, so there is nothing
+            // to re-verify.
+            Self::Terminal => {
+                let _ = builtins::write_terminal("title", sequence);
+            }
+        }
+    }
+}
+
+/// Write a sequence to `out`, reporting a failure rather than discarding it.
+///
+/// For the *cleanup* writes — see [`TitleSink::write`]. Reports rather than
+/// returns, because the only caller runs from [`run_logout`], where a failed
+/// clear must not change what the session exits with; the status is what is
+/// deliberately dropped there, not the error. Answers whether it succeeded so
+/// the decision can be tested, since the failure needs a broken descriptor the
+/// pty harness cannot stage.
+fn report_failed_write(label: &str, out: &mut impl io::Write, sequence: &str) -> bool {
+    match out
+        .write_all(sequence.as_bytes())
+        .and_then(|()| out.flush())
+    {
+        Ok(()) => true,
+        Err(err) => {
+            note!("mesh: {label}: {err}");
+            false
+        }
+    }
+}
+
+/// Write a terminal sequence on the shell's own stdout, which the interactive
+/// loop owns at every point it decorates from.
+///
+/// Failure is ignored for the same reason as [`semantic_mark`]: a decoration that
+/// could change a command's status would be worse than a missing decoration.
+/// The *clear* on the way out goes through [`report_failed_write`] instead.
+fn write_stdout(sequence: &str) {
     use std::io::Write as _;
     let mut out = io::stdout();
     let _ = out.write_all(sequence.as_bytes());
     let _ = out.flush();
-    true
 }
 
-/// `$env.TERM` as it stood at the first title, held for the session.
+/// The session's `$env.TERM`, taken once and held.
+///
+/// Written to by the deliberate read in the interactive loops, after the startup
+/// files have run — see there.
+static SESSION_TERM: OnceLock<Option<OsString>> = OnceLock::new();
+
+/// `$env.TERM` as the session settled it, taking the snapshot if it has not been
+/// taken yet.
 ///
 /// Read once rather than per title, because the terminal on the other end does not
 /// change: `$env.TERM = dumb` mid-session is a claim about a terminal, not a new
 /// one. Reading it each time let the *clear* at exit consult a different answer
 /// than the title it was clearing, so that assignment left the window holding the
 /// command that made it — raised in review on #238. A startup file's `$env.TERM` is
-/// still honored, since the first title comes after those have run.
+/// still honored, because the loops take the snapshot explicitly once those have
+/// run, and everything that titles by itself runs later still.
 fn session_term() -> Option<OsString> {
-    static TERM: OnceLock<Option<OsString>> = OnceLock::new();
-    TERM.get_or_init(|| std::env::var_os("TERM")).clone()
+    SESSION_TERM
+        .get_or_init(|| std::env::var_os("TERM"))
+        .clone()
+}
+
+/// `$env.TERM` for a write that may be happening *before* the session has settled
+/// it — which since `title` became a builtin means a startup file, the one place
+/// that can write a title while `$env.TERM` is still being decided.
+///
+/// Falls back to a live read rather than taking the snapshot, so an early `title`
+/// uses the terminal as it stands at that moment without freezing it: a startup
+/// file that titles and then corrects `$env.TERM`, or one that titles before a
+/// later file corrects it, would otherwise pin the wrong dialect for the whole
+/// session — titles suppressed on a terminal that does support them, or emitted
+/// at one that does not. Raised in review on #452; it is the accident the
+/// deliberate snapshot was introduced to end, arriving through a new door.
+fn current_term() -> Option<OsString> {
+    match SESSION_TERM.get() {
+        Some(term) => term.clone(),
+        None => std::env::var_os("TERM"),
+    }
 }
 
 /// The title sequence for this `$env.TERM`, or `None` for a terminal that has no
@@ -13061,7 +13406,8 @@ fn run_interactive(options: &StartupOptions) -> ExitCode {
     // from is read *after* the startup files have had their say and before the
     // first prompt draws anything. Leaving it to whichever write happened to come
     // first made the moment an accident, and put the dialect's read before
-    // `rc.mesh` — see `session_integration`.
+    // `rc.mesh` — see `session_integration`. A startup file's own `title` reads
+    // through `current_term` and so does not take the snapshot early.
     let _ = session_term();
     let _ = session_integration();
     let mut pending = String::new();
@@ -13092,10 +13438,21 @@ fn run_interactive(options: &StartupOptions) -> ExitCode {
             // a fresh command: a continuation line is the same command line still
             // being typed, and the shell cannot have moved between the two.
             report_cwd(decoration(&shell.vars, Opt::CwdReport));
-            shell.title_written |= set_title(
-                decoration(&shell.vars, Opt::OscTitle),
-                &environment_prompt_title(),
-            );
+            // Unless something has named the window itself, in which case the
+            // window is theirs from then on — see [`Shell::title_owned_by_caller`].
+            // Standing aside rather than moving this write above the hooks, which
+            // would title the directory a `preprompt` handler had just left.
+            if !shell.title_owned_by_caller
+                && let Some(clear) = set_title(
+                    decoration(&shell.vars, Opt::OscTitle),
+                    &environment_prompt_title(),
+                )
+            {
+                // Replaced only on a write. Assigning unconditionally would drop
+                // the debt the moment the setting went off, and the clear is owed
+                // from when it was on.
+                shell.owe_clear(clear.0, clear.1);
+            }
         }
         *completion.write().expect("completion state poisoned") =
             CompletionState::from_shell(&shell);
@@ -14131,12 +14488,24 @@ fn handle_signal(
             // caused it. The prompt's title comes back at the next prompt, so a
             // command's title lasts exactly as long as the command.
             //
+            // Gated on ownership for the same reason the prompt's title is, and
+            // it is the *worse* of the two to miss: the prompt's write is the one
+            // that would put the window back, so a running title written over a
+            // caller's would then never be replaced — `title CUSTOM; sleep 10`
+            // would leave the window reading `sleep 10` for good. Raised in
+            // review on #452.
+            //
             // Still on `interactive()` rather than a setting of its own:
             // `$sh.options.osc-title` is the next change, not this one.
-            shell.title_written |= set_title(
-                decoration(&shell.vars, Opt::OscTitle),
-                &running_title(&command),
-            );
+            if !shell.title_owned_by_caller
+                && let Some(clear) = set_title(
+                    decoration(&shell.vars, Opt::OscTitle),
+                    &running_title(&command),
+                )
+            {
+                // Replaced only on a write, as at the prompt above.
+                shell.owe_clear(clear.0, clear.1);
+            }
             // `E` first, so a terminal knows what is about to run before any of
             // its output arrives — the order VS Code's own integrations use.
             // Nothing is written for `OSC 133`, which has no such sequence.
@@ -14152,7 +14521,7 @@ fn handle_signal(
                 vec![Value::String(command.clone())],
                 shell,
             );
-            // The clock still starts here: `elapsed` is the command's own, and
+            // The clock starts here: `elapsed` is the command's own, and
             // reporting a hook's time as part of it would make the number
             // depend on what happens to be registered.
             let start = Instant::now();
@@ -14254,7 +14623,8 @@ fn run_piped(options: &StartupOptions) -> ExitCode {
     // from is read *after* the startup files have had their say and before the
     // first prompt draws anything. Leaving it to whichever write happened to come
     // first made the moment an accident, and put the dialect's read before
-    // `rc.mesh` — see `session_integration`.
+    // `rc.mesh` — see `session_integration`. A startup file's own `title` reads
+    // through `current_term` and so does not take the snapshot early.
     let _ = session_term();
     let _ = session_integration();
     let mut pending = String::new();
@@ -14522,17 +14892,180 @@ mod tests {
     use super::{
         ArgumentRecall, CommandLine, CompletionState, EscapePrefix, HeredocGate, Hook, HookEvent,
         Integration, Invocation, Lookup, MeshPrompt, NOTIFY_LIMIT, PromptMarkers, SemanticMark,
-        Shell, StartupOptions, Step, TITLE_LIMIT, TimestampedHistory, argument_completions,
-        body_awaits_close, command_line, command_notification, command_position,
-        command_segment_words, command_words, completed_command, deferred_words, duration_words,
-        escape_stripped_width, eval_binary, expand_history_designators, expansion_word,
-        external_stage, func_definition_is_open, handle_signal, help_completions,
+        Shell, StartupOptions, Step, TITLE_LIMIT, TimestampedHistory, TitleSink,
+        argument_completions, body_awaits_close, command_line, command_notification,
+        command_position, command_segment_words, command_words, completed_command, deferred_words,
+        duration_words, escape_stripped_width, eval_binary, expand_history_designators,
+        expansion_word, external_stage, func_definition_is_open, handle_signal, help_completions,
         history_designators, history_path_from, input_highlighter, interactive_keybindings,
         interruptible_task, last_argument, mark_sequence, needs_more_input, open_history,
         path_completions_sync, persist_logical_history, prepare_history_path, prompt_title,
         run_hooks, run_line, run_source, running_title, segment_completions, title_sequence,
         title_text, variable_completions, vscode_escaped,
     };
+
+    /// The sink names the terminal a title was written to.
+    ///
+    /// What replaced three rounds of descriptor bugs: the destination is recorded
+    /// by name, so it occupies no descriptor the session could redirect over and
+    /// nothing is held open between prompts. Raised in review on #452.
+    #[test]
+    fn the_title_sink_names_the_terminal_it_wrote_to() {
+        // Only meaningful where the test harness itself has a terminal; where it
+        // does not, `None` is the documented answer and there is nothing to check.
+        if !super::stdout_is_terminal() {
+            return;
+        }
+        let Some(TitleSink::Written(named)) = TitleSink::written_on_stdout() else {
+            panic!("a terminal stdout should name itself");
+        };
+        assert!(
+            named.is_absolute(),
+            "the sink should name a device path, got {named:?}"
+        );
+    }
+
+    /// A clear that cannot be written says so.
+    ///
+    /// The stdout branch of the sink used to run through `write_terminal_at`,
+    /// which reported; routing it back to the descriptor put it on `write_stdout`,
+    /// which ignores failure because a *title* is a decoration. A clear is not —
+    /// failing silently there leaves mesh's name on the window with no diagnostic.
+    /// Raised in review on #452.
+    #[test]
+    fn a_clear_that_cannot_be_written_is_reported() {
+        struct Broken;
+        impl std::io::Write for Broken {
+            fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe))
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        assert!(
+            !super::report_failed_write("title", &mut Broken, "\x1b]0;\x07"),
+            "a failed clear should be noticed, not discarded"
+        );
+        let mut sink = Vec::new();
+        assert!(
+            super::report_failed_write("title", &mut sink, "\x1b]0;\x07"),
+            "a clear that lands should report success"
+        );
+        assert_eq!(sink, b"\x1b]0;\x07");
+    }
+
+    /// The clear does not chase a name that is no longer the terminal.
+    ///
+    /// A pts name is recycled. The terminal that took the title can close and the
+    /// kernel hand its name to an unrelated one before mesh exits, and reopening
+    /// the name then puts the clear in a stranger's window; `st_rdev` and `st_ino`
+    /// cannot tell the two apart, because devpts derives both from the pty index.
+    /// So the name is only compared against the terminal on fd 1. Here the name is
+    /// an ordinary file, which is never what fd 1 is: the previous code opened it
+    /// and wrote the sequence into it, which is the bug in miniature. Raised in
+    /// review on #452.
+    #[test]
+    fn a_clear_does_not_follow_a_name_that_is_not_the_terminal() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let stranger = std::env::temp_dir().join(format!(
+            "mesh-title-stranger-{}-{unique}",
+            std::process::id()
+        ));
+        fs::write(&stranger, b"").expect("seed the stand-in terminal");
+
+        TitleSink::Written(stranger.clone()).write("\x1b]0;\x07");
+
+        let landed = fs::read(&stranger).expect("the stand-in terminal should still be readable");
+        fs::remove_file(&stranger).expect("clean up the stand-in terminal");
+        assert!(
+            landed.is_empty(),
+            "the clear went to a name that is not the terminal on fd 1, got {landed:?}"
+        );
+    }
+
+    /// A title on a second terminal is a debt of its own.
+    ///
+    /// The two writers can reach different terminals — `title` goes to
+    /// `/dev/tty`, the automatic title to stdout, which a session can point at
+    /// another tty. A single debt slot let the newer one evict the older, so the
+    /// first terminal kept a title nothing would ever clear. Raised in review
+    /// on #452.
+    #[test]
+    fn a_title_on_a_second_terminal_keeps_its_own_clear() {
+        let osc = title_sequence(Some(OsStr::new("xterm-256color")), "").unwrap();
+        let mut shell = Shell::new();
+        shell.owe_clear(TitleSink::Terminal, osc.clone());
+        shell.owe_clear(
+            TitleSink::Written(PathBuf::from("/dev/pts/other")),
+            osc.clone(),
+        );
+        assert_eq!(
+            shell.title_clear.len(),
+            2,
+            "both terminals are owed a clear"
+        );
+
+        // The same terminal in the same dialect is one debt however many titles
+        // were written: the clear does not depend on the text it undoes.
+        shell.owe_clear(TitleSink::Terminal, osc.clone());
+        assert_eq!(
+            shell.title_clear.len(),
+            2,
+            "one debt per terminal and dialect, not per title"
+        );
+    }
+
+    /// One terminal can hold two titles, in two protocols.
+    ///
+    /// Under screen or tmux, `ESC k` names the pane and `OSC 0` names the outer
+    /// window — different layers of the same destination. A startup file that
+    /// titles either side of an `$env.TERM` change writes both, and keying the
+    /// debt on the destination alone let the second evict the first, so logout
+    /// cleared the pane and left the window named. Raised in review on #452.
+    #[test]
+    fn two_title_dialects_on_one_terminal_are_two_debts() {
+        let osc = title_sequence(Some(OsStr::new("xterm-256color")), "").unwrap();
+        let screen = title_sequence(Some(OsStr::new("screen-256color")), "").unwrap();
+        assert_ne!(osc, screen, "the two dialects clear differently");
+
+        let mut shell = Shell::new();
+        shell.owe_clear(TitleSink::Terminal, osc.clone());
+        shell.owe_clear(TitleSink::Terminal, screen.clone());
+
+        let owed: Vec<&str> = shell
+            .title_clear
+            .iter()
+            .filter(|(sink, _)| *sink == TitleSink::Terminal)
+            .map(|(_, clear)| clear.as_str())
+            .collect();
+        assert!(
+            owed.contains(&osc.as_str()) && owed.contains(&screen.as_str()),
+            "both the window and the pane are owed a clear, got {owed:?}"
+        );
+    }
+
+    /// A forked child does not inherit the title debt.
+    ///
+    /// The clear belongs to the parent, which is still running and still owns the
+    /// window; a child that kept the debt would clear a title the session was
+    /// still wearing when it exited. Raised in review on #452.
+    #[test]
+    fn a_forked_child_does_not_inherit_the_title_debt() {
+        let mut shell = Shell::new();
+        shell.owe_clear(TitleSink::Terminal, "\x1b]0;\x07".to_string());
+        shell.became_forked();
+        assert!(shell.forked, "the child should be marked forked");
+        assert!(
+            shell.title_clear.is_empty(),
+            "the clear belongs to the parent, which still owns the window"
+        );
+    }
+
     use crate::builtins::{Multiplexer, through_multiplexer};
     use crate::options::Options;
     use crate::parser;

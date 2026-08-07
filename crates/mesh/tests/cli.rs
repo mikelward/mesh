@@ -6486,6 +6486,587 @@ fn title_setting_harness(exec: &MeshExec) -> i32 {
 }
 
 #[test]
+fn the_title_builtin_names_the_window() {
+    let exec = MeshExec::with_environment(
+        isolated_config_home(),
+        &[("TERM", "xterm-256color"), ("USER", "tester")],
+    );
+    // Its own directory, because the redirect below writes a file: the shell runs
+    // there, so the check for what a redirect caught cannot leave one behind in
+    // the tree.
+    let directory = fresh_dir("title_builtin");
+    let harness = unsafe { libc::fork() };
+    assert!(harness >= 0);
+    if harness == 0 {
+        unsafe { libc::_exit(title_builtin_harness(&exec, &directory)) };
+    }
+    await_pty_harness(harness);
+}
+
+/// `title TEXT` writes the same sequence the shell writes for itself, obeys the
+/// same setting, and leaves the same debt behind.
+///
+/// A pty because there is nothing to see without one: the write is gated on
+/// owning a terminal, so a piped shell is silent by design and would make every
+/// assertion below vacuously true.
+fn title_builtin_harness(exec: &MeshExec, directory: &Path) -> i32 {
+    let Some(shell) = start_pty_shell(exec, Some(directory)) else {
+        return 160;
+    };
+    if !pty_write(shell.master, b"title 'my window'\n") {
+        return 161;
+    }
+    let Some((seen, status)) = pty_read_until_command_done(shell.master) else {
+        return 162;
+    };
+    if status != 0 {
+        return 163;
+    }
+    if occurrences(&seen, b"\x1b]0;my window\x07") == 0 {
+        return 164;
+    }
+    // The scrub reaches a title the *user* wrote, not only the command lines and
+    // directory names the shell titles with. A title built from a commit subject
+    // or a branch name carries text nobody vetted, so this is the reachable case
+    // rather than a theoretical one.
+    if !pty_write(shell.master, b"title \"a\\e]0;evil\\ab\"\n") {
+        return 165;
+    }
+    let Some((seen, _)) = pty_read_until_command_done(shell.master) else {
+        return 166;
+    };
+    if occurrences(&seen, b"\x1b]0;a ]0;evil b\x07") == 0 {
+        return 167;
+    }
+    // A redirect cannot swallow it. Raised in review on #452: written to stdout,
+    // `title x > file` put the escape bytes in the file, left the window holding
+    // the previous title, and still claimed the prompt below — so the automatic
+    // title that would have corrected it never ran, and a redirected `title` in a
+    // `preprompt` hook suppressed the idle title for good.
+    if !pty_write(shell.master, b"title 'REDIRECTED' > title-out\n") {
+        return 168;
+    }
+    let Some((seen, _)) = pty_read_until_command_done(shell.master) else {
+        return 169;
+    };
+    if occurrences(&seen, b"\x1b]0;REDIRECTED\x07") == 0 {
+        return 170;
+    }
+    // And the file caught nothing, which is the other half of the same claim.
+    if !pty_write(shell.master, b"puts \"[$(cat title-out)]\"\n") {
+        return 171;
+    }
+    let Some((seen, _)) = pty_read_until_command_done(shell.master) else {
+        return 172;
+    };
+    if occurrences(&seen, b"[]") == 0 {
+        return 173;
+    }
+
+    // The setting governs the builtin too. An off switch a configured title walks
+    // past would silence the shell's own titles and nothing else, which is the
+    // opposite of what turning it off is for.
+    if !pty_write(shell.master, b"$sh.options.osc-title = false\n")
+        || pty_read_until_command_done(shell.master).is_none()
+        || !pty_write(shell.master, b"title 'silenced'\n")
+    {
+        return 174;
+    }
+    let Some((seen, _)) = pty_read_until_command_done(shell.master) else {
+        return 175;
+    };
+    if occurrences(&seen, b"\x1b]0;silenced\x07") != 0 {
+        return 176;
+    }
+    // And leaving still clears, because this session did put a title there.
+    if !pty_write(shell.master, b"exit 0\n") {
+        return 177;
+    }
+    let farewell = pty_read_to_end(shell.master);
+    let cleared = farewell
+        .windows(4)
+        .rposition(|part| part == b"\x1b]0;")
+        .is_some_and(|at| farewell.get(at + 4) == Some(&0x07));
+    if !cleared {
+        return 178;
+    }
+    let mut status = 0;
+    if unsafe { libc::waitpid(shell.mesh, &mut status, 0) } != shell.mesh
+        || !libc::WIFEXITED(status)
+        || libc::WEXITSTATUS(status) != 0
+    {
+        return 179;
+    }
+    unsafe { libc::close(shell.master) };
+    0
+}
+
+#[test]
+fn a_hook_title_survives_the_automatic_one() {
+    let home = fresh_dir("hook_title_rc");
+    let config = home.join("mesh");
+    std::fs::create_dir_all(&config).unwrap();
+    // Both halves configured, which is the arrangement the feature is for: where
+    // the shell is when it waits, what it runs when it is busy.
+    std::fs::write(
+        config.join("rc.mesh"),
+        "func title-idle() { title 'IDLE' }\n\
+         func title-busy(cmd) { title \"BUSY $cmd\" }\n\
+         on preprompt title title-idle\n\
+         on preexec title title-busy\n",
+    )
+    .unwrap();
+
+    let exec = MeshExec::with_environment(&home, &[("TERM", "xterm-256color"), ("USER", "tester")]);
+    let harness = unsafe { libc::fork() };
+    assert!(harness >= 0);
+    if harness == 0 {
+        unsafe { libc::_exit(hook_title_harness(&exec)) };
+    }
+    await_pty_harness(harness);
+}
+
+/// A `preprompt` hook's title reaches the terminal and the automatic one does not
+/// overwrite it, and a `preexec` hook's title does not cost the prompt its own.
+///
+/// The regression this pins: the prompt's title is written *after* the
+/// `preprompt` hooks, so before the suppression flag a handler's title was
+/// clobbered a few lines later — every prompt, silently. `title` worked
+/// everywhere except the one hook a title belongs in.
+fn hook_title_harness(exec: &MeshExec) -> i32 {
+    let Some(shell) = start_pty_shell(exec, None) else {
+        return 180;
+    };
+    // The first prompt already carries the hook's title, and never the automatic
+    // `user@host: dir` it stood in for.
+    if occurrences(&shell.startup, b"\x1b]0;IDLE\x07") == 0 {
+        return 181;
+    }
+    if occurrences(&shell.startup, b"\x1b]0;tester@") != 0 {
+        return 182;
+    }
+    if !pty_write(shell.master, b"sh -c 'sleep 0.3'\n") {
+        return 183;
+    }
+    let Some((seen, status)) = pty_read_until_command_done(shell.master) else {
+        return 184;
+    };
+    if status != 0 {
+        return 185;
+    }
+    // The busy title is the hook's, not the bare command line the shell writes.
+    if occurrences(&seen, b"\x1b]0;BUSY sh -c 'sleep 0.3'\x07") == 0 {
+        return 186;
+    }
+    // And the idle title comes back after it — the half that breaks if a
+    // `preexec` title is allowed to suppress the next prompt's.
+    if occurrences(&seen, b"\x1b]0;IDLE\x07") == 0
+        && pty_read_until_one_of(shell.master, &[b"\x1b]0;IDLE\x07".as_slice()]).is_none()
+    {
+        return 187;
+    }
+    if !pty_write(shell.master, b"exit 0\n") {
+        return 188;
+    }
+    let farewell = pty_read_to_end(shell.master);
+    let cleared = farewell
+        .windows(4)
+        .rposition(|part| part == b"\x1b]0;")
+        .is_some_and(|at| farewell.get(at + 4) == Some(&0x07));
+    if !cleared {
+        return 189;
+    }
+    let mut status = 0;
+    if unsafe { libc::waitpid(shell.mesh, &mut status, 0) } != shell.mesh
+        || !libc::WIFEXITED(status)
+        || libc::WEXITSTATUS(status) != 0
+    {
+        return 190;
+    }
+    unsafe { libc::close(shell.master) };
+    0
+}
+
+#[test]
+fn a_hand_typed_title_takes_the_window() {
+    let exec = MeshExec::with_environment(
+        isolated_config_home(),
+        &[("TERM", "xterm-256color"), ("USER", "tester")],
+    );
+    let harness = unsafe { libc::fork() };
+    assert!(harness >= 0);
+    if harness == 0 {
+        unsafe { libc::_exit(title_ownership_harness(&exec)) };
+    }
+    await_pty_harness(harness);
+}
+
+/// Calling `title` takes the window: the shell stops naming it from then on.
+///
+/// The rule has no lifetime, which is the point — its predecessor was a per-prompt
+/// claim released at the next submitted command, and the *lifetime* went wrong
+/// three times in review on #452 (spent a prompt early by a `mem::take`,
+/// documented backwards, and never released on the history-expansion error path).
+/// Nothing here is timing-dependent: the window is the caller's from the first
+/// `title` onwards. Documented in `docs/REFERENCE.md`; the flag behind it is
+/// scaffolding for the shipped-hook design in `TODO.md`.
+fn title_ownership_harness(exec: &MeshExec) -> i32 {
+    const CUSTOM: &[u8] = b"\x1b]0;CUSTOM\x07";
+    // The automatic title's shape — `user@host: dir`, from the planted `$USER`.
+    const AUTOMATIC: &[u8] = b"\x1b]0;tester@";
+    let Some(shell) = start_pty_shell(exec, None) else {
+        return 230;
+    };
+    // Before anything claims it, the shell titles the window itself. Asserted so
+    // the checks below cannot pass by titling never working at all.
+    if occurrences(&shell.startup, AUTOMATIC) == 0 {
+        return 229;
+    }
+    if !pty_write(shell.master, b"title CUSTOM\n") {
+        return 231;
+    }
+    let Some((seen, status)) = pty_read_until_command_done(shell.master) else {
+        return 232;
+    };
+    if status != 0 || occurrences(&seen, CUSTOM) == 0 {
+        return 233;
+    }
+    // A blank line runs no command, so there is no completion to wait for — the
+    // prompt being drawn again is the whole event. Read up to that mark rather
+    // than leaving it buffered: an unread pty backs up until the shell blocks
+    // writing into it, which presents as the shell ignoring what is typed next.
+    if !pty_write(shell.master, b"\n") {
+        return 234;
+    }
+    let Some(reprompt) = pty_read_until_one_of(shell.master, &[INPUT_READY]) else {
+        return 235;
+    };
+    // The regression: the automatic title rides in with that redrawn prompt,
+    // overwriting CUSTOM even though nothing was submitted.
+    if occurrences(&reprompt, AUTOMATIC) != 0 {
+        return 236;
+    }
+    // And a submitted command does not hand the window back either — the window
+    // stays the caller's. This is the half that used to be the other way round,
+    // when the claim was released here and a hand-typed title lasted exactly one
+    // prompt.
+    //
+    // Both titles are checked, because there are two writers and only one of them
+    // is the prompt's. The *running* title is the worse one to miss: the prompt's
+    // write is what would put the window back, so a running title written over a
+    // caller's is never replaced at all. Gating the prompt alone left
+    // `title CUSTOM; puts MARK` showing `puts MARK` for good — raised in review
+    // on #452, and this assertion is what was missing to catch it.
+    if !pty_write(shell.master, b"puts MARK\n") {
+        return 237;
+    }
+    let Some((seen, status)) = pty_read_until_command_done(shell.master) else {
+        return 238;
+    };
+    if status != 0 || occurrences(&seen, AUTOMATIC) != 0 {
+        return 239;
+    }
+    if occurrences(&seen, b"\x1b]0;puts MARK\x07") != 0 {
+        return 228;
+    }
+    if !pty_write(shell.master, b"exit 0\n") {
+        return 240;
+    }
+    let mut status = 0;
+    if unsafe { libc::waitpid(shell.mesh, &mut status, 0) } != shell.mesh
+        || !libc::WIFEXITED(status)
+        || libc::WEXITSTATUS(status) != 0
+    {
+        return 241;
+    }
+    unsafe { libc::close(shell.master) };
+    0
+}
+
+#[test]
+fn the_title_builtin_is_refused_where_its_cleanup_would_die() {
+    // Raised in review on #452: a forked stage writes to `/dev/tty`, which is the
+    // terminal's state and outlives the fork, but records the clear it owes on a
+    // `Shell` that does not. `title X | cat` named the window with nobody left
+    // holding the debt, so the window kept that name after mesh exited.
+    let out = run_with_input("title 'PIPED' | cat\nputs $sh.status\n");
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(text.trim(), "1", "{text}");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("no window title from a pipeline stage"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // The last stage runs in the shell itself, so its bookkeeping survives and it
+    // is allowed — the refusal is about the fork, not about the pipe.
+    let out = run_with_input("puts x | title 'LAST'\nputs $sh.status\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "0");
+}
+
+#[test]
+fn the_title_builtin_wants_exactly_one_string() {
+    // Two words are the mistake worth catching: `title $sh.host $(pwd)` reads as
+    // a title built from two pieces and is not one, so it is refused rather than
+    // silently naming the window after the first.
+    let out = run_with_input("title one two\nputs $sh.status\n");
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(text.trim(), "2", "{text}");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("expected one title string"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let out = run_with_input("title\nputs $sh.status\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "2");
+}
+
+#[test]
+fn a_startup_title_does_not_settle_the_terminal_dialect() {
+    let home = fresh_dir("startup_title_term");
+    let config = home.join("mesh");
+    std::fs::create_dir_all(&config).unwrap();
+    // The ordering raised in review on #452: a startup file titles while
+    // `$env.TERM` still says a terminal with no title to set, and only then
+    // corrects it. Reading the session snapshot at that first `title` would pin
+    // `dumb` for the whole session and suppress every title after it.
+    std::fs::write(
+        config.join("rc.mesh"),
+        "title 'too early'\n$env.TERM = 'xterm-256color'\n",
+    )
+    .unwrap();
+
+    let exec = MeshExec::with_environment(&home, &[("TERM", "dumb"), ("USER", "tester")]);
+    let harness = unsafe { libc::fork() };
+    assert!(harness >= 0);
+    if harness == 0 {
+        unsafe { libc::_exit(startup_title_term_harness(&exec)) };
+    }
+    await_pty_harness(harness);
+}
+
+/// The corrected `$env.TERM` decides the session, not the one a startup file's
+/// `title` happened to see.
+fn startup_title_term_harness(exec: &MeshExec) -> i32 {
+    let Some(shell) = start_pty_shell(exec, None) else {
+        return 200;
+    };
+    // `dumb` has no title, so the early call wrote nothing — which is right for
+    // the terminal as it stood, and is why it must not also be the answer for the
+    // rest of the session.
+    if occurrences(&shell.startup, b"too early") != 0 {
+        return 201;
+    }
+    // The first prompt titles under the corrected dialect.
+    if occurrences(&shell.startup, b"\x1b]0;tester@") == 0 {
+        return 202;
+    }
+    if !pty_write(shell.master, b"title 'later'\n") {
+        return 203;
+    }
+    let Some((seen, _)) = pty_read_until_command_done(shell.master) else {
+        return 204;
+    };
+    if occurrences(&seen, b"\x1b]0;later\x07") == 0 {
+        return 205;
+    }
+    if !pty_write(shell.master, b"exit 0\n") {
+        return 206;
+    }
+    let _ = pty_read_to_end(shell.master);
+    let mut status = 0;
+    if unsafe { libc::waitpid(shell.mesh, &mut status, 0) } != shell.mesh
+        || !libc::WIFEXITED(status)
+        || libc::WEXITSTATUS(status) != 0
+    {
+        return 207;
+    }
+    unsafe { libc::close(shell.master) };
+    0
+}
+
+#[test]
+fn a_startup_title_is_cleared_in_the_dialect_that_wrote_it() {
+    let home = fresh_dir("startup_title_clear");
+    let config = home.join("mesh");
+    std::fs::create_dir_all(&config).unwrap();
+    // The mirror image of the test above, and the second-order bug it caused —
+    // raised in review on #452. The title is written while `$env.TERM` names a
+    // terminal that takes one, and the session then settles on a terminal that
+    // does not. Building the clear at exit from the settled `$env.TERM` emits
+    // nothing, so the startup title outlives mesh.
+    std::fs::write(
+        config.join("rc.mesh"),
+        "title 'STARTUP'\n$env.TERM = 'dumb'\n",
+    )
+    .unwrap();
+
+    let exec = MeshExec::with_environment(&home, &[("TERM", "xterm-256color"), ("USER", "tester")]);
+    let harness = unsafe { libc::fork() };
+    assert!(harness >= 0);
+    if harness == 0 {
+        unsafe { libc::_exit(startup_title_clear_harness(&exec)) };
+    }
+    await_pty_harness(harness);
+}
+
+#[test]
+fn two_title_dialects_in_one_session_are_both_cleared() {
+    let home = fresh_dir("startup_title_two_dialects");
+    let config = home.join("mesh");
+    std::fs::create_dir_all(&config).unwrap();
+    // One terminal, two title layers — raised in review on #452. Under screen or
+    // tmux, `ESC k` names the pane while `OSC 0` names the outer window, so a
+    // startup file that titles either side of an `$env.TERM` change leaves two
+    // titles standing. Keying the debt on the destination alone let the second
+    // evict the first, and logout cleared only the pane.
+    std::fs::write(
+        config.join("rc.mesh"),
+        "title 'WINDOW'\n$env.TERM = 'screen-256color'\ntitle 'PANE'\n",
+    )
+    .unwrap();
+
+    let exec = MeshExec::with_environment(&home, &[("TERM", "xterm-256color"), ("USER", "tester")]);
+    let harness = unsafe { libc::fork() };
+    assert!(harness >= 0);
+    if harness == 0 {
+        unsafe { libc::_exit(startup_title_two_dialects_harness(&exec)) };
+    }
+    await_pty_harness(harness);
+}
+
+/// Two titles on one terminal in two protocols are two debts, and both are paid.
+fn startup_title_two_dialects_harness(exec: &MeshExec) -> i32 {
+    let Some(shell) = start_pty_shell(exec, None) else {
+        return 191;
+    };
+    // The window title, written while `xterm-256color` was in force.
+    if occurrences(&shell.startup, b"\x1b]0;WINDOW\x07") == 0 {
+        return 192;
+    }
+    // And the pane title, written after the switch to `screen-256color`.
+    if occurrences(&shell.startup, b"\x1bkPANE\x1b\\") == 0 {
+        return 193;
+    }
+    if !pty_write(shell.master, b"exit 0\n") {
+        return 194;
+    }
+    let farewell = pty_read_to_end(shell.master);
+    // The pane's clear. The session settled on `screen-256color`, so the automatic
+    // titles owe this one too — it is the window's clear below that discriminates.
+    if occurrences(&farewell, b"\x1bk\x1b\\") == 0 {
+        return 195;
+    }
+    // The window's clear, owed only by `title 'WINDOW'`. Absent when one debt per
+    // destination let the pane's clear evict it, which is the bug.
+    if occurrences(&farewell, b"\x1b]0;\x07") == 0 {
+        return 196;
+    }
+    let mut status = 0;
+    if unsafe { libc::waitpid(shell.mesh, &mut status, 0) } != shell.mesh
+        || !libc::WIFEXITED(status)
+        || libc::WEXITSTATUS(status) != 0
+    {
+        return 197;
+    }
+    unsafe { libc::close(shell.master) };
+    0
+}
+
+/// A title written under one dialect is cleared under that dialect, not whichever
+/// one the session ends up holding.
+fn startup_title_clear_harness(exec: &MeshExec) -> i32 {
+    let Some(shell) = start_pty_shell(exec, None) else {
+        return 210;
+    };
+    // Written: `xterm-256color` was in force when `rc.mesh` ran.
+    if occurrences(&shell.startup, b"\x1b]0;STARTUP\x07") == 0 {
+        return 211;
+    }
+    // And the session settled on `dumb`, so nothing titles after that — which is
+    // what leaves `STARTUP` as the title mesh still owes a clear for.
+    if occurrences(&shell.startup, b"\x1b]0;tester@") != 0 {
+        return 212;
+    }
+    if !pty_write(shell.master, b"exit 0\n") {
+        return 213;
+    }
+    let farewell = pty_read_to_end(shell.master);
+    // The clear is the empty-title sequence in the dialect that wrote — so it is
+    // present at all, which building it from `dumb` would not be.
+    if occurrences(&farewell, b"\x1b]0;\x07") == 0 {
+        return 214;
+    }
+    let mut status = 0;
+    if unsafe { libc::waitpid(shell.mesh, &mut status, 0) } != shell.mesh
+        || !libc::WIFEXITED(status)
+        || libc::WEXITSTATUS(status) != 0
+    {
+        return 215;
+    }
+    unsafe { libc::close(shell.master) };
+    0
+}
+
+#[test]
+fn a_custom_title_is_cleared_through_the_terminal_it_was_written_to() {
+    let exec = MeshExec::with_environment(
+        isolated_config_home(),
+        &[("TERM", "xterm-256color"), ("USER", "tester")],
+    );
+    let harness = unsafe { libc::fork() };
+    assert!(harness >= 0);
+    if harness == 0 {
+        unsafe { libc::_exit(title_sink_harness(&exec)) };
+    }
+    await_pty_harness(harness);
+}
+
+/// When the last title on the window is one `title` wrote, the clear on the way
+/// out goes back through `/dev/tty` — the channel that title took — rather than
+/// through the stdout the loop's own titles use.
+///
+/// Both channels are the same terminal in an ordinary session, so what this pins
+/// is that the `TitleSink::Terminal` path clears at all: the debt is recorded
+/// against a different writer than the one `run_logout` used to assume, and a
+/// session ending on a custom title is the common way to reach it.
+fn title_sink_harness(exec: &MeshExec) -> i32 {
+    let Some(shell) = start_pty_shell(exec, None) else {
+        return 220;
+    };
+    // Last thing the session does before leaving, so the debt at exit is the
+    // builtin's rather than a later automatic title's.
+    if !pty_write(shell.master, b"title 'CUSTOM'\n") {
+        return 221;
+    }
+    let Some((seen, status)) = pty_read_until_command_done(shell.master) else {
+        return 222;
+    };
+    if status != 0 || occurrences(&seen, b"\x1b]0;CUSTOM\x07") == 0 {
+        return 223;
+    }
+    // `exit` on the same line editor submission, so no prompt intervenes to
+    // retitle and take the debt back for stdout.
+    if !pty_write(shell.master, b"exit 0\n") {
+        return 224;
+    }
+    let farewell = pty_read_to_end(shell.master);
+    if occurrences(&farewell, b"\x1b]0;\x07") == 0 {
+        return 225;
+    }
+    let mut status = 0;
+    if unsafe { libc::waitpid(shell.mesh, &mut status, 0) } != shell.mesh
+        || !libc::WIFEXITED(status)
+        || libc::WEXITSTATUS(status) != 0
+    {
+        return 226;
+    }
+    unsafe { libc::close(shell.master) };
+    0
+}
+
+#[test]
 fn a_session_that_never_titles_writes_no_title_at_all() {
     let home = fresh_dir("options_title_rc");
     let config = home.join("mesh");

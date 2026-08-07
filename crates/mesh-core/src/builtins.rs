@@ -63,6 +63,7 @@ const TABLE: &[(&str, &str)] = &[
         "prompt [--reset | TEXT]",
         "Set or print the interactive prompt",
     ),
+    ("title TEXT", "Set the window and tab title"),
     (
         "on [--remove] EVENT NAME [FUNCTION]",
         "Register a function for a prompt event",
@@ -1314,8 +1315,8 @@ pub(crate) fn through_multiplexer(sequence: &str, inside: Multiplexer) -> String
 /// pipeline would corrupt the stream. It is also what lets a *script* reach the
 /// terminal, which is the point of having these as builtins rather than
 /// hand-emitted escapes.
-fn write_terminal(label: &str, sequence: &str) -> u8 {
-    match OpenOptions::new().write(true).open("/dev/tty") {
+pub(crate) fn write_terminal(label: &str, sequence: &str) -> u8 {
+    match OpenOptions::new().write(true).open(Path::new("/dev/tty")) {
         Ok(mut terminal) => match terminal.write_all(sequence.as_bytes()) {
             Ok(()) => 0,
             Err(err) => {
