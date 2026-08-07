@@ -1152,6 +1152,53 @@ fn exit_status_is_masked_to_eight_bits() {
 }
 
 #[test]
+fn exit_takes_the_status_spelling_beside_the_bare_code() {
+    // `exit status 5` reads like `return status 5`, so the two ways of leaving
+    // with a status are written alike. It disambiguates nothing — `exit` fills
+    // only the status channel — which is the point: it is a spelling, and both
+    // must land on the same code.
+    for source in ["exit status 5\n", "exit status(5)\n", "exit 5\n"] {
+        let out = run_with_input(source);
+        assert_eq!(out.status.code(), Some(5), "{source}");
+        assert!(out.stderr.is_empty(), "{source}: {:?}", out.stderr);
+    }
+    assert_eq!(run_with_input("exit status 0\n").status.code(), Some(0));
+
+    // The word promises a code, as `return status` does, so losing the operand
+    // is reported — and, like a surplus operand, does not end the shell.
+    let bare = run_with_input("exit status\nputs still here\n");
+    assert_eq!(bare.status.code(), Some(0));
+    assert_eq!(String::from_utf8_lossy(&bare.stdout), "still here\n");
+    assert!(
+        String::from_utf8_lossy(&bare.stderr).contains("expected a status code after `status`"),
+        "{:?}",
+        bare.stderr
+    );
+
+    // Past the spelling the operand is read exactly as a bare one is: same
+    // masking, same refusal of a non-number, same surplus check.
+    assert_eq!(run_with_input("exit status 256\n").status.code(), Some(0));
+    assert_eq!(
+        run_with_input("false\nexit status $sh.status\n")
+            .status
+            .code(),
+        Some(1)
+    );
+    let bad = run_with_input("exit status abc\n");
+    assert_eq!(bad.status.code(), Some(2));
+    assert!(
+        String::from_utf8_lossy(&bad.stderr).contains("abc: numeric argument required"),
+        "{:?}",
+        bad.stderr
+    );
+    assert!(
+        String::from_utf8_lossy(&run_with_input("exit status 5 7\n").stderr)
+            .contains("too many arguments"),
+        "a surplus operand is still surplus after the spelling"
+    );
+}
+
+#[test]
 fn exit_rejects_surplus_operands_without_exiting() {
     // A typo like `exit 3 junk` should not terminate the shell; the following
     // command still runs, so the shell exits with echo's status (0), not 3.
@@ -13260,7 +13307,7 @@ fn help_lists_every_builtin_with_its_usage() {
         "print [ARG ...]",
         "clip [TEXT ...]",
         "notify [TEXT ...]",
-        "exit [N]",
+        "exit [N] · exit status N",
         "fg [JOB]",
         "bg [JOB]",
         "jobs",
