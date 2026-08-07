@@ -21,6 +21,22 @@ Delete an entry once you have agreed with it or reversed it.
       N` **spelling** — a literal leading word, not a channel word and not a
       value — but that was asked for rather than guessed, so it is not queued
       here.
+- [ ] **A modifier declaration's subject may be any parameter name, not just
+      `_s`.** `func a:b()` declares modifier `:b` with subject `a`, so the leading
+      underscore in the design's `func _s:shorten()` is naming style rather than
+      grammar — mesh does not require it of ordinary parameters either. The
+      alternative is reserving the form to `_`-prefixed subjects, which would buy a
+      clearer read of `func a:b()` at the cost of a rule nothing else in the
+      signature grammar has. Cost recorded: `func a:b() { … }` used to be refused as
+      ``a:b` is not a name`, and that test case moved. *Reversible:* one condition in
+      `Parser::modifier_subject`, and the refusal it would restore is already
+      spelled by the diagnostic that used to fire.
+- [ ] **A modifier cannot be a `wrapper func`.** `wrapper func _s:name()` is a parse
+      error rather than a marker that is ignored or given a meaning. "Parses no flags
+      of its own" describes a command's argument list, and a modifier's subject
+      arrives through `$x:` rather than as an argument to forward, so the two have no
+      combined reading. *Reversible:* deleting one check restores whichever reading is
+      chosen later; nothing depends on the refusal.
 - [ ] **`exec` keeps its own process as a pipeline's last stage.** Everything else
       in-shell now runs in the shell there, but `exec` still forks. Running it in
       the shell would spend the *shell* on the replacement, and it buys nothing:
@@ -5388,10 +5404,22 @@ two other shells' answers turned out to be strictly better than ours.
 
 ## Beyond M3 — User-defined modifiers (`func _s:name()`)
 
-Decided in design discussion; see `docs/DESIGN.md` §"Modifiers". Nothing here is
-implemented.
+Decided in design discussion; see `docs/DESIGN.md` §"Modifiers".
 
-- [ ] **A declaration form with the subject left of the colon.** `func _s:shorten()`,
+**The declaration half is built; the application half is blocked.** Declaring a
+modifier and refusing a built-in name are done and tested. Applying one is not,
+and cannot be until the `source` boundary below is settled — which corrects this
+section's earlier claim that "everything else in this section is independent of
+it". Element-wise application and the map-subject error are both about *applying*
+a declared modifier, and nothing can be applied until `$x:shorten` resolves rather
+than being rejected by the parser as an unknown modifier. That resolution *is* the
+blocked item: today `modifier_name` gates `:name` at parse time in five places, and
+opening that gate means choosing when an unknown name is diagnosed — the very
+question poison-after-`source` and an import form are the two recorded answers to.
+So a declared modifier currently stores and never runs.
+
+- [x] **A declaration form with the subject left of the colon.** *(Built.)*
+      `func _s:shorten()`,
       `func _s:pad(_n)`, `func ..._xs:oxford(_conj)`. The subject is **not** a
       positional parameter — it sits outside the parens, which is what lets a
       list-taking modifier still take arguments without colliding with
@@ -5399,8 +5427,14 @@ implemented.
       deliberately unclaimed: `:join` is a shipped built-in and could not be
       declared, per the reserved-name item below. `func` therefore grows a second declaration shape; that is
       the accepted cost, and it buys a declaration readable straight off the call
-      site.
-- [ ] **Element-wise by default, `...` for the collection.** A plain subject parameter
+      site. *Built:* `Parser::modifier_subject` reads the shape before the name and
+      rewinds when it is not there; `Executable::Function` carries
+      `subject: Option<Param>`, which routes the definition into a separate map on
+      `Funcs` so `$x:f` can never find an ordinary `func f`. `wrapper func _s:name()`
+      is refused — the two markers have no combined reading. One consequence:
+      `func a:b()` used to report ``a:b` is not a name` and is now a declaration.
+- [ ] **Element-wise by default, `...` for the collection.** *(Blocked with the
+      resolution item — there is no way to apply a modifier yet.)* A plain subject parameter
       receives one element, so a list subject calls the modifier per element — the
       auto-mapping the built-ins already do. A rest subject receives the whole list
       once. Implement the subject as *spread into* the parameter so this is one rule
@@ -5439,8 +5473,11 @@ implemented.
         an import form — are recorded there as language decisions nobody has picked.
         Pick one *there*, then implement here; do not invent a third answer inside the
         modifier work. Everything else in this section is independent of it.
-- [ ] **Redeclaring a built-in modifier is refused, by the same principle as
-      `definition_name_problem` but on a separate name set.** `func _s:upper()` must be
+- [x] **Redeclaring a built-in modifier is refused, by the same principle as
+      `definition_name_problem` but on a separate name set.** *(Built:
+      `modifier_definition_name_problem` in `crates/mesh-core/src/repl.rs` consults
+      `parser::is_builtin_modifier` only, and `func upper() { tr a-z A-Z }` has a
+      test holding it legal.)* `func _s:upper()` must be
       rejected at the declaration, for the reason that helper already gives for
       `func puts` / `func cd` (`crates/mesh-core/src/repl.rs`): a name resolved first
       elsewhere makes the definition unreachable, and `docs/INTEGRATION.md` relies on
@@ -5450,7 +5487,8 @@ implemented.
       are their own vocabulary: the built-in *modifier* names must be checked only
       against *modifier* declarations, so the check needs declaration-kind context,
       matching the diagnostic shape rather than the name set.
-- [ ] **A map subject errors**, naming `:keys` / `:values`. A placeholder, not a
+- [ ] **A map subject errors**, naming `:keys` / `:values`. *(Blocked with the
+      resolution item.)* A placeholder, not a
       decision — see the open question below.
   - [ ] **What element-wise means over a map.** Loop iteration does *not* settle it:
         `for host, addr in $known_hosts` is shipped, but two loop **binders** are a
