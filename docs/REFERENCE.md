@@ -2440,17 +2440,22 @@ and double-quoted interpolation, in every position a word can be written; braced
 form puts the modifier inside the braces (`${file:stem}`).
 
 **`:` followed by an identifier is reserved by the grammar**, so a name that is not
-a modifier is a syntax error rather than literal text. The *shape* is what reserves
+a modifier is an error rather than literal text. The *shape* is what reserves
 it, never the list of names mesh implements — otherwise adding a modifier would
 silently change what an existing string means, and `"$h:port"` would be text until
 the day `:port` shipped:
 
 ```text
 puts ubuntu:latest
-mesh: syntax error: `:latest` is not a modifier; quote the whole word to keep it
+mesh: `:latest` is not a modifier; quote the whole word to keep it
 as text (`"x:latest"`), or brace the name when it comes from a variable
 (`"${x}:latest"`)
 ```
+
+The error lands **when the line runs**, not when it is read, because a script may
+declare a modifier of its own and the parser cannot know the whole vocabulary. So
+the work above a bad `:name` happens, and a branch that is never taken never
+complains.
 
 Quoting the *subject* does not help — `"ubuntu":latest` is the same chain. The
 colon has to be inside the quotes (`"ubuntu:latest"`), or the name braced when it
@@ -2492,9 +2497,10 @@ reading bound the literal `ab:upper`, silently — which is why the braced form 
 still the safer habit in code that has to run on an older mesh.
 
 A name mesh **reserves** for a modifier it has not built yet — `:sort`,
-`:replace`, and the rest of the `DESIGN.md` set — parses, then reports a
-loud `not implemented yet` in a value context rather than a silent no-op. That is
-a different failure from an unknown name, which never parses.
+`:replace`, and the rest of the `DESIGN.md` set — reports a loud
+`not implemented yet` rather than a silent no-op. Both arrive when the line runs,
+and they stay worded differently: "no such modifier" and "not built yet" are
+different answers.
 
 | Modifier | Input | Result |
 | --- | --- | --- |
