@@ -27465,7 +27465,7 @@ fn the_sh_namespace_lists_its_runtime_entries() {
     let out = run_with_input("puts ...$sh:keys\n");
     assert_eq!(
         String::from_utf8_lossy(&out.stdout),
-        "status pipestatus pid ppid uid version interactive width stdin stdout stderr \
+        "status pipestatus pid ppid uid host fqdn version interactive width stdin stdout stderr \
          jobs origin source options preprompt preexec postexec precd postcd jobdone exit \
          name args\n"
     );
@@ -28674,6 +28674,58 @@ fn sh_reports_the_effective_user_id() {
     let lines: Vec<&str> = text.lines().collect();
     assert_eq!(lines.len(), 2, "{text}");
     assert_eq!(lines[0], lines[1], "$sh.uid changed inside a forked stage");
+}
+
+#[test]
+fn sh_reports_the_host_name_without_a_fork() {
+    // Compared against `gethostname` directly rather than the `hostname` program,
+    // which is what `$sh.fqdn` exists to stop a prompt shelling out to — and
+    // which is missing outright on some minimal systems.
+    let mut buffer = [0_u8; 256];
+    // SAFETY: `gethostname` writes at most `buffer.len()` bytes through a pointer
+    // valid and writable for exactly that many.
+    assert_eq!(
+        unsafe { libc::gethostname(buffer.as_mut_ptr().cast(), buffer.len()) },
+        0
+    );
+    let end = buffer.iter().position(|byte| *byte == 0).unwrap_or(256);
+    let expected = String::from_utf8_lossy(&buffer[..end]).into_owned();
+
+    let out = run_with_input("puts $sh.fqdn\nputs $sh.host\n");
+    let text = String::from_utf8_lossy(&out.stdout);
+    let lines: Vec<&str> = text.lines().collect();
+    assert_eq!(lines.len(), 2, "{text}");
+    assert_eq!(lines[0], expected, "$sh.fqdn is not the host name");
+    assert_eq!(
+        lines[1],
+        expected.split('.').next().unwrap(),
+        "$sh.host is not the name up to the first dot"
+    );
+}
+
+#[test]
+fn sh_host_is_stable_inside_a_forked_stage() {
+    // Session state, like `$sh.pid` and `$sh.uid`: the machine does not change
+    // because a pipeline stage forked.
+    let out = run_with_input("puts $sh.host\nfunc f() { puts $sh.host }\nf | cat\n");
+    let text = String::from_utf8_lossy(&out.stdout);
+    let lines: Vec<&str> = text.lines().collect();
+    assert_eq!(lines.len(), 2, "{text}");
+    assert_eq!(lines[0], lines[1], "$sh.host changed inside a forked stage");
+}
+
+#[test]
+fn sh_host_ignores_a_stale_exported_hostname() {
+    // The case `url::hostname` refuses `$env.HOSTNAME` for: an exported copy
+    // survives an `ssh` and then names the machine you came *from*, which is
+    // exactly the distinction a title or prompt is drawing.
+    let out = run_with_input("$env.HOSTNAME = 'not-this-machine'\nputs $sh.host\n");
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert_ne!(
+        text.trim(),
+        "not-this-machine",
+        "$sh.host read $env.HOSTNAME"
+    );
 }
 
 #[test]
