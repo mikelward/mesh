@@ -1,11 +1,24 @@
-# Track current stable so contributors and CI use the same channel and pick up
-# fixes automatically. This floats rather than pinning an exact release: CI runs
-# every PR against both current stable and the MSRV floor, so new-compiler or
-# Clippy breakage surfaces immediately. Pin an exact `major.minor.patch` here if
-# reproducibility ever needs to be exact.
+# Pin an exact release, so every checkout compiles with the same compiler
+# whether or not anything remembered to update it.
+#
+# The alternative — `channel = "stable"` — reads worse than it sounds. rustup
+# resolves `stable` to whatever stable that machine already has installed and
+# never checks for a newer one, so a container built months ago resolves it to a
+# compiler *below* the MSRV floor and nothing in the tree builds. An exact
+# version rustup does not have, it installs, which is the behavior we actually
+# wanted from `stable` all along.
+#
+# What pinning costs is the early warning: new-compiler and new-Clippy breakage
+# no longer shows up on its own. The `stable` CI job buys that back by
+# overriding this pin with `+stable`, and runs on pushes to main rather than
+# pull requests so an upstream release cannot redden an unrelated PR.
+#
+# Bump this deliberately. Nothing yet nags when it falls behind — see TODO.md.
 #
 # `rust-version` in Cargo.toml records the supported MSRV floor, which the `msrv`
 # CI job builds against so the declared number cannot drift from what compiles.
+# This pin is the compiler development happens on; that floor is the oldest one
+# still supported. They are different numbers on purpose.
 [toolchain]
-channel = "stable"
+channel = "1.97.1"
 components = ["rustfmt", "clippy"]

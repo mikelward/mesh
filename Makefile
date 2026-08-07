@@ -33,6 +33,7 @@ uninstall: ## Remove an installed mesh binary
 
 test: ## Run every suite: the cargo tests and the shell-script ones
 	$(CARGO) test --workspace
+	sh toolchain_test.sh
 	sh session_start_hook_test.sh
 	sh makefile_test.sh
 
