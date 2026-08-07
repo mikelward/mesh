@@ -1356,6 +1356,21 @@ with its switch: add an `Opt` variant in `options.rs` and read it through
       error path. A rule with no lifetime cannot be any of those. What it costs is
       that it cannot tell "titles sometimes" from "owns the title", so a session
       with only an `on preexec` handler loses the automatic idle title as well.
+- [ ] **Decide hook ordering, and where the shipped title sits in it.** The
+      prelude registers before the user's startup files, so a user's own
+      `preprompt` handler under a different name runs *after* `mesh-title-idle`.
+      A handler that `cd`s therefore leaves the title naming the directory it just
+      left, until the next prompt. The deleted Rust path wrote the title after all
+      `preprompt` hooks precisely to avoid this, and moving it into a hook gave
+      that up. Raised by Codex on #458 and confirmed.
+
+      Registering the prelude *after* the user's files would fix the ordering and
+      break overriding — the prelude would re-register `title` over the user's own.
+      So this needs a real ordering concept rather than a swap: an explicit "runs
+      last" position, or hooks sorted by something other than registration, or the
+      shipped title registered at the end of startup rather than the start. It
+      overlaps the entry below on turning hooks off, so decide them together.
+
 - [ ] **Decide how a user turns hooks off.** Now that the hooks are
       authoritative, a `title` typed at the prompt lasts only until the next
       prompt or hook runs — correct for one mechanism, but it leaves no way to
@@ -1413,8 +1428,11 @@ with its switch: add an `Opt` variant in `options.rs` and read it through
       **Decided: embedded source of truth, reachable text.** `include_str!` holds
       the prelude, so the binary is always self-consistent and startup cannot fail
       on a missing or version-skewed file — but the text is *reachable* rather than
-      merely executed: printable, and `source`-able from a path mesh resolves
-      itself. That keeps the legibility this whole entry exists for, since you can
+      merely executed: printable via `$sh.prelude`. **`source`-ability is not
+      built** — `source` reads the filesystem, and the `<prelude>` label passed to
+      `run_sourced_text` is a diagnostic name, not a resolvable path. Printing
+      covers the legibility this entry exists for; a virtual path `source` can
+      resolve is a separate feature, not part of what shipped. That keeps the legibility this whole entry exists for, since you can
       print the handler you are about to override and start from it, without an
       installed file's failure modes.
 
