@@ -242,10 +242,14 @@ All four kinds:
   just a `/…/` literal sitting inside the parens like any other value — so there is
   no load-bearing whitespace to trip over and chaining is always unambiguous:
   `$host:split("."):first` reads exactly one way.
-- **Disambiguation:** `:` is a modifier only when immediately followed by a
-  known modifier keyword. `$host:$port` keeps `:` literal (the token after `:`
-  is an expansion, not a keyword), so building `host:port`-style strings — or
-  any `a:b` construction — is unaffected.
+- **Disambiguation:** `:` is a modifier when immediately followed by a bare
+  **identifier** — by shape, not by whether that name is one mesh knows, since
+  [declaring a modifier](#modifiers) means the parser cannot hold the list.
+  `$host:$port` keeps `:` literal (the token after `:` is an expansion, not an
+  identifier), so building `host:port`-style strings from values is unaffected; a
+  literal `host:port` word is the case the reservation does claim, and the escapes
+  are quoting the word or bracing the name (see
+  [Bare words and quoted values](#bare-words-and-quoted-values--decided)).
 
 **Split modifiers** (choose the separator). These bind to a substitution's raw
 byte capture, replacing the trim that a bare capture would have applied:
@@ -428,18 +432,97 @@ expression position claimed the chain outright while argument position fell back
 text. Both now refuse an unknown name, and the diagnostic names both escapes:
 
 ```
-puts ubuntu:latest    # syntax error: `:latest` is not a modifier; quote the whole
-                      # word to keep it as text (`"x:latest"`), or brace the name
-                      # when it comes from a variable (`"${x}:latest"`)
+puts ubuntu:latest    # `:latest` is not a modifier; quote the whole word to keep it
+                      # as text (`"x:latest"`), or brace the name when it comes from
+                      # a variable (`"${x}:latest"`)
 ```
+
+**When that error fires has since moved to run time**, though what is reserved has
+not. [Declaring a modifier](#modifiers) lets a user add to the vocabulary, so the
+parser can no longer hold the whole list and cannot tell a typo from a name declared
+elsewhere; `:latest` is diagnosed when the line runs rather than when it is read. The
+*grammar* reservation below is untouched — `ubuntu:latest` is still a modifier
+position and never text — and the escapes above are still the escapes. This does
+change **shipped** behavior: `modifier_name` gates on `MODIFIER_NAMES` at parse time
+today, and opening that gate is what the resolution item in `TODO.md` covers.
+
+**The flag suffix on a [regex literal](#operators-and-matching) is opened with the
+rest** *(decided)*, because a regex flag **is** a modifier — one whose subject is a
+pattern and whose result is a pattern. That was already the settled reading
+([Tests and comparisons](#tests-and-comparisons)), and the shipped vocabulary already
+agrees: `i`, `ignorecase`, `m`, `multiline`, `s`, `dotall`, `x` and `extended` are all
+in `MODIFIER_NAMES`, and *applying* one already runs through the ordinary modifier
+applier — `expand::set_regex_flag`, reached from the same path as any other modifier,
+which is why `$r:i` on a pattern in a variable and `$rs:map(:i)` by reference both work
+today. Which modifier `:x` is depends on the subject it meets: the extended-syntax flag
+on a pattern, the executable filter on a path. The parser's `regex_flag` table is not a
+second vocabulary; it answers the narrower question of whether a name may be *folded
+into the literal while parsing*, which is the thing call-time resolution removes.
+
+So a `/…/` in a match slot is a pattern **value**, and a `:name` after it is the
+ordinary postfix chain, resolved against that subject when it runs. What that buys is
+narrow and worth stating exactly: a declared modifier may follow a regex literal. The
+flags themselves already reach a pattern by every other route.
+
+The diagnostic survives the move with better grounds, not worse. `/a/:g` reports that
+`:g` is not a regex flag today because the parser guessed the subject from syntax; at
+run time the subject *is* a pattern, so the same message can be given for a reason the
+parser only inferred — and the flag names it lists are still a closed set, since a
+built-in modifier name cannot be redeclared.
+
+Underneath both is one rule, the same one the `:ident` reservation above states:
+**shape decides, vocabulary does not.** A colon and an identifier is a modifier
+position whether or not that modifier exists; equally, a regex literal followed by
+`:name` is a regex literal followed by a modifier, whatever the name turns out to be.
+Which names exist is a question for run time in both cases.
+
+What that costs is one corner that exists only because the parser was allowed to
+answer it from vocabulary. Today a name it knows is a modifier but *not* a flag makes
+it **back out** of the regex reading and take the string one, which is why
+`"/A/":replaceall(/a/:upper, X)` prints `X` (pinned in `crates/mesh/tests/cli.rs`).
+With the rule above there is nothing to back out on: `/a/` is the pattern, and
+`:upper` applied to a pattern reports. `"x":i` stays an error from the other side — a
+flag needs a pattern subject, and a string is not one.
+
+**One thing the chain must not lose: a parse-affecting flag is construction-time.**
+`:x` decides whether the pattern text is *valid*, so `/foo#(/:x` has to be compiled
+once, in extended mode, rather than compiled and then modified — which is what
+[`re()`](#tests-and-comparisons) already says, and why `re($x, extended: true)` exists.
+Making the suffix an ordinary postfix chain does not change that; it constrains *when*
+the literal compiles, not what the grammar reads. Today it compiles eagerly
+(`repl.rs`, `E::Regex` calls `compile_regex` before any postfix runs), and the contract
+is unmet in the shipped build — `/foo#(/:x` reports `invalid regex` — so this is a bug
+to fix alongside, not a behavior to preserve.
+
+What folds is the **leading run** of flags, and it closes at the first modifier that is
+not one — because that is exactly how far the text still belongs to the literal. Past
+it, nothing about the chain changes: a flag applied to a pattern value is the ordinary
+dispatch it already is, so `/a/:foo:x` reaches `:x` with whatever `:foo` returned and
+means the extended flag if that is a pattern, the executable filter if it is a path.
+`$r:x` on a pattern in a variable works today and keeps working.
+
+So the constraint is on **construction, not on chain position**. `/foo#(/:foo:x` fails
+because `/foo#(/` cannot be compiled at all without the flag — the failure lands before
+`:foo` runs, and it is the same failure `re("foo#(")` gives. `/foo#(/:x:foo` is the fix,
+just as `re($x, extended: true)` is for the constructor. Nothing is applied
+retroactively and no ordering rule is added; a literal simply has to be constructible
+before a chain can run on it.
+
+*(The [`re()`](#tests-and-comparisons) note used to state this more strongly — "never
+as a post-hoc modifier on a finished value" — which the implementation has never done:
+post-hoc `:x` on a pattern whose text is *valid* works, and is tested. That sentence is
+narrowed to what actually holds, so the two sections agree: a post-hoc flag cannot
+rescue text that never compiled.)*
 
 **Only a bare identifier after the colon is claimed** — the reservation is of the
 shape, not of the colon. `key:2`, `key:/path`, `key:`, `http://x` and `a:$b` all keep
 the punctuation reading they had, so the break is narrower than "colons are taken".
 
 A name the vocabulary *does* hold but the engine cannot apply yet (`:sort`) parses
-and reports at run time, which is a different failure from an unknown one and stays
-worded that way.
+and reports at run time. That was once the *distinguishing* case, an unknown name
+having failed earlier; both now report at run time, and the two stay worded
+differently because "no such modifier" and "not implemented yet" are different
+answers even when they arrive together.
 
 `modifier_name` (`parser.rs:4562`) tests `MODIFIER_NAMES` only to decide that
 fallback. So reserving `:ident` in the grammar does not introduce a new rule; it
@@ -1128,15 +1211,15 @@ having written a one-argument `func`. The declaration puts the subject where the
 site puts it — left of the colon — so the two read the same:
 
 ```
-func _s:shorten()          { … }                  # $x:shorten
-func _s:pad(_n)            { … }                  # $x:pad(8)
-func ..._xs:oxford(_conj)  { … }                  # $xs:oxford("and") — "a, b, and c"
-func ..._xs:longest()      { … }                  # $xs:longest
+func _s:foo()          { … }   # $x:foo         — one element at a time
+func _s:bar(_n)        { … }   # $x:bar(8)      — …with an argument
+func ..._xs:baz(_sep)  { … }   # $xs:baz(", ")  — the whole list, with an argument
+func ..._xs:qux()      { … }   # $xs:qux        — the whole list
 ```
 
 The subject is **not a positional parameter** — it sits outside the parens, which is
 what lets a list-taking modifier still take arguments; as a leading rest parameter it
-would collide with rest-must-be-last, and `$xs:oxford("and")` is not a corner case.
+would collide with rest-must-be-last, and `$xs:baz(", ")` is not a corner case.
 This also describes the built-ins without strain: `:upper` is `func _s:upper()`,
 `:replaceall` is `func _s:replaceall(_old, _new)`, `:join` is
 `func ..._xs:join(_sep)`.
@@ -1148,67 +1231,72 @@ subject receives the whole list, once. That is not a second meaning for `...`: t
 subject is *spread into* the parameter the same way arguments are, and `...` gathers
 many either way — only the source differs.
 
-**Why a declaration rather than any `func`.** Letting every one-argument function be
-callable as `:name` would move `:name` from **parse**-time to **run**-time resolution
-for *every* modifier, the shipped ones included, because the parser could no longer
-tell which kind of name it was looking at. A declared set keeps the vocabulary closed
-at any given point in the program while still letting it grow.
+**Why a declaration rather than any `func`.** Not to keep resolution static — it is
+not, see below. The declaration is about **intent**. `func helper(_s)` is a function
+that happens to take one argument, and making every such function silently reachable
+as `$x:helper` would promote a private helper to public vocabulary by accident. The
+declaration says *this is a modifier*, and it is where the subject and its `...` form
+live, which an ordinary parameter list has nowhere to put.
 
-**The check is at load time, and that is the cost.** A unit — a script, a sourced file,
-a `-c` string, or one interactive line — has its modifier declarations collected first,
-then its modifier *uses* checked against the known set, before any of it runs. Two
-things follow on purpose: **forward references work within a unit** (`$x:shorten` above
-its own `func _s:shorten()`, matching how `func f { g }` resolves in command position),
-and an interactive line, being its own unit, still reports `:shortne` before executing
-anything. So the error does not arrive later than it used to. What is genuinely given
-up is that the **parser alone** can no longer tell `:foo` is invalid — it needs the
-loaded environment — so an editor or a single-file lint sees less than today.
+**A modifier resolves when it is called**, exactly as command position does. `$x:foo`
+finds whatever `:foo` names at the moment that line runs, so redefining a modifier
+changes what an already-written use runs, and one arriving from a `source` a statement
+earlier is found. There is no pre-pass and nothing is hoisted; a modifier declaration
+may sit wherever a `func` may sit, including inside a function body or a branch, and
+binds when it executes just as a `func` does.
 
-**Modifier declarations are hoisted**, which is what makes that forward reference real
-rather than a check that passes and then fails. An ordinary `func` binds when its
-statement *executes* — `shell.funcs.define` runs inside the executable step — so a call
-placed above it finds nothing. Collecting declarations only to validate them would
-therefore accept `$x:shorten` above `func _s:shorten()` and then have no body to call
-when execution arrived. So the same pre-pass that collects a unit's modifier
-declarations also **installs** them, before the unit's first statement runs. That is a
-real divergence from `func`, and it is the point: a modifier is vocabulary, and
-vocabulary that only exists once control has flowed past it cannot be checked in
-advance. The cost is that within a unit, textual order stops deciding which body is
-live — declare the same modifier twice and the later one wins even for a use written
-between them, where an ordinary `func` would give the earlier body to a call in that
-position.
-
-**A modifier declaration must be top-level in its unit**, and that follows from the
-same reasoning rather than being a separate rule. A `func` in mesh binds by
-*executing*, so a nested one binds only once its enclosing function is called —
-`func outer() { func inner() { … } }` leaves `inner` undefined until `outer` runs.
-A modifier declared that way is not knowable before the unit runs, which is the one
-property the whole decision rests on. Neither alternative survives: scanning
-recursively would accept `$x:slug` when the declaration sits in a function nobody
-calls or a branch nobody takes, and scanning only the top level while *allowing*
-nested declarations would reject uses that do work. So `func _s:name()` inside a
-function body or a conditional is an **error at the declaration**, reported where it
-is written. Ordinary nested `func`s are untouched — this restricts the modifier form
-only, because only the modifier form has to be known in advance.
-
-**What a `source` does to that check is not decided here.** A unit that sources a
-library and then uses one of its modifiers —
+That makes the reach of a *later* declaration exactly the reach `func` already has, and
+it is worth being precise rather than saying "forward references work". A declaration
+further down the file is found only when the **use** is delayed past it:
 
 ```
-source lib.mesh        # declares func _s:slug()
-puts $x:slug
+func f() { puts $x:foo }     # fine — `f` is called below, after the declaration binds
+func _s:foo() { … }
+f
 ```
 
-— cannot be checked by collecting declarations from the unit's own text, because
-`lib.mesh` binds `:slug` by *executing*, a statement later. That is not a new problem:
-it is the constraint `TODO.md`'s static-checker item already records, where four
-framings each died on a counter-example and the two surviving directions —
-poison-after-`source`, or an import form — are called out as **language decisions
-nobody has made**. This decision inherits that boundary rather than settling it, and
-must not be read as settling it: a library modifier has to remain usable in the script
-that sources it, which rules out simply rejecting the use. Whether the region after a
-`source` degrades to a call-time error, or `source` gets a declaration form, belongs to
-that item.
+```
+puts $x:bar                  # error — nothing has bound `:bar` at this point yet
+func _s:bar() { … }
+```
+
+Two separate programs, and separate names: in one file the first block's declaration
+would already have bound the modifier, and the second would be a redefinition rather
+than the missing one it is meant to show.
+
+Which is the same thing `func f { g }` buys and the same thing it does not: definition
+order is irrelevant *between* a function and what its body calls, and entirely relevant
+for a call written above the definition. Modifiers get that rule, not a stronger one.
+
+**The cost is that a typo'd modifier fails at run time.** `$x:fop` is no longer a
+syntax error; it fails when the line runs, naming the modifier. That is a real loss,
+and an earlier revision of this section treated avoiding it as the whole reason to
+require a declaration. Two things make it the right trade.
+
+mesh already takes exactly this loss one rung over. A typo'd *read* — `$staus` — is a
+run-time unbound-variable error rather than a syntax error, the accepted cost of having
+no `let` / `var`. Demanding a parse-time answer for `:name` would hold modifiers to a
+stricter standard than variables and commands, which is the inconsistency rather than
+the guarantee.
+
+And the shell precedent points the same way. bash's **alias** is its one construct
+resolved when a line is *read* rather than when it runs, and it is exactly the one that
+surprises people: `alias hi="echo hi"; hi` in a single parse unit reports `hi: command
+not found`, and so does an alias defined after a function that uses it. bash's
+*functions* have no such problem — `f() { g; }; g() { …; }; f` works — because they are
+looked up late. Early resolution is what makes the aliases brittle, and there is no
+reason `:name` should be the one construct in mesh that repeats it.
+
+**What this removes.** An earlier revision built three further rules on a load-time
+check: declarations **hoisted** so a forward use had a body to call, declarations
+**banned below top level** so nothing could bind conditionally, and the **`source`
+boundary** left explicitly undecided because a sourced library's modifiers could not be
+seen by a text-only pre-pass. None of the three is needed once resolution is late. A
+nested or conditional `func _s:name()` is as legal as a nested `func` and binds the same
+way; a library's modifiers work in the script that sources them; and textual order
+decides which body is live exactly as it does for `func`. The blocked `source` question
+is not answered here — it is *not raised* here, and stays where it already lived, with
+the static-checker item.
 
 **A built-in modifier name may not be redeclared**, on the principle that already
 governs this. `func _s:upper()` is a **loud error at the declaration**, for the reason
@@ -1222,6 +1310,26 @@ refused because `:upper` is a built-in **modifier**, while `func upper() { tr a-
 stays perfectly legal — `upper` is not a builtin *command*, and a shipped modifier has
 no claim on the command namespace. One principle, applied per namespace; adding modifier
 names to the command-side check would break working code.
+
+**An argument reaches a modifier through braces** *(decided)*. Inside `"…"`, an
+attached `(` after `:name` is never literal text — it is the modifier's argument list,
+and it always reports, because an unbraced `$…` interpolation cannot pass one. Which
+complaint you get is the modifier's to make: `"$x:upper(foo)"` says **`:upper` does
+not take arguments** — the same message the braced `"${x:upper(foo)}"` already gives
+— while `"$x:bar(8)"`, for a modifier that does take one, points at
+`"${x:bar(8)}"`. Bracing advice is given only where bracing is the fix.
+
+That split needs the modifier's arity, so the check lands **where arity is known**,
+which for a declared modifier is run time: the name is not resolved when the string
+is parsed, and a later declaration can change what it means. Today the parser decides
+both cases itself, from a fixed table.
+
+This **breaks shipped behavior**, deliberately. After an argument-free built-in an
+attached `(` is ordinary text today — `"$x:upper(foo)"` prints `AB(foo)`, pinned in
+`crates/mesh/tests/cli.rs` — and it will report instead. Literal text after a chain
+keeps a spelling: end the chain with braces, `"${x:upper}(foo)"`. Only an *abutting*
+`(` after `:name` changes; `"$x:upper (1)"`, `"($x:upper)"` and `"$x(foo)"` are
+untouched, and the braced form is unaffected throughout.
 
 A **map** subject has no element-wise meaning yet and **errors**, naming `:keys` /
 `:values` — see [Open questions](#open-questions), where it is parked rather than
@@ -2395,10 +2503,16 @@ regex."
 In a **match slot** (the `~` / `!~` RHS, a `:match` argument, the replace family's
 `OLD` argument — `:replaceall` / `:replacestart` / `:replaceend` — a `match` arm), a word
 beginning with `/` is a **regex** *only* when its **base** — the word stripped of any
-trailing recognized `:` flag modifiers — is a clean `/BODY/`: the closing `/` is the
-final character of the base and `BODY` has no unescaped interior `/`. So `/\d+/:i` is
-a regex (base `/\d+/`, then `:i`). Every other leading-`/` word is a **path or
-glob**:
+trailing `:` modifier chain — is a clean `/BODY/`: the closing `/` is the final
+character of the base and `BODY` has no unescaped interior `/`. So `/\d+/:i` is a
+regex (base `/\d+/`, then `:i`). Every other leading-`/` word is a **path or glob**:
+
+*(The chain is stripped by **shape**, not by vocabulary — this rule once said
+"recognized flag modifiers", which [declaring a modifier](#modifiers) makes impossible
+to know while parsing, and which the parser never did anyway: `$p ~ /tmp/:foo` reports
+about `:foo` today rather than reading as the path `/tmp/:foo`. No row of the table
+moves, because the base test — clean `/BODY/`, no unescaped interior `/` — is
+unchanged, and it is the base test that separates a path from a pattern.)*
 
 | RHS word | reads as | why |
 | --- | --- | --- |
@@ -3115,7 +3229,7 @@ backslash. Every *other* backslash reaches the regex engine verbatim (`\d`, `\.`
 (`:replaceall` / `:replacestart` / `:replaceend`), and a
 `match` arm — and there a leading-slash
 word is a regex **only when its base is a clean `/BODY/`** (the base is the word minus
-any trailing `:` flag modifiers, so `/\d+/:i` qualifies; the closing `/` is the base's
+any trailing `:` modifier chain, so `/\d+/:i` qualifies; the closing `/` is the base's
 final character and `BODY` has no unescaped interior `/`); every other leading-`/`
 word is a **path or glob** (full rule and cases in [Quoting](#quoting-and-escaping)).
 The `~` RHS *also* takes a **glob**: a **relative** one is bare (`*.txt`, `src/**`),
@@ -3153,12 +3267,14 @@ supported.)* `literal:` stays a
 **constructor** argument regardless, since it
 changes how the string becomes a pattern rather than being a post-hoc flag on a
 finished regex. Match-behavior flags (`:i` `:m` `:s`) work as post-hoc modifiers on
-any regex value; a **parse-affecting** flag like `:x` cannot, because `re()` is
-fail-loud and compiles the *unflagged* pattern first — `re('foo # (')` errors before
-a trailing `:x` could make it valid in extended mode. Parse-affecting flags must
-therefore be known at construction: folded in pre-compile on a `/…/` literal
-(`/foo#(/:x`, compiled once; `#(` is ignored only in extended mode) or passed as a constructor argument
-(`re($x, extended: true)`), never as a post-hoc modifier on a finished value.)*
+any regex value, and so does a **parse-affecting** flag like `:x` when the pattern
+compiles without it — `re("a b"):x` is a finished value, extended after the fact. What
+a post-hoc flag cannot do is **rescue source that never compiled**: `re()` is fail-loud
+and compiles the *unflagged* pattern first, so `re('foo # (')` errors before a trailing
+`:x` could make it valid in extended mode. A parse-affecting flag must therefore be
+known at construction *whenever the unflagged text is invalid*: folded in pre-compile on
+a `/…/` literal (`/foo#(/:x`, compiled once; `#(` is ignored only in extended mode) or
+passed as a constructor argument (`re($x, extended: true)`).)*
 
 *(decided: **`/…/` does not interpolate** — it is a **raw** regex literal (raw except
 the `\/` delimiter escape; see the regex-value section above), so a `$` inside `/…/`
@@ -3795,7 +3911,7 @@ spelling rather than add one.
 *Not a second spelling: `:name` for a user's own.* `:upper` is already a one-argument
 function reference in value position, and [it has since been decided](#modifiers) that
 a user may add to that vocabulary — by **declaring a modifier**, `func _s:name()`, and
-only that way. An ordinary `func shorten(_s)` is *not* callable as `$x:shorten`; the
+only that way. An ordinary `func helper(_s)` is *not* callable as `$x:helper`; the
 declaration is what makes a modifier, which is the whole of that decision. Either way,
 this does not make `&name` and `:name` alternatives for the same job. The line between them
 is by **shape**, not by who wrote the name: `:name` is the postfix, auto-mapping
@@ -6202,12 +6318,25 @@ to avoid" rather than promising the latter as done.
   `:ident` is reserved by the grammar, so the ambiguity was already paid for and a
   user modifier was always *possible*; the vocabulary was otherwise closed forever.
   What was open is whether to spend it, and on what terms. A modifier is a **postfix
-  function on its subject** that auto-maps over a list, so the naive widening — any
-  one-argument `func` is callable as `:name` — was rejected: it makes `:name`
-  resolution run-time for *every* modifier including the shipped ones, since the
-  parser can no longer tell which kind it is looking at. Requiring a declaration
-  keeps a closed set at any point in the program while letting users add to it. See
+  function on its subject** that auto-maps over a list, and the declaration is what
+  marks one — an ordinary one-argument `func` is not reachable as `:name`, so a
+  private helper is never promoted to public vocabulary by accident, and the subject
+  and its `...` form get somewhere to live. **Resolution is at call time**, the same
+  rule as command position, which costs the parse-time unknown-modifier error and buys
+  consistency with every other name in the language. An earlier revision kept a
+  load-time check instead and grew three rules to support it — hoisting, top-level-only
+  declarations, and a blocked `source` boundary — all since removed. See
   [Modifiers](#modifiers).
+- **Interpolation shape — open, for later.** Requiring braces around a modifier's
+  argument (above) is a step in that direction, not the answer to it. `${…}` accepts
+  **two grammars** today — `"${xs:join("-")}"` (bare name) and `"${$xs:join("-")}"`
+  (a `$` expression) both work — and the second is the one worth building on:
+  `"{$x:foo(bar)}"`, with the `$` always present and the braces purely a delimiter,
+  would leave one grammar inside them instead of two. What it costs is the `{`
+  immediately followed by `$`, which is literal text today (`"{$x}"` prints `{5}`).
+  No other literal brace is affected — mesh has no brace expansion, so `"a{b}c"` is
+  `a{b}c` and a JSON object pasted into a string stays JSON text. **Not decided, and
+  not for now**; the braces-for-arguments rule holds either way.
 - **Element-wise over a map — open.** `$m:name` where the subject is a **map** has no
   answer here. Loop iteration is already settled and does *not* decide it: `for host,
   addr in $known_hosts` binds key and value as two names, which is a **binding form**,

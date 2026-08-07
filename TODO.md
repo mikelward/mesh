@@ -5406,73 +5406,170 @@ two other shells' answers turned out to be strictly better than ours.
 
 Decided in design discussion; see `docs/DESIGN.md` §"Modifiers".
 
-**The declaration half is built; the application half is blocked.** Declaring a
-modifier and refusing a built-in name are done and tested. Applying one is not,
-and cannot be until the `source` boundary below is settled — which corrects this
-section's earlier claim that "everything else in this section is independent of
-it". Element-wise application and the map-subject error are both about *applying*
-a declared modifier, and nothing can be applied until `$x:shorten` resolves rather
-than being rejected by the parser as an unknown modifier. That resolution *is* the
-blocked item: today `modifier_name` gates `:name` at parse time in five places, and
-opening that gate means choosing when an unknown name is diagnosed — the very
-question poison-after-`source` and an import form are the two recorded answers to.
-So a declared modifier currently stores and never runs.
+**The declaration half is built; applying one waits on this section's resolution
+item.** Declaring a modifier and refusing a built-in name are done and tested. Applying
+one is not: nothing can be applied until `$x:foo` *resolves* rather than being rejected
+by the parser as an unknown modifier, and `modifier_name` gates `:name` at parse time in
+today. That gate is the work. The `source` boundary that an earlier revision blocked
+this on is **not reached** — that block came from a load-time check being unable to see
+a sourced library's modifiers, and resolution now happens at call time. The one
+*smaller* question call-time resolution raised in its place — what attached parentheses
+mean after a modifier in an unbraced interpolation — is **decided** below: they are the
+argument list, and it reports. The regex-literal flag suffix opens with everything else
+rather than being carved out, since a flag is a modifier whose subject is a pattern —
+so the remaining work here is implementation throughout. (The wider
+interpolation *shape* is open in `docs/DESIGN.md` §Open questions and deliberately not
+for now; nothing in this section depends on it, since the braces rule holds under either
+spelling.) A declared modifier currently stores and never runs.
 
 - [x] **A declaration form with the subject left of the colon.** *(Built.)*
-      `func _s:shorten()`,
-      `func _s:pad(_n)`, `func ..._xs:oxford(_conj)`. The subject is **not** a
-      positional parameter — it sits outside the parens, which is what lets a
+      `func _s:foo()`, `func _s:bar(_n)`, `func ..._xs:baz(_sep)`. The subject is
+      **not** a positional parameter — it sits outside the parens, which is what lets a
       list-taking modifier still take arguments without colliding with
-      rest-must-be-last (`$xs:oxford("and")`). Names in these examples are
-      deliberately unclaimed: `:join` is a shipped built-in and could not be
-      declared, per the reserved-name item below. `func` therefore grows a second declaration shape; that is
-      the accepted cost, and it buys a declaration readable straight off the call
-      site. *Built:* `Parser::modifier_subject` reads the shape before the name and
-      rewinds when it is not there; `Executable::Function` carries
-      `subject: Option<Param>`, which routes the definition into a separate map on
-      `Funcs` so `$x:f` can never find an ordinary `func f`. `wrapper func _s:name()`
-      is refused — the two markers have no combined reading. One consequence:
-      `func a:b()` used to report ``a:b` is not a name` and is now a declaration.
-- [ ] **Element-wise by default, `...` for the collection.** *(Blocked with the
-      resolution item — there is no way to apply a modifier yet.)* A plain subject parameter
+      rest-must-be-last. `func` therefore grows a second declaration shape; that is the
+      accepted cost, and it buys a declaration readable straight off the call site.
+      *Built:* `Parser::modifier_subject` reads the shape before the name and rewinds
+      when it is not there; `Executable::Function` carries `subject: Option<Param>`,
+      which routes the definition into a separate map on `Funcs` so `$x:f` can never
+      find an ordinary `func f`. `wrapper func _s:name()` is refused — the two markers
+      have no combined reading. One consequence: `func a:b()` used to report
+      ``a:b` is not a name` and is now a declaration.
+- [ ] **Element-wise by default, `...` for the collection.** *(Waits on the resolution
+      item — there is no way to apply a modifier yet.)* A plain subject parameter
       receives one element, so a list subject calls the modifier per element — the
       auto-mapping the built-ins already do. A rest subject receives the whole list
       once. Implement the subject as *spread into* the parameter so this is one rule
       rather than a special case.
-- [ ] **Resolve declared modifiers at load time, not parse time.** Per unit — a
-      script, a sourced file, a `-c` string, or one interactive line — collect the
-      modifier declarations, then check the unit's modifier *uses* against the known
-      set before running any of it. Forward references within a unit must work, which
-      falls out of collecting before checking rather than needing its own rule. An
-      unknown modifier is an error naming the name. **Do not** make `:name` resolution
-      run-time per call: that would weaken the shipped modifiers too, and it is the
-      reason a declaration is required at all rather than any one-argument `func`
-      qualifying.
-  - [ ] **Hoist modifier declarations — collect *and install* in the pre-pass.** An
-        ordinary `func` binds when its statement executes (`shell.funcs.define` inside
-        the `Function` step, `crates/mesh-core/src/repl.rs`), so validating without
-        installing would accept `$x:shorten` above its own declaration and then find
-        no body at execution. Install during the same pass that collects, before the
-        unit's first statement runs. Consequence to keep: within a unit the later
-        declaration of a name wins even for a use written above it, unlike `func`.
-  - [ ] **Modifier declarations are top-level only.** A `func` binds by executing, so
-        a nested one binds only when its enclosing function runs (`func outer() { func
-        inner() { … } }` — see the nested-definition test in
-        `crates/mesh/tests/cli.rs`). A modifier declared inside a function body or a
-        branch therefore is not knowable before the unit runs, which is the property
-        the whole decision rests on. Reject it **at the declaration**. Do not "fix"
-        this by scanning recursively: that accepts a use whose declaration sits in an
-        uncalled function. Ordinary nested `func`s keep working — this restricts the
-        modifier form only.
-  - [ ] **Blocked on the `source` boundary — do not implement the check until it is
-        settled.** `source lib.mesh` then `$x:slug` cannot be checked from the unit's
-        own text, because `lib.mesh` binds `:slug` by executing a statement later, and
-        a library modifier must stay usable in the script that sources it. This is the
-        same wall as the static-checker item above ("Four framings, four
-        counter-examples"), whose two surviving directions — poison after `source`, or
-        an import form — are recorded there as language decisions nobody has picked.
-        Pick one *there*, then implement here; do not invent a third answer inside the
-        modifier work. Everything else in this section is independent of it.
+- [ ] **Resolve a modifier when it is called**, the same rule as command position —
+      not at parse time, and not by a load-time pre-pass. `$x:foo` looks `:foo` up at
+      the moment the line runs; redefining a modifier changes what an already-written
+      use runs, and one arriving from a `source` a statement earlier is found. A
+      modifier declaration binds when it executes, like a `func`, and may sit anywhere
+      a `func` may sit — nested and conditional declarations included. An unknown
+      modifier is a **run-time** error naming it.
+  - [ ] **Open the parse-time gate everywhere it stands.** `modifier_name` consults
+        `MODIFIER_NAMES` to reject an unknown `:name` as a syntax error. That check
+        moves to run time for a modifier applied to a **value subject**, for the
+        regex-literal flag suffix (below), and for the **reference** form — `Parser::modifier_ref_name` gates whether `:foo` may
+        enter the expression parser at all, and `docs/DESIGN.md` promises `:name` in
+        value position for a user's own declaration (`$xs:filter(:foo)`), so leaving
+        that gate closed would make a declared modifier unusable through the spelling
+        the design offers. Keep the `:ident`
+        **grammar reservation** — `ubuntu:latest` is still a modifier position rather
+        than text — and keep the existing diagnostic's escape advice (quote the word,
+        or brace the name) at its new site. This is a change to **shipped** behavior,
+        not just to an unimplemented plan; see `docs/DESIGN.md` §"Modifiers".
+    - [ ] **Opening the gate is not enough for an interpolation — the expansion path
+          cannot see `Funcs`.** `expansion_variable` (`crates/mesh-core/src/repl.rs`)
+          lowers each `:name` through `modifier_step`, which knows built-ins only, and
+          the value is resolved by `expand::resolve_value(&reference, &shell.vars)` —
+          `&Vars`, with no route to `Funcs::modifiers`. So `"$x:foo"` would still fail
+          to find a declared modifier after the parser stops rejecting it. This is the
+          same plumbing `docs/DESIGN.md` already flags for `:kind`: "`:kind` needs the
+          function table, which lives in `Funcs`, while string interpolation resolves
+          through `expand.rs` with only `&Vars` … whichever way the plumbing goes, both
+          paths land together." Land them together here too — `y = $x:foo` and
+          `"$x:foo"` disagreeing is the failure to avoid — either by giving the
+          expansion path shell-aware resolution or by carrying an unresolved name out
+          to a caller that has `Funcs`.
+    - [ ] **The regex-literal flag suffix opens with the rest — a flag *is* a
+          modifier.** Its subject is a pattern and its result is a pattern, which is
+          what `docs/DESIGN.md` already settled, and the shipped tables already agree:
+          all eight flag names (`i`, `ignorecase`, `m`, `multiline`, `s`, `dotall`,
+          `x`, `extended`) are in `MODIFIER_NAMES`, and *applying* one already goes
+          through the ordinary applier — `expand::set_regex_flag`, reached from
+          `apply_modifier_step` — so `$r:i` on a pattern in a variable, `$rs:map(:i)`
+          by reference and the lambda form all work today
+          (`a_modifier_reference_follows_the_value_type_like_the_postfix_form`). **Do
+          not reimplement any of that.** `regex_flag`
+          (`crates/mesh-core/src/parser.rs`) is not a second vocabulary; it answers
+          only whether a name may be folded into the literal while parsing. The work is
+          parser-side: `Parser::regex_literal` stops consulting either table, so `/…/`
+          in a match slot is a pattern value and the `:name` chain after it is the
+          ordinary postfix loop, applied by the code that already handles it.
+          - [ ] **Keep the flag diagnostic, at its new site.** `` `:g` is not a regex
+                flag `` names the flag vocabulary, and `crates/mesh/tests/cli.rs` pins
+                it for the assignment, detached and bare-condition forms. Moving to run
+                time gives it *better* grounds — the subject is known to be a pattern
+                rather than guessed from syntax — so report it there, with the same
+                text, instead of falling back to the generic unknown-modifier message.
+                The flag list stays closed: a built-in modifier name cannot be
+                redeclared.
+          - [ ] **What it costs: `/a/:upper` stops meaning the string.** A name the
+                parser knows is a modifier but not a flag currently makes it *decline*
+                the regex reading and fall back to the string one, which is why
+                `puts "/A/":replaceall(/a/:upper, X)` prints `X`
+                (`a_bare_word_in_a_replace_pattern_stays_the_string_it_looks_like`).
+                With no table to consult there is nothing to decline on: `/a/` is the
+                pattern and `:upper` reports against it. Update that test rather than
+                preserving the corner — it is the parser answering a question from
+                vocabulary that the shape already answers, which is the same thing
+                `:ident`-is-always-a-modifier rules out one level up.
+                A string subject keeps its own error: `"x":i` is a flag without a
+                pattern.
+          - [ ] **Compile the literal after its chain is known — `:x` is
+                construction-time.** A parse-affecting flag decides whether the pattern
+                text is *valid*, so `/foo#(/:x` must compile once in extended mode
+                rather than compile and then be modified; `docs/DESIGN.md` says so
+                already, beside `re($x, extended: true)`. `eval_expr` compiles
+                `E::Regex` eagerly (`crates/mesh-core/src/repl.rs`, `compile_regex`
+                before any postfix runs), so the contract is **unmet today** —
+                `if "foo#(" ~ /foo#(/:x { … }` reports `invalid regex`. Fix it with
+                this work rather than treating eager compilation as the behavior to
+                preserve: fold the **leading run** of parse-affecting flags into
+                construction, then compile, then run the rest of the chain.
+                A test for `/foo#(/:x` fails before and passes after.
+                - [ ] **Only the leading run folds — and past it nothing changes.**
+                      The window closes at the first modifier that is not a flag,
+                      because that is how far the text still belongs to the literal.
+                      After it, a flag on a pattern value is the ordinary dispatch it
+                      already is: `/a/:foo:x` reaches `:x` with whatever `:foo`
+                      returned, meaning extended syntax on a pattern and the executable
+                      filter on a path, and `$r:x` keeps working (pinned in
+                      `crates/mesh/tests/cli.rs` — `re("a b"):x` matches `ab`). **Add
+                      no ordering rule**: the constraint is on construction, not chain
+                      position. `/foo#(/:foo:x` fails because `/foo#(/` cannot compile
+                      without the flag at all, which lands before `:foo` runs and is
+                      the same failure `re("foo#(")` gives; `/foo#(/:x:foo` is the fix.
+                      Do **not** read "fold the leading run" as deferring compilation
+                      past the whole chain — that hands `:foo` an uncompiled, possibly
+                      invalid pattern — and do not make `:x` retroactive.
+                      *(`docs/DESIGN.md`'s `re()` note used to say a parse-affecting
+                      flag is "never a post-hoc modifier on a finished value", which
+                      the implementation has never done: post-hoc `:x` on a pattern
+                      whose text is valid works. That sentence is narrowed to what
+                      holds — a post-hoc flag cannot rescue text that never
+                      compiled — so the two sections agree.)*
+    - [ ] **Attached parentheses in an unbraced interpolation stop being text —
+          decided.** `variable_access_prefix` decides whether `(` after `:name` is a
+          call or literal text by asking `modifier_accepts_arguments`: after an
+          argument-free modifier a `(` is ordinary text and always was
+          (`"$x:upper(foo)"` is `AB(foo)`), and after an argument-taking one it is a
+          parse error pointing at the braced form. The parser cannot ask that of a user
+          modifier — its arity is not known when the string is parsed, and a
+          redeclaration can change it afterwards. The decision is that **an argument
+          reaches a modifier through braces**: an attached `(` is always the argument
+          list, never text, and the *modifier* makes the complaint — `:upper` says it
+          does not take arguments (`modifier :upper does not take arguments`, the
+          message the braced form already gives), one that does take an argument points
+          at `"${x:bar(8)}"`. So the check moves to where arity is known, which for a
+          declared modifier is run time. Two consequences to implement: drop the
+          literal-text reading (`"$x:upper(foo)"` becomes an error — retire the
+          `AB(foo)` line and the `"$x:upper (1)"` neighbors stay as they are, in
+          `crates/mesh/tests/cli.rs`; `"${x:upper}(foo)"` is the spelling for literal
+          text after a chain), and route the two messages by arity at the point the
+          modifier is applied rather than at the paren. `"$x:upper (1)"`,
+          `"($x:upper)"`, `"$x(foo)"` and every braced form are untouched. See
+          `docs/DESIGN.md` §"Modifiers".
+  - [ ] **Do not hoist, do not pre-scan, do not restrict placement.** An earlier
+        revision of this decision required all three to support a load-time check;
+        every one of them is now removed, and reintroducing any is a change to the
+        decision rather than an implementation detail.
+  - [ ] **A later declaration reaches only a delayed use.** `func f() { $x:foo }`
+        called after `func _s:foo()` binds is fine; a direct top-level `$x:foo` written
+        above the declaration is not, exactly as calling a `func` above its definition
+        is not. Do not "fix" that asymmetry — it is the command-position rule, and
+        fixing it means hoisting.
 - [x] **Redeclaring a built-in modifier is refused, by the same principle as
       `definition_name_problem` but on a separate name set.** *(Built:
       `modifier_definition_name_problem` in `crates/mesh-core/src/repl.rs` consults
@@ -7625,10 +7722,12 @@ a one-line edit. Every claim below was checked against the built shell.
         fully raw" question — `'…'` is no longer raw; rawness moved to `r'…'`.
   - [x] **Regex-flag modifiers — decided: coexist.** Regex values take `:` modifiers
         (`re($x):i`, `$re:m`, `:s`) **and** the `--ignore-case` constructor flag
-        stays — both spellings supported. A **parse-affecting** flag is *not* a
-        post-hoc modifier (`re()` is fail-loud and compiles the unflagged pattern
-        first): use `re($x --extended)` for a dynamic pattern, and reserve trailing
-        `:x` for a `/…/` literal that folds it in before compilation (`/…/:x`).
+        stays — both spellings supported. A **parse-affecting** flag applies post-hoc
+        like any other *when the pattern compiles without it* (`re("a b"):x`); what it
+        cannot do is rescue source that never compiled, since `re()` is fail-loud and
+        compiles the unflagged pattern first. So for text that is invalid unflagged,
+        use `re($x --extended)` for a dynamic pattern, and a trailing `:x` on a `/…/`
+        literal, which folds it in before compilation (`/…/:x`).
         `--literal` stays a constructor argument.
   - [ ] **Value-producing raw heredoc** — the decided both-quote-kinds raw form is a
         heredoc, but the only heredoc specified today is command-redirection (feeds
