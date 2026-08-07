@@ -96,9 +96,15 @@ impl FuncDef {
 }
 
 /// The session's defined functions (name → definition).
+///
+/// Modifiers live in their own map rather than in `map` under a mangled name:
+/// they are a **separate vocabulary**, so `func upper() { tr a-z A-Z }` and a
+/// built-in `:upper` do not collide, and `$x:f` never finds an ordinary `func f`
+/// (`DESIGN.md` §"Modifiers").
 #[derive(Default)]
 pub struct Funcs {
     map: HashMap<String, FuncDef>,
+    modifiers: HashMap<String, FuncDef>,
 }
 
 impl Funcs {
@@ -118,6 +124,11 @@ impl Funcs {
 
     pub(crate) fn names(&self) -> impl Iterator<Item = &str> {
         self.map.keys().map(String::as_str)
+    }
+
+    /// Define (or redefine) a declared modifier, `func _s:name()`.
+    pub fn define_modifier(&mut self, name: String, def: FuncDef) {
+        self.modifiers.insert(name, def);
     }
 }
 

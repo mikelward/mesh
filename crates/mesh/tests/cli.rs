@@ -16560,10 +16560,6 @@ fn every_rule_about_a_definitions_name_reports_the_same_way() {
         ("func a.b() { puts x }", "`a.b` cannot be a function name"),
         ("func _() { puts x }", "`_` is the discard name"),
         ("func 2x() { puts x }", "`2x` is not a name"),
-        // A colon is one word in command position, so a name carrying one has to
-        // reach the runtime check whole rather than stopping the parser mid-name.
-        // Raised in review: it used to reject the file with ``expected `(` ``.
-        ("func a:b() { puts x }", "`a:b` is not a name"),
         ("func a[0]() { puts x }", "`a[0]` is not a name"),
         // Opens on lexer-split punctuation rather than a word. Raised in review:
         // requiring a `Word` to start put the parse error back for exactly the
@@ -32160,6 +32156,168 @@ fn a_builtin_with_no_options_reports_a_flag_rather_than_printing_it() {
             String::from_utf8_lossy(&out.stdout),
             "--force\n",
             "{source}"
+        );
+    }
+}
+
+/// The modifier declaration form, `func _s:name()` (`DESIGN.md` §"Modifiers").
+///
+/// The subject sits *outside* the parens, which is the whole reason for the shape:
+/// as a leading rest parameter it would collide with rest-must-be-last, and a
+/// collection modifier that still takes an argument — `$xs:oxford("and")` — is not
+/// a corner case.
+#[test]
+fn a_modifier_declaration_names_its_subject_left_of_the_colon() {
+    // Both shapes parse, and neither disturbs what follows.
+    for source in [
+        "func _s:shorten() { puts short }",
+        "func _s:pad(_n) { puts padded }",
+        "func ..._xs:oxford(_conj) { puts joined }",
+        "func ..._xs:longest() { puts longest }",
+        // `_s` is the docs' naming style, not a rule — the subject is an ordinary
+        // parameter name.
+        "func a:b() { puts x }",
+    ] {
+        let out = run_with_input(&format!("{source}\nputs after\n"));
+        assert!(out.stderr.is_empty(), "{source}: {:?}", out.stderr);
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout),
+            "after\n",
+            "{source} ran its body at the declaration"
+        );
+    }
+}
+
+/// A built-in modifier name may not be redeclared, for the reason
+/// `definition_name_problem` already gives `func puts`: a name the shell resolves
+/// first leaves the definition unreachable.
+///
+/// The check consults a **separate name set**, which is the part worth pinning:
+/// modifiers are their own vocabulary, so a shipped `:upper` has no claim on the
+/// command namespace.
+#[test]
+fn a_builtin_modifier_name_cannot_be_redeclared_as_a_modifier() {
+    for name in ["upper", "join", "len", "keys"] {
+        let out = run_with_input(&format!("func _s:{name}() {{ puts x }}\nputs after\n"));
+        assert!(
+            String::from_utf8_lossy(&out.stderr)
+                .contains(&format!("`:{name}` is a built-in modifier")),
+            "{name}: {:?}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        // Runtime, not syntax — the next command still runs, like every other
+        // definition-name refusal.
+        assert!(
+            !String::from_utf8_lossy(&out.stderr).contains("syntax error"),
+            "{name}"
+        );
+        assert_eq!(String::from_utf8_lossy(&out.stdout), "after\n", "{name}");
+    }
+
+    // The other half of "separate name set", and the regression this rule exists
+    // to avoid: a built-in *modifier* name is still a perfectly good *command*
+    // name, so widening the command-side check would break this.
+    let ok = run_with_input("func upper() { tr a-z A-Z }\nputs hi | upper\n");
+    assert_eq!(String::from_utf8_lossy(&ok.stdout), "HI\n");
+    assert!(ok.stderr.is_empty(), "{:?}", ok.stderr);
+}
+
+/// `wrapper` and a modifier subject have no combined reading: "parses no flags of
+/// its own" describes a command's argument list, and a modifier's subject arrives
+/// through `$x:` rather than as an argument to forward.
+#[test]
+fn a_modifier_cannot_be_a_wrapper() {
+    let out = run_with_input("wrapper func _s:shorten() { puts x }\nputs after\n");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("a modifier cannot be a `wrapper func`"),
+        "{:?}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// The line reader has to know the modifier header shape, or an interactive
+/// declaration whose body opens on the next line is dispatched half-read.
+///
+/// `header_awaits_body` judges the text before the `(` with `valid_name`, and
+/// `_s:shorten` is not one — so without `strip_modifier_subject` the header was
+/// declared malformed and `unexpected end of input` reported, for a layout
+/// ordinary functions accept. Raised in review.
+#[test]
+fn a_modifier_declaration_can_open_its_body_on_the_next_line() {
+    for source in [
+        "func _s:shorten()\n{\nputs body\n}\n",
+        "func ..._xs:oxford(_conj)\n{\nputs body\n}\n",
+        "func _s:pad(_n)\n{\nputs body\n}\n",
+    ] {
+        let out = run_with_input(&format!("{source}puts after\n"));
+        assert!(out.stderr.is_empty(), "{source}: {:?}", out.stderr);
+        assert_eq!(String::from_utf8_lossy(&out.stdout), "after\n", "{source}");
+    }
+
+    // The stripping must not swallow a name from a header that is *not* a
+    // declaration: a lone `:` with no valid subject before it is left alone.
+    let bad = run_with_input("func :shorten()\n{\n}\nputs after\n");
+    assert!(
+        String::from_utf8_lossy(&bad.stderr).contains("syntax error"),
+        "{:?}",
+        String::from_utf8_lossy(&bad.stderr)
+    );
+}
+
+/// The subject binds into the call scope beside the parameters and the captures,
+/// so it takes the signature's rules even though it is written outside the parens.
+///
+/// Returning it separately from `parameters()` bypassed both that validation and
+/// `capture_list_beside`, which let `func env:mine()` shadow a reserved namespace
+/// and `func x:mine(x)` bind one name twice. Raised in review.
+#[test]
+fn a_modifier_subject_is_checked_against_the_rest_of_the_signature() {
+    for (source, reason) in [
+        ("func env:mine() { puts x }", "`env` is reserved"),
+        ("func sh:mine() { puts x }", "`sh` is reserved"),
+        ("func x:mine(x) { puts x }", "duplicate parameter `x`"),
+        ("func x:mine(...x) { puts x }", "duplicate parameter `x`"),
+        (
+            "y = 1\nfunc y:mine() with ($y) { puts x }",
+            "both captured and a parameter",
+        ),
+    ] {
+        let out = run_with_input(&format!("{source}\nputs after\n"));
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains(reason),
+            "{source}: {:?}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    // A subject that clashes with nothing is still fine, including one sharing a
+    // name with a *different* declaration's parameter.
+    let ok = run_with_input("func s:mine(n) { puts x }\nfunc n:other(s) { puts x }\nputs after\n");
+    assert!(ok.stderr.is_empty(), "{:?}", ok.stderr);
+    assert_eq!(String::from_utf8_lossy(&ok.stdout), "after\n");
+
+    // The line reader has to reach the same verdict, or it buffers the *following*
+    // command into a header the parser will reject. `signature_parses` probes a
+    // synthesized definition, so the subject rides along with it: probing `(x)`
+    // alone called `func x:mine(x)` well-formed and swallowed `puts after`. An
+    // ordinary `func mine(x, x)` never did, which is the shape to match.
+    // Raised in review.
+    for source in [
+        "func x:mine(x)",
+        "func x:mine(...x)",
+        "func env:mine()",
+        "func mine(x, x)",
+    ] {
+        let out = run_with_input(&format!("{source}\nputs after\n"));
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains("syntax error"),
+            "{source}: {:?}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout),
+            "after\n",
+            "{source} swallowed the next command"
         );
     }
 }

@@ -310,6 +310,14 @@ pub enum ParseErrorKind {
     /// would be listed in help and offered by completion while every
     /// command-position `--flag` went straight to `...rest` instead.
     WrapperDeclaresFlag(String),
+    /// `wrapper func _s:name()`. "Parses no flags of its own" describes a command's
+    /// argument list; a modifier's subject arrives through `$x:`, so the two
+    /// markers have no combined reading rather than one that has to be guessed at.
+    WrapperModifier,
+    /// A modifier subject written as anything but a plain name or a `...rest` —
+    /// `func _s = "x":name()`, `func --s:name()`. The subject is supplied by the
+    /// call site, so it can be neither defaulted nor named as a flag.
+    ModifierSubjectDefault(String),
     /// A `/…/` literal the tokenizer had already taken apart — the only way that
     /// happens is a construct the lexer consumes *without emitting a token*, so
     /// in practice a ` #` comment inside the pattern. Its own variant because the
@@ -503,6 +511,17 @@ impl std::fmt::Display for ParseError {
                 f,
                 "syntax error: a `wrapper func` parses no flags, so it cannot declare \
                  `--{name}`; drop the marker, or take the flag through `...rest`"
+            ),
+            ParseErrorKind::WrapperModifier => write!(
+                f,
+                "syntax error: a modifier cannot be a `wrapper func`; its subject comes \
+                 from `$x:`, not from an argument list to forward"
+            ),
+            ParseErrorKind::ModifierSubjectDefault(name) => write!(
+                f,
+                "syntax error: a modifier subject is a plain name or `...name`, so \
+                 `{name}` cannot take a default or be a flag; the call site's `$x:` \
+                 always supplies it"
             ),
             ParseErrorKind::KeywordFuncRef(name) => write!(
                 f,
@@ -743,6 +762,18 @@ pub enum Executable {
         /// not know the callee's grammar; the check is *relocated* to the
         /// wrapped call rather than dropped (`DESIGN.md` §"Functions").
         wrapper: bool,
+        /// `func _s:shorten()` — the modifier declaration's **subject**, the
+        /// parameter written left of the colon (`DESIGN.md` §"Modifiers"). `None`
+        /// for an ordinary `func`, which is every definition that predates the
+        /// form.
+        ///
+        /// It sits outside the parens because it is not a positional: as a leading
+        /// rest parameter it would collide with rest-must-be-last, and
+        /// `$xs:oxford("and")` — a list subject that still takes an argument — is
+        /// not a corner case. [`ParamKind::Rest`] here is `func ..._xs:name()`,
+        /// which takes the whole collection; anything else takes one element and
+        /// is called per element over a list.
+        subject: Option<Param>,
     },
     If(IfExpr),
     Match(MatchExpr),
@@ -3949,11 +3980,25 @@ impl Parser<'_> {
                 span,
             },
             wrapper: true,
+            // An alias desugars to a `wrapper func`, and a wrapper cannot be a
+            // modifier — there is no `alias _s:name =` spelling to reach this.
+            subject: None,
         })
     }
 
     fn function(&mut self, wrapper: bool) -> Result<Executable, ParseError> {
         self.take_word("func");
+        // `func _s:shorten()` — a modifier declaration, read before the name
+        // because the subject is written *first*, left of the colon. Absent for
+        // every ordinary `func`, which is what `None` here means downstream.
+        let subject = self.modifier_subject()?;
+        // A wrapper parses no flags of its own, which is a statement about an
+        // argument list a modifier reaches through its subject rather than as a
+        // command. The two markers have no combined reading, so refuse it here
+        // rather than pick one.
+        if wrapper && subject.is_some() {
+            return Err(self.error(ParseErrorKind::WrapperModifier));
+        }
         // Taken as written and judged when the definition runs — see
         // [`definition_name`](Self::definition_name). The rules themselves (no
         // reserved word, no built-in value call, no dotted name) live at the one
@@ -3966,7 +4011,25 @@ impl Parser<'_> {
         if wrapper && let Some(flag) = parameters.iter().find(|p| p.kind.is_option()) {
             return Err(self.error(ParseErrorKind::WrapperDeclaresFlag(flag.name.clone())));
         }
-        let captures = self.capture_list_beside(&parameters)?;
+        // The subject is a binder like any other, so it takes the signature's own
+        // rules — it just is not written inside the parens. Checked against the
+        // parameters *and* the captures, since all three bind into one call scope:
+        // `func env:mine()` would shadow a reserved namespace, and `func x:mine(x)`
+        // would bind the same name twice with nothing to say which won.
+        let binders = subject
+            .iter()
+            .cloned()
+            .chain(parameters.iter().cloned())
+            .collect::<Vec<_>>();
+        if let Some(subject) = &subject {
+            if crate::vars::is_reserved_namespace(&subject.name) {
+                return Err(self.error(ParseErrorKind::ReservedParameter(subject.name.clone())));
+            }
+            if parameters.iter().any(|param| param.name == subject.name) {
+                return Err(self.error(ParseErrorKind::DuplicateParameter(subject.name.clone())));
+            }
+        }
+        let captures = self.capture_list_beside(&binders)?;
         self.newlines();
         let body = self.block()?;
         Ok(Executable::Function {
@@ -3976,7 +4039,73 @@ impl Parser<'_> {
             captures,
             body,
             wrapper,
+            subject,
         })
+    }
+
+    /// Read a modifier declaration's subject — the `_s` of `func _s:shorten()`, or
+    /// the `..._xs` of `func ..._xs:oxford(_conj)` — leaving the cursor on the name.
+    ///
+    /// Answers `None` for an ordinary `func`, and must do so without consuming
+    /// anything: `func f()` and `func _s:f()` differ only past the name, so this
+    /// looks the whole shape up front and rewinds if it is not there.
+    ///
+    /// The colon has to **abut** both halves, the same rule the modifier chain
+    /// itself uses (`$x:upper`, never `$x : upper`). Without it `func _s : f()`
+    /// would be a declaration, and the spelling that reads as one thing at the call
+    /// site would read as two here.
+    fn modifier_subject(&mut self) -> Result<Option<Param>, ParseError> {
+        let saved = self.position;
+        let mut ahead = 0;
+        if self
+            .tokens
+            .get(self.position)
+            .is_some_and(|token| matches!(token.value, TokenKind::Spread))
+        {
+            ahead += 1;
+        }
+        // Subject, then an abutting `:`, then an abutting name. Anything else is an
+        // ordinary definition and the cursor has not moved.
+        let Some(subject) = self.tokens.get(self.position + ahead) else {
+            return Ok(None);
+        };
+        let Some(colon) = self.tokens.get(self.position + ahead + 1) else {
+            return Ok(None);
+        };
+        if !matches!(colon.value, TokenKind::Colon) || colon.span.start != subject.span.end {
+            return Ok(None);
+        }
+        if !self
+            .tokens
+            .get(self.position + ahead + 2)
+            .is_some_and(|name| name.span.start == colon.span.end)
+        {
+            return Ok(None);
+        }
+        // Committed: past here the text can only be a modifier declaration, so a
+        // malformed subject is an error rather than a rewind to a reading that
+        // would blame the `(` instead.
+        let head = self.parameter_head()?;
+        if head.has_default {
+            self.position = saved;
+            return Err(self.error(ParseErrorKind::ModifierSubjectDefault(head.name)));
+        }
+        let kind = match head.class {
+            OrderClass::Rest => ParamKind::Rest,
+            OrderClass::Required => ParamKind::Required,
+            // A flag or an optional is a *signature* role, and the subject fills
+            // none of them: it is supplied by the call site's `$x:`, which cannot
+            // be absent and cannot be named.
+            _ => {
+                self.position = saved;
+                return Err(self.error(ParseErrorKind::ModifierSubjectDefault(head.name)));
+            }
+        };
+        self.expect(&TokenKind::Colon, "`:`")?;
+        Ok(Some(Param {
+            name: head.name,
+            kind,
+        }))
     }
 
     fn parameters(&mut self) -> Result<Vec<Param>, ParseError> {
@@ -7503,6 +7632,13 @@ fn modifier_name(name: &str) -> bool {
     MODIFIER_NAMES.contains(&name)
 }
 
+/// Is `name` one of the shipped modifiers? The name set a **modifier**
+/// declaration is judged against, kept separate from the command-side reserved
+/// names so the two vocabularies stay independent (`DESIGN.md` §"Modifiers").
+pub fn is_builtin_modifier(name: &str) -> bool {
+    modifier_name(name)
+}
+
 /// Is `name` a modifier that **requires** a parenthesized argument list? Used to
 /// give a clearer error when such a modifier is written bare (`:split` with no
 /// arguments) rather than the generic "not implemented yet".
@@ -7814,11 +7950,13 @@ mod tests {
             captures,
             body,
             wrapper,
+            subject,
         } = &sugar.statements[0].and_or.first
         else {
             panic!("expected a function definition")
         };
         assert!(wrapper);
+        assert!(subject.is_none(), "an alias is not a modifier declaration");
         assert_eq!(name, "co");
         // Sugar for the hand-written form, which has no list either unless one is
         // written: `alias` does not bake anything on its own.
