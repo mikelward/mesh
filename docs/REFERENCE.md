@@ -1600,14 +1600,25 @@ on preprompt title title-idle
 on preexec   title title-busy
 ```
 
-Registering either replaces what the shell writes for itself at that moment. The
-two get there differently, which matters only if you are reading the sequence on
-the wire: `preexec` runs after the running title is written, so the hook's simply
-lands second, while the prompt's own title is written after the `preprompt` hooks
-— so that a handler which `cd`s is titled from where it left the shell — and
-stands aside for the prompt where one of them called `title`. Either way the last
-title written is yours, and the halves are independent: titling the busy window
-does not cost you the idle one.
+Registering either takes the window: the first title that actually reaches the
+terminal stops the shell naming it for itself, at the prompt *and* while a
+command runs. The prompt's own title is written after the `preprompt` hooks — so
+that a handler which `cd`s is titled from where it left the shell — and once a
+`title` has landed, neither automatic write happens again.
+
+A call that writes nothing does not take it, which is what you want: with
+`$sh.options.osc-title = false`, or on a terminal off the allowlist, `title` is
+silent and the shell's own titles are silent too, so there is nothing to hand
+over. Turn the option back on and the automatic titles resume until a `title`
+call succeeds.
+
+**The halves are not independent, so register both or neither.** Taking the
+window is one flag, not one per hook, so a session with only an `on preexec`
+handler loses the automatic *idle* title too and the window keeps whatever the
+last command was called. Registering the pair above avoids it, since each moment
+then has a handler of its own. This is the one rough edge in the current design
+and it goes away when the shell's own titles become overridable hooks — see
+`TODO.md` — where taking a half is just replacing that half's handler.
 
 `$sh.options.osc-title = false` turns off both the shell's titles and the hooks',
 so it stays the one switch that means "leave my title bar alone".
