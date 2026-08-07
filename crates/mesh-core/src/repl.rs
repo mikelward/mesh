@@ -1450,6 +1450,32 @@ fn definition_name_problem(name: &str) -> Option<String> {
     None
 }
 
+/// Why `name` cannot be declared as a modifier, `func _s:name()`.
+///
+/// The same principle as [`definition_name_problem`] — a name the shell resolves
+/// first leaves the definition *unreachable*, so refuse it loudly rather than
+/// leave dead code — applied to a **different name set**. Modifiers are their own
+/// vocabulary: `:upper` is a built-in modifier and has no claim on the command
+/// namespace, so `func upper() { tr a-z A-Z }` stays legal while `func _s:upper()`
+/// does not (`DESIGN.md` §"Modifiers").
+fn modifier_definition_name_problem(name: &str) -> Option<String> {
+    if parser::is_builtin_modifier(name) {
+        return Some(format!(
+            "`:{name}` is a built-in modifier and cannot be redeclared"
+        ));
+    }
+    if name == "_" {
+        return Some("`_` is the discard name and cannot be a modifier name".to_owned());
+    }
+    if !parser::valid_name(name) {
+        return Some(format!(
+            "`{name}` is not a name: a name starts with a letter or `_` and continues with \
+             letters, digits, `_`, and single `-`s"
+        ));
+    }
+    None
+}
+
 fn run_line(text: &str, last: u8, in_function: bool, shell: &mut Shell) -> Step {
     // Input the parser rejected never reaches `run_recorded`, so this is the only
     // place its status can be published. Without it the shell carries 2 to the
@@ -1886,6 +1912,7 @@ fn run_executable(
             captures,
             body,
             wrapper,
+            subject,
         } => {
             // A written name is text the parser read; a computed one is a word
             // evaluated here, which is the whole point of `alias $name = …` --
@@ -1918,7 +1945,15 @@ fn run_executable(
                     Err(step) => return step,
                 },
             };
-            if let Some(reason) = definition_name_problem(&name) {
+            // Two vocabularies, two checks. A modifier name is judged against the
+            // built-in *modifiers* and nothing else: widening the command-side set
+            // would reject `func upper() { tr a-z A-Z }`, which is a working
+            // definition (`DESIGN.md` §"Modifiers").
+            if let Some(reason) = if subject.is_some() {
+                modifier_definition_name_problem(&name)
+            } else {
+                definition_name_problem(&name)
+            } {
                 note!("mesh: func: {reason}");
                 return Step::Error(2);
             }
@@ -1935,15 +1970,17 @@ fn run_executable(
             }
             // Parameter names are already validated (distinct, not `env`) by the
             // parser's `parameters()`.
-            shell.funcs.define(
-                name,
-                FuncDef {
-                    params: parameters.clone(),
-                    body,
-                    captures: captured,
-                    wrapper: *wrapper,
-                },
-            );
+            let def = FuncDef {
+                params: parameters.clone(),
+                body,
+                captures: captured,
+                wrapper: *wrapper,
+            };
+            if subject.is_some() {
+                shell.funcs.define_modifier(name, def);
+            } else {
+                shell.funcs.define(name, def);
+            }
             Step::Continue(0)
         }
         If(expression) => run_ast_if(expression, last, in_function, shell),
@@ -11945,6 +11982,7 @@ fn body_open_offset(text: &str) -> Option<usize> {
                 .strip_prefix("func")
                 .unwrap_or("")
                 .trim();
+            let head = strip_modifier_subject(head);
             (head.is_empty() || is_ident_prefix(head)).then_some(brace)
         }
     }
@@ -11972,13 +12010,19 @@ fn header_awaits_body(text: &str) -> bool {
         // No `(` yet: still forming the name. Keep reading while what we have is a
         // valid identifier *prefix* (or just `func`); an impossible head (`_`, a
         // digit) or an embedded space can never become a name, so dispatch it.
-        let name = rest.trim_end();
+        let name = strip_modifier_subject(rest.trim_end());
         return name.is_empty() || is_ident_prefix(name);
     };
-    // The name is everything before the `(` and must be a valid identifier.
-    if !parser::valid_name(rest[..paren].trim()) {
+    // The name is everything before the `(`, past any modifier subject, and must
+    // be a valid identifier.
+    let head = rest[..paren].trim();
+    if !parser::valid_name(strip_modifier_subject(head)) {
         return false;
     }
+    // Kept for the probe below: a subject is a binder, so a reserved or duplicate
+    // one makes the signature invalid, and a probe that dropped it would call the
+    // header well-formed and buffer the next command into it.
+    let subject = &head[..head.len() - strip_modifier_subject(head).len()];
     let after_open = &rest[paren + 1..];
     match signature_close(after_open) {
         // Params still forming: keep reading only while the partial list could
@@ -11992,7 +12036,8 @@ fn header_awaits_body(text: &str) -> bool {
         // buffering the commands after it. Only whitespace may sit between the
         // signature's `)` and the body `{`.
         Some(close) => {
-            signature_parses(&after_open[..close]) && after_open[close + 1..].trim().is_empty()
+            signature_parses(subject, &after_open[..close])
+                && after_open[close + 1..].trim().is_empty()
         }
     }
 }
@@ -12001,9 +12046,33 @@ fn header_awaits_body(text: &str) -> bool {
 /// the real parser (on a synthesized `func …(params) {}`), so default expressions
 /// and the ordering rules are checked exactly as an executed definition would be —
 /// the completeness helpers only approximate a *still-forming* list.
-fn signature_parses(params: &str) -> bool {
-    let probe = format!("func probe({params}) {{}}");
+///
+/// `subject` is a modifier declaration's `_s:` — including the colon — or empty.
+/// It has to ride along because the subject is a binder: `func x:mine(x)` is a
+/// duplicate the real parser rejects, and probing `(x)` alone would call the
+/// header well-formed and buffer the following command into it.
+fn signature_parses(subject: &str, params: &str) -> bool {
+    let probe = format!("func {subject}probe({params}) {{}}");
     matches!(parser::parse(&probe), Ok(parser::ParseOutcome::Complete(_)))
+}
+
+/// Strip a modifier declaration's subject from a `func` header, leaving the name:
+/// `_s:shorten` → `shorten`, `..._xs:oxford` → `oxford`. Text that is not one is
+/// returned unchanged, so an ordinary header is judged exactly as before.
+///
+/// The line reader has to know this shape or it never buffers one. It works on
+/// the header *text* rather than tokens because that is all these helpers have,
+/// and it is why the subject is checked with [`parser::valid_name`] here: a `:`
+/// in a header that is not a modifier declaration must not swallow the name.
+fn strip_modifier_subject(head: &str) -> &str {
+    let Some((subject, name)) = head.split_once(':') else {
+        return head;
+    };
+    let bare = subject.strip_prefix("...").unwrap_or(subject);
+    if bare.is_empty() || !parser::valid_name(bare) {
+        return head;
+    }
+    name
 }
 
 /// Is `s` a valid *prefix* of a kebab identifier — an ASCII-letter head followed
