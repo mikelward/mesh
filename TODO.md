@@ -9,21 +9,6 @@ file as tasks land.
 Calls autopilot made without asking, each one chosen for being cheap to undo.
 Delete an entry once you have agreed with it or reversed it.
 
-- [ ] **`fail` accepts a `Status` operand as well as an integer.** `fail
-      $sh.status` and `fail $j.status` are the obvious spellings once those
-      channels carry a status, and the design's `fail N` wording predates the
-      type. The `N ≥ 1` check is unchanged, so `fail status(0)` is refused
-      exactly as `fail 0` is. *Reversible:* one arm in `make_fail`, and the
-      alternative — refusing it, and making the caller write `fail
-      $sh.status:code` — is a strictly smaller surface.
-- [ ] **`status` is a builtin with both spellings, like `gets`.** The design
-      calls `status(N)` a builtin returning a value and separately requires
-      `{ status 5 }` to work as a block arm's tail, which is command position.
-      Registering it in the builtin table plus `CALLABLE_BUILTINS` gives both
-      from one entry, and takes `help status` / `type status` with it, where a
-      `Claim::ValueCall` name would have needed a second mechanism for the
-      command form. *Reversible:* the entry is one table row; nothing outside
-      dispatch reads it.
 - [ ] **`exit` reads a word, not a value, which answers the design's open
       question by omission.** The question was whether `exit` should accept a
       `Status` the way `fail` does; nothing had to, because `exit` reads its
@@ -5815,6 +5800,63 @@ unguarded, alongside fish and elvish, and carries a `TODO:` naming this entry.
       equality does not, whether numeric types compare across (`1 == 1.0`, where
       the document and the implementation disagree), and where `Status` lands
       once those are answered. Whatever equality ends up doing, `match` arms do.
+
+- [ ] **Consider removing `fail`.** It is a reserved word and a whole control
+      path (`parser.rs` `take_word("fail")`, `Expanded::Fail`, `make_fail`) for
+      something the status type now spells directly:
+
+      | `fail` | equivalent |
+      |---|---|
+      | `fail` | `return status 1` |
+      | `fail 3` | `return status 3` |
+      | `fail $sh.status` | `return $sh.status` |
+      | `fail 0` | *refused* — `return status 0` is not |
+
+      The case for going: one fewer reserved name (`INHERITED_RESERVED_NAMES`,
+      `RESERVED_WORDS`, a `SYNTAX` row), one fewer way to do it, and `return
+      status N` reads no worse. `fail` predates the type — it existed *because*
+      a status had no spelling, which is the premise that just changed.
+
+      The case for staying, which is not nothing: the `N ≥ 1` check. `fail 0` is
+      refused because a `fail` that succeeds is always a mistake, and `return
+      status 0` cannot carry that check without refusing a legitimate value. Drop
+      `fail` and the diagnostic goes with it. `fail` is also shorter at the site
+      that uses it most — a guard clause — and reads as a verb where `return
+      status 1` reads as a mechanism.
+
+      Cost of the change if taken: ~48 call sites in `crates/mesh/tests/cli.rs`,
+      ~20 in the mesh shell config downstream (mikelward/conf), plus `DESIGN.md`
+      §"Result and `return`", which argues the split from `exit` on grounds that
+      still hold — `fail` leaves a function, `exit` leaves the shell — so the
+      design entry needs rewriting rather than deleting.
+
+- [ ] **Consider moving the value constructors into the builtin table.** `status`
+      and `gets` are constructors that live in `TABLE` (the builtin registry),
+      while `re`, `style`, `link`, `glob`, `files` and `dirs` are
+      `Claim::ValueCall` reserved words in `RESERVED_WORDS` / `SYNTAX`. So one
+      registry now holds two constructors among the commands and the other holds
+      the rest, and which one a name is in decides how the shell talks about it:
+
+      ```
+      $ type status                     $ type style
+      status is a shell builtin         style is a shell keyword
+      $ status --help                   $ style --help
+      A status value — how a command…   mesh: command not found: style
+      ```
+
+      `help` answers for both, but differently — `Usage:` with an `Options:`
+      block for a table row, `Syntax:` with none for a keyword — so a reader
+      cannot tell from the shape whether a name takes flags or whether the
+      registry simply files it elsewhere.
+
+      What blocks a straight move: **table membership currently implies a command
+      form.** `CALLABLE_BUILTINS` reads "answers to the call spelling *as well as*
+      the command one", which is true of `gets` and `status` and false of every
+      name above — `style x` is a `command not found` on purpose. Moving them
+      needs a third state, a call-only builtin, plus an answer for what
+      `--help` means on a name that takes no flags and cannot be written in
+      command position at all. That is a registry redesign rather than six table
+      rows, which is why it is filed rather than done.
 
 - [ ] **A word subscript takes only a string variable.** `$m[$key]` inside a word
       goes through `expand::subscript_key`, which accepts `Value::String` and
