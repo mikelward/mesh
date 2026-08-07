@@ -442,9 +442,11 @@ not. [Declaring a modifier](#modifiers) lets a user add to the vocabulary, so th
 parser can no longer hold the whole list and cannot tell a typo from a name declared
 elsewhere; `:latest` is diagnosed when the line runs rather than when it is read. The
 *grammar* reservation below is untouched — `ubuntu:latest` is still a modifier
-position and never text — and the escapes above are still the escapes. This does
-change **shipped** behavior: `modifier_name` gates on `MODIFIER_NAMES` at parse time
-today, and opening that gate is what the resolution item in `TODO.md` covers.
+position and never text — and the escapes above are still the escapes. That move is
+**shipped**: the parser's gate on `MODIFIER_NAMES` is open for a value subject and
+for the `:name` reference alike, and `parser::unknown_modifier_message` carries the
+wording to its new site. The [regex literal](#operators-and-matching) below is the
+one gate still standing.
 
 **The flag suffix on a [regex literal](#operators-and-matching) is opened with the
 rest** *(decided)*, because a regex flag **is** a modifier — one whose subject is a
@@ -524,10 +526,9 @@ having failed earlier; both now report at run time, and the two stay worded
 differently because "no such modifier" and "not implemented yet" are different
 answers even when they arrive together.
 
-`modifier_name` (`parser.rs:4562`) tests `MODIFIER_NAMES` only to decide that
-fallback. So reserving `:ident` in the grammar does not introduce a new rule; it
-makes argument position agree with expression position, which is where the
-inconsistency was.
+The parser tests `MODIFIER_NAMES` for neither, now that both report at run time. So
+reserving `:ident` in the grammar does not introduce a new rule; it makes argument
+position agree with expression position, which is where the inconsistency was.
 
 The alternative — keep gating on the name list — was written into an earlier
 draft of this entry and is worse in the way that matters. Under it the reserved

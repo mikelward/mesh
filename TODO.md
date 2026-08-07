@@ -5406,11 +5406,13 @@ two other shells' answers turned out to be strictly better than ours.
 
 Decided in design discussion; see `docs/DESIGN.md` §"Modifiers".
 
-**The declaration half is built; applying one waits on this section's resolution
-item.** Declaring a modifier and refusing a built-in name are done and tested. Applying
-one is not: nothing can be applied until `$x:foo` *resolves* rather than being rejected
-by the parser as an unknown modifier, and `modifier_name` gates `:name` at parse time in
-today. That gate is the work. The `source` boundary that an earlier revision blocked
+**The declaration half is built, and the parse-time gate is open; applying a
+declaration is what remains.** Declaring a modifier, refusing a built-in name, and
+reporting an unknown `:name` when the line runs rather than when it is read are done
+and tested. Applying one is not: `$x:foo` now reaches run time, where nothing yet
+looks in `Funcs::modifiers` for it, so a declared modifier still reports `` `:foo` is
+not a modifier ``. Both spellings say so together, which is what the resolution item
+below has to keep true when it starts answering. The `source` boundary that an earlier revision blocked
 this on is **not reached** — that block came from a load-time check being unable to see
 a sourced library's modifiers, and resolution now happens at call time. The one
 *smaller* question call-time resolution raised in its place — what attached parentheses
@@ -5447,7 +5449,9 @@ spelling.) A declared modifier currently stores and never runs.
       modifier declaration binds when it executes, like a `func`, and may sit anywhere
       a `func` may sit — nested and conditional declarations included. An unknown
       modifier is a **run-time** error naming it.
-  - [ ] **Open the parse-time gate everywhere it stands.** `modifier_name` consults
+  - [x] **Open the parse-time gate everywhere it stands.** *(Done for the value
+        subject and the reference; the regex-literal suffix below is still gated.)*
+        `modifier_name` consulted
         `MODIFIER_NAMES` to reject an unknown `:name` as a syntax error. That check
         moves to run time for a modifier applied to a **value subject**, for the
         regex-literal flag suffix (below), and for the **reference** form — `Parser::modifier_ref_name` gates whether `:foo` may
@@ -5459,6 +5463,13 @@ spelling.) A declared modifier currently stores and never runs.
         than text — and keep the existing diagnostic's escape advice (quote the word,
         or brace the name) at its new site. This is a change to **shipped** behavior,
         not just to an unimplemented plan; see `docs/DESIGN.md` §"Modifiers".
+        *Done:* `parser::unknown_modifier_message` holds the wording, `repl::modifier_step`
+        and `eval_modifier_with_arguments` give it, and `ParseErrorKind::UnknownModifier`
+        is gone. Three parser gates opened with it — `valid_variable_access` and
+        `variable_access_prefix`, which decide how much text a `$…` reference claims,
+        and `carries_attached_modifier`, which is what keeps `if:nope` a chain on the
+        word `if` rather than a conditional. **Found building it:** every affected
+        spelling exits 1 now instead of 2, which is the visible half of the change.
     - [ ] **Opening the gate is not enough for an interpolation — the expansion path
           cannot see `Funcs`.** `expansion_variable` (`crates/mesh-core/src/repl.rs`)
           lowers each `:name` through `modifier_step`, which knows built-ins only, and
