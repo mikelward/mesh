@@ -1168,7 +1168,7 @@ Seven events, each handed what it is about:
 own is fixed:
 
 ```mesh
-func refresh-prompt() { prompt "$(pwd)> " }
+func refresh-prompt() { prompt "${pwd()}> " }
 on preprompt cwd refresh-prompt
 
 func command-finished(cmd, status, elapsed) {

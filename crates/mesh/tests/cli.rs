@@ -1456,6 +1456,63 @@ fn pwd_rejects_operands() {
     assert!(String::from_utf8_lossy(&out.stderr).contains("too many arguments"));
 }
 
+/// The **value** form: `pwd()` yields the directory into an expression rather
+/// than printing it (`DESIGN.md` §"Built-ins"), which is what lets a path
+/// compose. It writes **nothing** — the two spellings divide on that, and a call
+/// that printed as well would put the path on the terminal every time a prompt
+/// asked for it.
+#[test]
+fn the_pwd_value_form_yields_the_directory() {
+    let out = run_with_input("cd /\nhere = pwd()\nputs \"[$here]\"\n");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "[/]\n",
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// What the call is *for*: a path that feeds a modifier chain or a styled
+/// segment, where `$(pwd)` had to fork a capture to hand over the same string.
+#[test]
+fn the_pwd_value_form_composes_with_modifiers() {
+    let out = run_with_input("cd /usr/share\nputs pwd():base\nputs pwd():dir\n");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "share\n/usr\n",
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// The command form's operands are all errors today, so the call has nothing to
+/// accept either — and saying so beats binding a status from a call that looked
+/// like it took a directory.
+#[test]
+fn the_pwd_value_form_takes_no_arguments() {
+    let out = run_with_input("x = pwd(/tmp)\n");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("pwd() takes no arguments"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(!out.status.success());
+}
+
+/// `pwd():capture` records the **call**: `.value` is the path and `.out` is
+/// empty. Routed to the command path it would run the printing spelling instead
+/// and hand back a record with a `Status` where the path belongs.
+#[test]
+fn the_pwd_value_form_captures_as_a_call() {
+    let out = run_with_input("cd /\nr = pwd():capture\nputs \"[$r.value][$r.out]\"\n");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "[/][]\n",
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
 #[test]
 fn puts_joins_arguments_with_spaces() {
     let out = run_with_input("puts hello   world\n");
@@ -14296,7 +14353,8 @@ fn help_prints_every_name_it_was_given() {
     let out = run_with_input("help pwd jobs\n");
     assert_eq!(
         String::from_utf8_lossy(&out.stdout),
-        "Print the working directory\n\nUsage: pwd\n\nOptions:\n  --help  Print help\n\
+        "Print the working directory, or yield it as a value\n\nUsage: pwd · pwd()\n\n\
+         Options:\n  --help  Print help\n\
          \nList the jobs\n\nUsage: jobs\n\nOptions:\n  --help  Print help\n"
     );
     assert!(out.stderr.is_empty());
@@ -18244,30 +18302,19 @@ fn capturing_a_builtin_runs_the_builtin() {
     // dispatcher command position uses.
     let out = run_with_input(
         "p = puts(hello):capture\n\
-         w = pwd():capture\n\
          j = jobs():capture\n\
          e = echo(hi):capture\n\
-         puts \"p=$p.status/[$p.out] w=$w.status j=$j.status e=$e.status/[$e.out]\"\n",
+         puts \"p=$p.status/[$p.out] j=$j.status e=$e.status/[$e.out]\"\n",
     );
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(stdout.contains("p=0/[hello\n]"), "{stdout:?}");
-    assert!(stdout.contains("w=0"), "{stdout:?}");
     assert!(stdout.contains("j=0"), "{stdout:?}");
     // The external path still works alongside it.
     assert!(stdout.contains("e=0/[hi\n]"), "{stdout:?}");
     assert!(out.stderr.is_empty(), "{:?}", out.stderr);
 
-    // `pwd` reports the real directory rather than an empty capture.
-    let cwd = run_with_input("r = pwd():capture\nn = $r.out:len\nputs $n\n");
-    let length: usize = String::from_utf8_lossy(&cwd.stdout)
-        .trim()
-        .parse()
-        .unwrap_or(0);
-    assert!(
-        length > 1,
-        "pwd should have written its path: {:?}",
-        cwd.stdout
-    );
+    // `pwd` and `gets` have value spellings, so they capture as *calls* rather
+    // than here — see `the_pwd_value_form_captures_as_a_call`.
 
     // An unknown name is still an external lookup, and its failure is data.
     let missing = run_with_input("r = nosuchcmd():capture\nputs \"s=$r.status\"\n");

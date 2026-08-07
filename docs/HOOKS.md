@@ -31,7 +31,7 @@ Two surfaces over one store — the `on` builtin, and the `$sh.<event>` map D4
 added.
 
 ```mesh
-func arrived(from) { puts "now in $(pwd)" }
+func arrived(from) { puts "now in ${pwd()}" }
 on postcd trace arrived        # EVENT NAME FUNCTION
 on --remove postcd trace
 

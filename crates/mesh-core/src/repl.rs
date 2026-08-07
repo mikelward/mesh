@@ -5314,6 +5314,9 @@ fn call_named_for_value(
     if name == "gets" {
         return eval_gets(arguments, last, in_function, shell);
     }
+    if name == "pwd" {
+        return eval_pwd(arguments);
+    }
     if let Some(filter) = entry_filter(name) {
         return eval_directory_entries(name, filter, arguments, last, in_function, shell);
     }
@@ -5651,6 +5654,36 @@ fn status_value(code: &Value) -> Result<Value, String> {
             "status: the code must be an integer, not {}",
             value_kind(&other)
         )),
+    }
+}
+
+/// `pwd()` — the value form, which yields the working directory as a **string**
+/// rather than printing it (`DESIGN.md` §"Built-ins"), so the path composes:
+/// `here = pwd()`, `style(pwd(), fg: blue)`, `pwd():base`.
+///
+/// `$(pwd)` already produced that string, but as a *capture* — a fork, a pipe,
+/// and a trailing-newline trim to read a value the shell was holding all along.
+/// The call is the same answer without the subprocess, which is what puts it on
+/// the prompt path where `PROMPT.md` counts forks.
+///
+/// It takes **no arguments**: the command form's operands are all errors today
+/// (`--physical` included, since there is no logical cwd to be physical *about*
+/// yet), so there is nothing for the call to accept either.
+///
+/// A directory whose name is not valid UTF-8 arrives **lossily**, where the
+/// command form prints its bytes verbatim — a mesh string is UTF-8, the same
+/// boundary [`run_cd_hooks`] hands a path across. The bytes-exact spelling stays
+/// available as the printed form.
+fn eval_pwd(arguments: &[parser::Argument]) -> Result<Value, Step> {
+    if !arguments.is_empty() {
+        return runtime_error(
+            "pwd() takes no arguments; the value form yields the working directory, \
+             so bind it with `here = pwd()`",
+        );
+    }
+    match builtins::working_directory() {
+        Ok(directory) => Ok(Value::String(directory.to_string_lossy().into_owned())),
+        Err(message) => runtime_error(format!("pwd(): {message}")),
     }
 }
 
