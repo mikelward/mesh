@@ -5516,8 +5516,10 @@ and leaves the structural waste in place.
 
 Decided in design discussion; see `docs/DESIGN.md` §"Modifiers".
 
-**Declaring a modifier, applying one, and the regex-literal flag suffix are all
-built.** What remains here is the attached-parentheses reading, below. The
+**Every item in this section is built.** Declaring a modifier, applying one, the
+regex-literal flag suffix and the attached-parentheses reading all landed; what is
+left below is the open *question* about a map subject, which is a design decision
+rather than work. The
 `source` boundary that an earlier revision blocked
 this on is **not reached** — that block came from a load-time check being unable to see
 a sourced library's modifiers, and resolution now happens at call time. The one
@@ -5681,8 +5683,8 @@ spelling.)
                       whose text is valid works. That sentence is narrowed to what
                       holds — a post-hoc flag cannot rescue text that never
                       compiled — so the two sections agree.)*
-    - [ ] **Attached parentheses in an unbraced interpolation stop being text —
-          decided.** `variable_access_prefix` decides whether `(` after `:name` is a
+    - [x] **Attached parentheses in an unbraced interpolation stop being text —
+          decided.** *(Built.)* `variable_access_prefix` decides whether `(` after `:name` is a
           call or literal text by asking `modifier_accepts_arguments`: after an
           argument-free modifier a `(` is ordinary text and always was
           (`"$x:upper(foo)"` is `AB(foo)`), and after an argument-taking one it is a
@@ -5702,6 +5704,17 @@ spelling.)
           modifier is applied rather than at the paren. `"$x:upper (1)"`,
           `"($x:upper)"`, `"$x(foo)"` and every braced form are untouched. See
           `docs/DESIGN.md` §"Modifiers".
+          *Built:* `variable_access_prefix` claims the `(…)` run through a new
+          `parser::paren_end`, `expansion_variable` lowers it to
+          `ModifierStep::InterpolatedArguments`, and `resolve_reference` picks the
+          message by arity — the only place that can, since a declared modifier's
+          arity is the session's to give. **Found building it:**
+          `valid_variable_access` must *not* claim the paren, or a braced
+          `"${e:get(K, D)}"` stops reaching the expression parser and reports the
+          advice it is the answer to. And a heredoc body's reference now runs to
+          the end of the **line** rather than the first space, since an argument
+          list may hold one. An unclosed `(` is not an argument list and keeps the
+          text reading it always had.
   - [ ] **Do not hoist, do not pre-scan, do not restrict placement.** An earlier
         revision of this decision required all three to support a load-time check;
         every one of them is now removed, and reintroducing any is a change to the

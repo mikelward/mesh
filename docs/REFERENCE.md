@@ -2525,15 +2525,15 @@ reading as text. A `[…]` literal's `key:` is a map key, not a chain on the key
 The chain also outranks keyword parsing, so `if:upper` is `IF` rather than the
 start of a conditional; `if :upper` — with the space — is still the keyword.
 
-Inside a `"…"` string a `$…` reference is scanned by its **characters**, which
-stop at a `(`, so a modifier that takes arguments has nowhere to put them there.
-That is a syntax error naming the spelling that does work — `${…}`, whose body is
-an expression:
+Inside a `"…"` string a `$…` reference is scanned by its **characters**, and it
+cannot carry an argument list — so an attached `(` after `:name` is always the
+argument list and always reports. The braced `${…}`, whose body is an expression,
+is the spelling that takes them:
 
 ```text
 puts "$env:get(HOME, none)"
-mesh: syntax error: `:get` takes arguments, which a `$…` interpolation cannot
-pass; brace it instead (`"${x:get(…)}"`)
+mesh: `:get` takes arguments, which a `$…` interpolation cannot pass; brace it
+instead (`"${x:get(…)}"`)
 
 puts "${env:get(HOME, none)}"     # /home/user
 puts "${$env:get(HOME, none)}"    # the same — the `$` is optional here
@@ -2541,10 +2541,18 @@ puts "${$env:get(HOME, none)}"    # the same — the `$` is optional here
 
 The braced body takes the name **sigil-less**, exactly as the argument-free
 `${file:stem}` does, so adding an argument does not change how the head reads.
-Only an *abutting* `(` after a name that **takes** arguments is this shape; after
-an argument-free modifier a `(` is ordinary text, so `"$x:upper(foo)"` is
-`AB(foo)` and `"$x:upper (1)"` keeps its reading. `"$x:nosuch(1)"` reports the
-unknown `:nosuch` instead — the name is resolved before its arguments are reached.
+
+Which complaint you get is the *modifier's*, decided by its arity when the line
+runs — the parser cannot know what a [declared modifier](#declaring-a-modifier)
+takes, and a redeclaration can change it. Bracing advice is given only where
+bracing is the fix: `"$x:upper(foo)"` says `:upper` does not take arguments,
+because `"${x:upper(foo)}"` is equally wrong, and `"$x:nosuch(1)"` reports the
+unknown `:nosuch` — the name is the mistake, not the parentheses.
+
+Only an **abutting** `(` is the argument list. A space makes a separate word
+(`"$x:upper (1)"`), a `(` with no `$` in front of the word was never a chain
+(`"a:get(b)"`), an unclosed one is ordinary text, and `"${x:upper}(foo)"` is the
+spelling for literal text after a chain.
 
 A bare `$name:mod` chain inside a `"…"` string reads the same wherever the string
 sits, so `puts "$x:upper"` and `y = "$x:upper"` both give `AB`, and the error above

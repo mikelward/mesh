@@ -3830,15 +3830,19 @@ fn heredoc_reference_end(text: &str, i: usize) -> Result<Option<usize>, String> 
     }
     // A braced `${…}` is already delimited and absorbs no following access, the
     // same exception the tokenizer's merge step makes. Otherwise the continuation
-    // runs over the *word* after the reference, which is what the tokenizer hands
-    // it: in a command the following text piece is already split at whitespace,
-    // while a body is one long run, so `$xs:len` at end of line would otherwise
-    // offer `len\n…` as the modifier name and be rejected.
+    // runs over the rest of the **line**, which is the boundary a body has: in a
+    // command the tokenizer hands it a piece already split at whitespace, while a
+    // body is one long run, so `$xs:len` at end of line would otherwise offer
+    // `len\n…` as the modifier name and be rejected.
+    //
+    // The line rather than the word, because a modifier's argument list may hold
+    // spaces — `$e:get(HOME, none)` is one reference, and cutting at the first
+    // space left an unclosed `(` that the scan then declined to claim.
     if text[i..end].ends_with('}') {
         return Ok(Some(end));
     }
     let tail = &text[end..];
-    let word = tail.find(char::is_whitespace).unwrap_or(tail.len());
+    let word = tail.find('\n').unwrap_or(tail.len());
     let extra = parser::variable_access_prefix(&tail[..word])
         .map_err(|kind| format!("heredoc: {}", parser::ParseError { kind, span: 0..0 }))?;
     Ok(Some(end + extra))
@@ -4537,8 +4541,20 @@ fn expansion_variable(source: &str, quote: parser::QuoteMode) -> VarRef {
             });
             rest = &rest[close..];
         } else if let Some(value) = rest.strip_prefix(':') {
-            let end = value.find(':').unwrap_or(value.len());
+            let end = value.find([':', '(']).unwrap_or(value.len());
             let name = &value[..end];
+            // An attached `(` is the modifier's argument list, and an unbraced
+            // `$…` interpolation cannot pass one — see `variable_access_prefix`,
+            // which claims it so it reaches here rather than staying as text.
+            if let Some(close) = value[end..]
+                .starts_with('(')
+                .then(|| parser::paren_end(&value[end..]))
+                .flatten()
+            {
+                modifiers.push(interpolated_arguments_step(name));
+                rest = &value[end + close..];
+                continue;
+            }
             // A `from_name` miss is *carried*, never dropped. `expand` implements 35
             // of the 83 modifiers the parser accepts, and dropping the rest let a
             // chain quietly lose a step: `"${s:lines:len}"` answered 3 — the length
@@ -5727,10 +5743,25 @@ fn resolve_reference(vref: &expand::VarRef, shell: &mut Shell) -> Result<Value, 
     };
     let mut value = expand::resolve_value(&head, &shell.vars).map_err(runtime_message)?;
     for step in &vref.modifiers[split..] {
-        value = if shell.funcs.modifier(step.name()).is_some() {
-            run_declared_modifier(step.name(), value, None, 0, false, shell)?
-        } else {
-            expand::apply_modifier_step(value, step).map_err(runtime_message)?
+        value = match step {
+            // Reported, never applied — and this is the one place that can say
+            // *which* report, because a declared modifier's arity is the session's
+            // to give and the step was built without it.
+            expand::ModifierStep::InterpolatedArguments { name, .. } => {
+                let arity = shell
+                    .funcs
+                    .modifier(name)
+                    .map(|def| !def.params.is_empty())
+                    .or_else(|| {
+                        parser::is_builtin_modifier(name)
+                            .then(|| parser::modifier_accepts_arguments(name))
+                    });
+                return runtime_error(interpolated_arguments_message(name, arity));
+            }
+            _ if shell.funcs.modifier(step.name()).is_some() => {
+                run_declared_modifier(step.name(), value, None, 0, false, shell)?
+            }
+            _ => expand::apply_modifier_step(value, step).map_err(runtime_message)?,
         };
     }
     Ok(value)
@@ -5916,6 +5947,39 @@ fn run_modifier_body<'p>(
 fn apply_argument_free_modifier(name: &str, value: Value) -> Result<Value, Step> {
     expand::apply_modifier_step(value, &modifier_step(name))
         .map_err(|error| runtime_message(error.to_string()))
+}
+
+/// The step a `:name(…)` written in an unbraced interpolation spells: a report,
+/// never an application.
+///
+/// The message is the **built-in** vocabulary's answer, chosen by arity so that
+/// bracing advice is given only where bracing is the fix. A declared modifier's
+/// arity is the session's to say, so [`resolve_reference`] replaces this before
+/// the step is applied.
+fn interpolated_arguments_step(name: &str) -> expand::ModifierStep {
+    expand::ModifierStep::InterpolatedArguments {
+        name: name.to_string(),
+        message: interpolated_arguments_message(
+            name,
+            parser::is_builtin_modifier(name).then(|| parser::modifier_accepts_arguments(name)),
+        ),
+    }
+}
+
+/// What `:name(…)` in an unbraced interpolation is told, given whether `name`
+/// takes arguments — `None` where nothing holds the name at all.
+///
+/// A modifier that takes arguments is pointed at the braced form, which works.
+/// One that does not hears the message the braced form itself gives, because
+/// `"${x:upper(foo)}"` is equally wrong and sending the reader there would be
+/// advice that does not run. A name nothing holds hears *that* first: the name is
+/// the mistake, not the parentheses.
+fn interpolated_arguments_message(name: &str, takes_arguments: Option<bool>) -> String {
+    match takes_arguments {
+        Some(true) => parser::interpolated_modifier_arguments_message(name),
+        Some(false) => format!("modifier :{name} does not take arguments"),
+        None => parser::unknown_modifier_message(name),
+    }
 }
 
 /// The step `name` spells, with everything only this layer knows folded in: which

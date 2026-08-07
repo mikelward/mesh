@@ -331,14 +331,6 @@ pub enum ParseErrorKind {
     /// message names both, and it keeps this the loud error it was before value
     /// arguments existed rather than three arguments where one was written.
     GluedValueArgument,
-    /// A modifier given an **argument list** inside a `$…` interpolation —
-    /// `"$env:get(HOME, none)"`. Its own variant because the reader wrote
-    /// something that has a working spelling rather than something mesh cannot
-    /// do: a `$…` reference is scanned by its characters and stops at the `(`,
-    /// so the arguments became literal text and the modifier ran with none. The
-    /// braced form `${env:get(HOME, none)}` takes them, sigil-less like the
-    /// argument-free `${file:stem}`.
-    InterpolatedModifierArguments(String),
     /// Input nested past [`MAX_DEPTH`]. Its own variant because the failure is a
     /// *resource* limit rather than a shape the grammar rejects: the source may be
     /// perfectly well formed, and the honest report is that mesh will not go that
@@ -423,11 +415,6 @@ impl std::fmt::Display for ParseError {
             ParseErrorKind::TooDeep => write!(
                 f,
                 "syntax error: nested too deeply; mesh parses at most {MAX_DEPTH} levels"
-            ),
-            ParseErrorKind::InterpolatedModifierArguments(name) => write!(
-                f,
-                "syntax error: `:{name}` takes arguments, which a `$…` interpolation \
-                 cannot pass; brace it instead (`\"${{x:{name}(…)}}\"`)"
             ),
             ParseErrorKind::UnknownGlobQualifier(text) => write!(
                 f,
@@ -2284,6 +2271,37 @@ pub(crate) fn subscript_end(rest: &str) -> Option<usize> {
     None
 }
 
+/// Where the `(…)` opening at the start of `rest` closes, counting nesting and
+/// skipping quoted text — the parenthesis twin of [`subscript_end`].
+///
+/// Used to claim a modifier's **attached** argument list in an unbraced
+/// interpolation. `None` for an unclosed one, which is not an argument list and
+/// keeps the literal-text reading it always had.
+pub(crate) fn paren_end(rest: &str) -> Option<usize> {
+    let mut quote = None;
+    let mut escaped = false;
+    let mut depth = 0usize;
+    for (offset, ch) in rest.char_indices() {
+        if escaped {
+            escaped = false;
+        } else if ch == '\\' && quote.is_some() {
+            escaped = true;
+        } else if quote == Some(ch) {
+            quote = None;
+        } else if quote.is_none() && matches!(ch, '\'' | '"') {
+            quote = Some(ch);
+        } else if quote.is_none() && ch == '(' {
+            depth += 1;
+        } else if quote.is_none() && ch == ')' {
+            depth -= 1;
+            if depth == 0 {
+                return Some(offset + 1);
+            }
+        }
+    }
+    None
+}
+
 fn valid_variable_access(value: &str) -> bool {
     let name_end = value.find(['.', '[', ':']).unwrap_or(value.len());
     if !valid_name(&value[..name_end]) {
@@ -2309,6 +2327,12 @@ fn valid_variable_access(value: &str) -> bool {
             let end = modifier.find(':').unwrap_or(modifier.len());
             // A name, not a known modifier: which names exist is answered when the
             // chain runs, so the shape is all this can check.
+            //
+            // An attached `(` is deliberately **not** accepted. This decides
+            // whether a `${…}` body is a plain reference, and one carrying an
+            // argument list is not — it belongs to the expression parser, which is
+            // what makes `"${x:join(\"-\")}"` the spelling that works. The unbraced
+            // continuation claims one; see `variable_access_prefix`.
             if !valid_name(&modifier[..end]) {
                 return false;
             }
@@ -2562,24 +2586,25 @@ pub(crate) fn variable_access_prefix(text: &str) -> Result<usize, ParseErrorKind
             if length == 0 {
                 break;
             }
-            // An abutting `(` after a modifier that **can take one** is an argument
-            // list, and this scan has nowhere to put it: it stops at the character,
-            // so the arguments stayed behind as literal text while the modifier ran
-            // with none. That is silent and wrong in the same breath —
-            // `"$env:get(HOME, none)"` answered the whole environment and then failed
-            // on being a list. Reported rather than supported here because the
-            // expression form already takes them, so what the reader needs is the
-            // other spelling.
-            //
-            // Gated on arity, because after an argument-free modifier a `(` is
-            // ordinary text and always was: `"$x:upper(foo)"` is `AB(foo)`, and the
-            // braced form the message points at would reject it.
-            if modifier_accepts_arguments(&value[..length]) && value[length..].starts_with('(') {
-                return Err(ParseErrorKind::InterpolatedModifierArguments(
-                    value[..length].to_string(),
-                ));
-            }
             consumed += length + 1;
+            // An abutting `(` is the modifier's **argument list**, whatever the name
+            // turns out to take, and an unbraced `$…` interpolation cannot pass one
+            // — so it is always claimed and always reported. It used to be gated on
+            // arity: after a modifier the parser knew took none, a `(` was ordinary
+            // text (`"$x:upper(foo)"` was `AB(foo)`). The parser cannot ask that of
+            // a declared modifier, whose arity it does not know and which a
+            // redeclaration can change, so the question moves to where arity *is*
+            // known — the point the modifier is applied. Claimed here so it gets
+            // there (`DESIGN.md` §"Modifiers").
+            //
+            // An **unclosed** `(` is not an argument list, and keeps the literal
+            // text reading it always had.
+            let rest = &value[length..];
+            if rest.starts_with('(')
+                && let Some(close) = paren_end(rest)
+            {
+                consumed += close;
+            }
         } else {
             break;
         }
@@ -7672,11 +7697,27 @@ pub(crate) fn modifier_requires_arguments(name: &str) -> bool {
     )
 }
 
+/// What a modifier given an **argument list** in an unbraced `$…` interpolation
+/// is told, when it is one that takes arguments.
+///
+/// The reader wrote something with a working spelling rather than something mesh
+/// cannot do: a `$…` reference is scanned by its characters and cannot carry an
+/// argument list, so the braced form is the fix. Bracing advice is given only
+/// where bracing *is* the fix — a modifier that takes no arguments hears that
+/// instead, which is why the choice is made where arity is known rather than here
+/// (`DESIGN.md` §"Modifiers").
+pub fn interpolated_modifier_arguments_message(name: &str) -> String {
+    format!(
+        "`:{name}` takes arguments, which a `$…` interpolation cannot pass; \
+         brace it instead (`\"${{x:{name}(…)}}\"`)"
+    )
+}
+
 /// Can `name` take an argument list at all? The superset that adds the ones whose
 /// argument is *optional*, since an abutting `(` after any of them is still the
 /// argument form — `"$x:trimstart(abc)"` asks for the char set, not for literal
 /// parentheses.
-fn modifier_accepts_arguments(name: &str) -> bool {
+pub(crate) fn modifier_accepts_arguments(name: &str) -> bool {
     modifier_requires_arguments(name) || matches!(name, "trimstart" | "trimend" | "bool")
 }
 
