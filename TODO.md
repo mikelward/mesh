@@ -24,12 +24,18 @@ Delete an entry once you have agreed with it or reversed it.
       `Claim::ValueCall` name would have needed a second mechanism for the
       command form. *Reversible:* the entry is one table row; nothing outside
       dispatch reads it.
-- [ ] **`exit` was left alone, which answers the design's open question by
-      omission.** `exit $sh.status` still works because a status renders as
-      decimal at the argv boundary, where `exit` reads its operand — so nothing
-      had to accept a `Status` for the obvious spelling to keep working.
-      *Reversible:* if `exit` ever reads values rather than words, it takes the
-      same arm `fail` just grew.
+- [ ] **`exit` reads a word, not a value, which answers the design's open
+      question by omission.** The question was whether `exit` should accept a
+      `Status` the way `fail` does; nothing had to, because `exit` reads its
+      operand at the argv boundary and a status renders as decimal there, so
+      `exit $sh.status` and `exit status(5)` work without `exit` knowing the
+      type. *Reversible:* if `exit` ever reads values rather than words, it takes
+      the same arm `fail` grew.
+
+      Only the *type* half is a guess. `exit` has since gained the `exit status
+      N` **spelling** — a literal leading word, not a channel word and not a
+      value — but that was asked for rather than guessed, so it is not queued
+      here.
 - [ ] **A value call on a name that resolves to nothing now reports `command
       not found`.** It used to say *a command has no return value*, which was
       also the message for `double(5)` where `double` is a variable holding a

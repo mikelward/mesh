@@ -43,7 +43,9 @@ const TABLE: &[(&str, &str)] = &[
     ),
     ("clip [TEXT ...]", "Copy text to the terminal's clipboard"),
     ("notify [TEXT ...]", "Raise a desktop notification"),
-    ("exit [N]", "Leave the shell"),
+    // Two spellings, because `[status] [N]` would say they are independently
+    // optional and advertise a bare `exit status`, which is refused.
+    ("exit [N] · exit status N", "Leave the shell"),
     ("fg [JOB]", "Resume a job in the foreground"),
     ("bg [JOB]", "Resume a stopped job in the background"),
     ("jobs", "List the jobs"),
@@ -1405,7 +1407,29 @@ fn base64(bytes: &[u8]) -> String {
 /// matching `DESIGN.md` and conventional shells. A non-numeric argument is an
 /// error but still exits; a surplus operand is a likely typo, so the shell
 /// reports it and keeps running rather than exiting on it.
+///
+/// **`exit status N` is accepted** beside `exit N`, so the two ways of leaving
+/// with a status are spelled alike: `return status 5` fills `return`'s status
+/// channel, and someone who has written that writes this next. It disambiguates
+/// nothing — `exit` fills only the status channel, so `exit 5` already says the
+/// whole thing — which is why it is a *spelling* rather than a channel word: it
+/// is read here as a literal leading operand, the way `cd -` and `wait
+/// --timeout` read theirs, not by the parser. `exit status(5)` needs no rule at
+/// all; the call is one word that renders as its code.
 fn exit(args: &[String], last: u8) -> Builtin {
+    let args = match args {
+        [word, rest @ ..] if word == "status" => {
+            if rest.is_empty() {
+                // The word promised a code, as `return status` does. Reported
+                // without exiting, since a spelling that lost its operand is the
+                // same kind of typo a surplus one is.
+                note!("mesh: exit: expected a status code after `status`");
+                return Builtin::Status(1);
+            }
+            rest
+        }
+        _ => args,
+    };
     if args.len() > 1 {
         note!("mesh: exit: too many arguments");
         return Builtin::Status(1);
