@@ -6404,6 +6404,70 @@ unguarded, alongside fish and elvish, and carries a `TODO:` naming this entry.
       Not in scope, unchanged: `in` / `:has` answer `false` on a type mismatch for
       pairs that do not compare; ordering (`$s > 1`) still errors.
 
+- [ ] **Flag patterns in a `match` arm bind their payload.** *(Decided, not built
+      — `DESIGN.md` §"Matching" is canonical.)* Today `--verb=3` matches that
+      exact flag and there is no way to say "the verb flag, whatever its payload",
+      nor to get the payload out. `--verb=$n` looks like the binder and is not: it
+      *reads* `$n`, so it errors when unbound and silently becomes a comparison
+      when bound.
+
+      Three states, three spellings: `--verb` is the bare switch only (`--force`
+      and `--force=true` stay different flags), `--verb=_` takes any payload, and
+      `--verb=n` binds it, keeping its type — the pattern `--n=v` binds the
+      integer `2` against a subject written `--n=2`. (`--n=2` as a *pattern* is a
+      literal; only the binder position keeps a type.)
+
+      **A bare word is a literal in a whole-value position and a binder in a
+      sub-pattern position**, which covers this slot and `[ ]` in one sentence
+      instead of two special cases.
+
+      **The binder takes only the slot's string case.** A bare payload is typed by
+      `expand::typed_scalar` (`expand.rs`:1077) — `true`/`false` to a bool, a
+      canonical integer to an int, everything else to a string — and only the
+      string case binds. Raised by Codex on mikelward/mesh#465, and it is load
+      bearing rather than tidiness: quoting recovers a string payload
+      (`--tag="main"` is the bare form's value) but **not** a typed one, since
+      `--force="true"` is a string-payload flag and `--force=true` a
+      boolean-payload one, distinct as `:repr` shows. Letting `true` bind would
+      leave an exact boolean-payload arm unspellable.
+
+      So the only spelling whose meaning changes is an unquoted *string* payload
+      like `--tag=main`, and **nothing in the repo writes a flag arm at all** — no
+      test, no doc example — so the literal reading being retired is unused.
+
+      Deferred: a glob, regex or alternation in the value slot, under the entry
+      that already defers richer element sub-patterns inside `[ ]`. When that
+      lifts, `["quit" ...rest]` — today `syntax error: expected a name` — should
+      become the literal element this slot already accepts rather than growing a
+      second rule.
+
+- [ ] **`:name` and `:value` read a flag's two halves.** *(Decided, not built.)*
+      `FlagValue` has carried `name` and `value` since the type landed
+      (`vars.rs`:113) with no user-facing way to read either — `:flag` builds one
+      and nothing takes it apart, so `$x:value` reports "`:value` is not a
+      modifier". `--tag=v2` gives `"tag"` and `"v2"`, the payload keeping its own
+      type as it does everywhere else.
+
+      These are for a flag held outside a match; arms do not need them, since the
+      binder above works where an extractor cannot — `match $args:get(0) {
+      --verb=n => … }` has no name to hang `:value` off.
+
+      **`:value` on a bare switch reports.** A bare flag has no payload, mesh has
+      no null, and an empty string would be exactly the silent absence the
+      language refuses elsewhere. No soft form is needed: `--verb` against
+      `--verb=_` is how you branch on the two states before reading one.
+
+      **The names are not free — reserving them retires user modifiers of the same
+      name.** `func _s:name()` and `func _s:value()` are legal today (verified),
+      and `modifier_definition_name_problem` refuses every name
+      `is_builtin_modifier` knows (`repl.rs`:1566), so both start reporting
+      `` `:value` is a built-in modifier and cannot be redeclared `` the day this
+      lands. Raised by Codex on mikelward/mesh#465; recorded rather than resolved,
+      since it is the standing cost of any addition to the modifier vocabulary.
+      The two neighbors that looked like collisions are not: `return value X` is a
+      channel word after `return`, and a capture record's `.value` is a field —
+      neither is a modifier, unlike `:type`, which the file-type question owns.
+
 - [ ] **Ordering across types is not settled, and its fall-through is a bug.**
       `$s > 1` errors, as `1 > "1"` does, so equality and ordering now at least
       agree that a type mismatch is loud. What is *not* settled is why ordering

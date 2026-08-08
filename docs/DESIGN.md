@@ -4260,6 +4260,8 @@ Arm patterns, in one vocabulary:
 | `/re/` | a **regex** | slash-delimited; this is mesh's whole regex story (no separate `=~`) |
 | `a \| b` | either | alternation |
 | `1..=9` | a **range** | the `..` / `..=` from slices |
+| `--force`, `--n=2` | a **flag** | exact, payload type included — `--n=2` and `--n='2'` are different arms |
+| `--verb=n` | a flag, **binding** the payload | `n` is a binder, not a literal; `--verb=_` takes any payload — see the flag-pattern rule below |
 | `_` | anything | the default; put it last |
 
 Rules:
@@ -4273,7 +4275,7 @@ Rules:
   dispatch machinery, like `:dedup` and list `-`: under first-match traversal
   it needs an answer for every pair, so it uses the total equality those
   share rather than the `==` operator's refusals. The `Flag` type is where the
-  two visibly part — `$x == "--help"` refuses on a flag, while a `match` with
+  two visibly part: `$x == "--help"` refuses on a flag, while a `match` with
   both a `--help` arm and a `"--help"` arm keeps working and takes the right
   one, since naming both arms is someone deliberately telling them apart.
   Stated here so the `(==)` in the table below is not read as importing the
@@ -4307,6 +4309,91 @@ Rules:
   (`[verb ...rest] if $verb == "quit"`). Richer element sub-patterns (a literal /
   glob / `/re/` element, or nesting) and **map-shape** patterns (`[k: v]`) stay
   **deferred** until the need is real.
+- **Flag patterns bind their payload** *(decided, not yet built)*. A flag has three
+  states and each gets its own spelling, so none of them has to be inferred:
+
+  ```mesh
+  match $a {
+    --verb       => { set-verbosity 1 }     # the bare switch, no payload
+    --verb="max" => { set-verbosity 9 }     # that exact payload
+    --verb=n     => { set-verbosity $n }    # any other payload, bound as `n`
+  }
+  ```
+
+  Arms are first-win, so the exact payload precedes the binder — a binder catches
+  every valued flag and would shadow anything below it. `--verb=_` is the fourth
+  spelling, the binder's discard form, for when the payload's presence is the
+  whole question:
+
+  ```mesh
+  match $a { --verb=_ => { set-verbosity 1 } ; --verb => { usage() } }
+  ```
+
+  A bare `--verb` matches **only** the bare switch: `--force` and `--force=true`
+  are different flags and stay so (see the `Flag` entry in `TODO.md`), so nothing
+  here collapses the two. The bound payload **keeps its type**: the pattern
+  `--n=v` binds the integer `2` against a subject written `--n=2`, and the string
+  `"2"` against `--n='2'`. That is the point of binding rather than reading text
+  back off the flag. (`--n=2` as a *pattern* is a literal, per the rule below —
+  only the binder position is being described here.)
+
+  **A bare word is a literal in a whole-value position and a binder in a
+  sub-pattern position.** That one sentence covers both this slot and `[ ]`,
+  replacing what would otherwise be two special cases: `--tag=main` binds for the
+  same reason `[start arg]` binds both elements, and a top-level `main` arm is a
+  string for the same reason it always was.
+
+  **The binder takes only the slot's *string* case.** A bare payload word is typed
+  exactly as any bare word is — `true` and `false` are booleans, a canonical
+  integer is an int, everything else is a string — and **only that last case
+  binds**. So `--n=2` stays the integer literal and `--force=true` the boolean;
+  `--tag=main` is the one that becomes a binder. A quoted word and `_` keep their
+  own readings, unchanged.
+
+  That line is what keeps every typed payload spellable, and it is not a
+  refinement for tidiness. **Quoting is a real escape for a string but not for a
+  typed payload**: `--tag="main"` is the same value as the bare form, while
+  `--force="true"` is a *string*-payload flag — a different value from
+  `--force=true`, as `:repr` shows (`--force='true'` against `--force=true`). A
+  rule that swallowed `true` into the binder would therefore leave an exact
+  boolean-payload arm with no spelling at all. The string case is the only one
+  quoting can give back, so it is the only one the binder may take.
+
+  **Quoting is otherwise the escape mesh already teaches.** The [word-shape
+  rule](#tests-and-comparisons) says a bare word in a match slot may
+  be read as a pattern and quoting forces literal text; `--tag="main"` is that
+  rule applied one level in. So the binder costs only the *unquoted* spelling of a
+  literal **string** payload, never the ability to match one.
+
+  The value slot takes a binder, `_`, or a literal for now. A glob, a regex or an
+  alternation there (`--out=*.txt`, `--level=/^\d+$/`) is **deferred** under the
+  same entry that defers richer element sub-patterns inside `[ ]` — and when that
+  is lifted, `["quit" ...rest]` should become the literal element this slot
+  already accepts, rather than the two growing separate rules.
+
+  Binding in the arm is what makes this work on a subject that has no name:
+  `match $args:get(0) { --verb=n => … }` needs nowhere to hang an extractor. For a
+  flag held *outside* a match, **`:name` and `:value`** read the two halves
+  (`--tag=v2` gives `"tag"` and `"v2"`) — `FlagValue` has carried both fields
+  since the type landed with no way to read either, and `:flag` builds one with
+  nothing to take it apart.
+
+  **`:value` on a bare switch is an error**, not `""` and not a sentinel. A bare
+  flag genuinely has no payload — that is the two-state distinction the type
+  exists to keep — and [mesh has no null](#variables-and-assignment), so inventing
+  an empty string here would be the silent-absence answer the language refuses
+  everywhere else. Branching on the two states is the arm vocabulary above
+  (`--verb` against `--verb=_`), which is why `:value` does not also need a
+  soft form: by the time you are reading a payload you have already established
+  there is one.
+
+  **Reserving these two names retires any user modifier of the same name**, which
+  is a real cost rather than a free pick. `func _s:name()` and `func _s:value()`
+  are legal today; `modifier_definition_name_problem` refuses every name
+  `is_builtin_modifier` knows (`repl.rs`:1566), so both declarations start
+  reporting `` `:value` is a built-in modifier and cannot be redeclared `` the day
+  this lands. That is the general cost of adding to the modifier vocabulary, not
+  something specific to these two — recorded so the choice is made knowing it.
 
 **`~` and `match` share one pattern vocabulary, but `~` is a strict subset** *(current
 M3 behavior)*. For a **string** subject and a **glob or regex** pattern,
@@ -4831,8 +4918,8 @@ on a list is an error naming `$xs:len > 0`, not a length test, alongside `if 0`
 and `if ""`); why an option value that evaluates to anything other than one
 string is reported rather than joined or dropped (`f(--tag=*.txt)` — raised on
 mikelward/mesh#361); and why comparing a flag to its own text form refuses
-rather than answering `false` *(decided, not yet built — the `Flag` type entry
-in `TODO.md`)*: the string was written *because* someone believed it was the
+rather than answering `false` *(built — the `Flag` type entry in `TODO.md`)*:
+the string was written *because* someone believed it was the
 flag, so a quiet `false` reads as "not that flag" when the truth is "wrong
 question."
 
