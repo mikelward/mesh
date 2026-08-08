@@ -128,22 +128,55 @@ that depend on those later features are not an M3 compatibility promise.
 Work continues past M3 on this track rather than as a new milestone. Landed so
 far, each documented in [`docs/REFERENCE.md`](docs/REFERENCE.md):
 
-- **Script invocation** — `mesh script.mesh a b c`, `mesh -c "…"`, `mesh -s`,
-  shebangs, and the `$sh.args` / `$sh.name` slice of the `$sh` namespace, so mesh
-  is no longer stdin-only.
-- **Fuzzy, case-insensitive completion** (`nucleo`), and a four-layer source for
+- **Invocation** — `mesh script.mesh a b c`, `mesh -c "…"`, `-s`, `-i`, `-n`,
+  `-l`, `--rcfile` / `--norc`, shebangs, the startup files under
+  `$XDG_CONFIG_HOME/mesh`, and the `$sh.args` / `$sh.name` / `$sh.origin` /
+  `$sh.source` slice of the `$sh` namespace, so mesh is no longer stdin-only.
+- **Fuzzy, smart-case completion** (`nucleo`), and a four-layer source for
   what it offers: a curated spec file, else the command's manual page, else a
   bounded `--help` probe, else files and directories.
-- **The status-sensitive prompt** with composable lifecycle hooks
-  (`prompt`, `on`), including the **directory pair** `precd` / `postcd`
-  that brackets every actual `cd`.
-- **Regex and glob `~` tests**, and `match` with regex arms.
-- **The environment as values** — `$env.KEY`, `export`, and the path-type entries
-  that split on `:` and rejoin exactly.
-- **`type`** — the name lookup every shell spells differently, with bash's flags.
+- **The status-sensitive prompt** with composable lifecycle hooks, registered
+  through `on` or the `$sh` event maps: `preprompt`, `preexec`, `postexec`, the
+  **directory pair** `precd` / `postcd` that brackets every actual `cd`,
+  `jobdone`, and `exit`, which runs on every path that *leaves* the shell — an
+  interactive `exit`, end of input, a script, a `-c` string, an `exit` in a
+  startup file — but not where there is no shell left to run it: a successful
+  `exec` replaces the process image, and a signal that kills the shell kills the
+  handler with it. The default window `title` ships as a mesh prelude rather
+  than as Rust.
+- **Two more value types.** A status is a value — `status(5)`, `$sh.status`, and
+  a comparison against an integer by its code — and a written `--name` is a
+  flag, with `--` a terminator value that travels to the command that asked for
+  it.
+- **The modifier vocabulary** — the postfix chain (`:base`, `:len`, `:int`, …),
+  the path walks (`:real`, `:tilde`, `:url`, and `:ancestors`, which turns a
+  path into the list to search upward through), the argument-taking modifiers
+  (`:split`, `:join`, `:get`, `:has`, and the affix, replace, and list-building
+  families), the higher-order `:map` / `:filter` / `:each`, and **modifiers a
+  user declares**: `func _s:name()` defines one, `$x:name` applies it.
+- **Functions as values** — lambdas, `&name` references, explicit capture with
+  `with (…)`, `wrapper func` for a function that forwards flags verbatim, and
+  `alias` as its terse spelling. A function's return value is separate from its
+  exit status, and `fail` leaves the same unit nonzero.
+- **The environment as values** — `$env.KEY`, `export`, the path-type entries
+  that split on `:` and rejoin exactly, a computed key (`$env[$name] = …`, and
+  `unset` for it), the `NAME=value cmd` prefix, and `with NAME=value { … }`,
+  which restores what it set.
+- **Bounded waiting** — `timeout DURATION COMMAND` and `wait --timeout`, so a
+  wait can give up without giving up on the job; `disown` gives one up entirely.
+- **More builtins** — `command`, `exec`, `type` (the name lookup every shell
+  spells differently, with bash's flags), `gets` including `--nulls` and the
+  value form, `clip`, `notify`, `print`, `status`, `title`, and the
+  paren-called `glob()` / `files()` / `dirs()`.
+- **Regex and glob `~` tests**, `match` with regex arms, and a `/…/` regex
+  literal read to its own closing slash.
+- **Diagnostics that say where** — a syntax error reports line and column, deep
+  input reports stack exhaustion instead of aborting, and a sourced file can
+  report that it broke.
 
-Still ahead: `$sh.complete` for programmable completion, session management
-(shpool/tmux), and the rest of the `DESIGN.md` surface.
+Still ahead: `$sh.complete` for programmable completion, a line-buffer API for
+keybindings and widgets, session management (shpool/tmux), and the rest of the
+`DESIGN.md` surface.
 
 ---
 

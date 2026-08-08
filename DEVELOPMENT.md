@@ -114,8 +114,12 @@ integration tests need no terminal. The rest of the interactive stack named in
 | `nu-ansi-term` | color for the prompt and the completion menu | MIT | **in use** |
 | `unicode-segmentation` | grapheme-aware string handling | MIT/Apache-2.0 | **in use** |
 | `unicode-width` | display width, so a prompt lines up | MIT/Apache-2.0 | **in use** |
-| `crossterm` | terminal control (pulled in by `reedline`) | MIT | transitive |
+| `crossterm` | terminal control and key events | MIT | **in use** |
 | `nucleo-matcher` | fuzzy completion | MPL-2.0 | **in use** |
+
+`crossterm` was transitive until the line editor needed to name its key-event
+types; it is now a direct dependency pinned to the version `reedline` itself
+builds against, so the two see one set of types.
 
 Add a dependency only when a milestone calls for it; prefer a small, focused
 crate over a framework. The repo is licensed `MIT OR Apache-2.0`; keep the
@@ -193,13 +197,24 @@ cargo clippy --all-targets -- -D warnings        # CI gate
 
 ## Continuous integration
 
-[`.github/workflows/ci.yml`](.github/workflows/ci.yml) runs fmt, clippy, the
-test suite, and the session-start hook's own tests for every push to `main` and
-every pull request, plus a second job building against the MSRV floor. Every
-job runs on `ubuntu-latest`: the FreeBSD and macOS coverage is `cargo check`
-against those targets — cross-compiled, Zig supplying the macOS C toolchain —
-rather than a runner of that platform, so it catches type errors but never
-executes a test there.
+[`.github/workflows/ci.yml`](.github/workflows/ci.yml) has three jobs. **`check`**
+is fmt, clippy, the test suite, shellcheck, and the three shell suites below; it
+also cross-checks FreeBSD and macOS. **`msrv`** builds against the MSRV floor
+read out of `Cargo.toml`. Both run for every push to `main` and every pull
+request. **`stable`** is an early warning — the same clippy and tests on the
+floating stable toolchain, so a lint or behavior change arriving in a later Rust
+is seen before the pin moves to it — and it runs on **pushes to `main` only**:
+on a pull request an upstream release would turn someone's unrelated PR red,
+which teaches everyone to ignore it.
+
+Every job runs on `ubuntu-latest`: the FreeBSD and macOS coverage is `cargo
+check` against those targets — cross-compiled, Zig supplying the macOS C
+toolchain — rather than a runner of that platform, so it catches type errors but
+never executes a test there.
+
+[`.github/workflows/release.yml`](.github/workflows/release.yml) is separate: it
+publishes the Linux x86-64 binary for every push to `main`, versioned by commit
+count (see the README's *Releases*).
 
 ## Supported systems
 
@@ -224,13 +239,15 @@ mesh/
 ├── Makefile                # one-line entry points over cargo (make install, make check)
 ├── makefile_test.sh        # asserts those entry points match the docs and CI
 ├── rust-toolchain.toml     # pins an exact release + rustfmt + clippy
-├── .github/workflows/ci.yml
+├── .github/workflows/ci.yml       # fmt, clippy, tests, cross-checks, MSRV, stable
+├── .github/workflows/release.yml  # the per-push Linux x86-64 binary
 ├── crates/
 │   ├── mesh/               # thin shell executable
 │   │   ├── Cargo.toml
 │   │   ├── src/main.rs     # calls mesh_core::run
 │   │   ├── tests/cli.rs    # end-to-end tests driving the built binary
-│   │   └── tests/docs.rs   # parses every mesh example in the documentation
+│   │   ├── tests/docs.rs   # parses every mesh example in the documentation
+│   │   └── tests/transcripts.rs # runs every documented <pre> transcript
 │   ├── mesh-core/          # reusable shell implementation
 │   │   ├── Cargo.toml
 │   │   ├── src/
@@ -242,11 +259,15 @@ mesh/
 │   │   │   ├── environ.rs  # $env.KEY, and the path-type entries that split on `:`
 │   │   │   ├── options.rs  # $sh.options — the settings, shared with the line editor
 │   │   │   ├── funcs.rs    # user-defined function store (name → params + body)
+│   │   │   ├── hooks.rs    # the lifecycle event registry behind `on` and $sh.<event>
 │   │   │   ├── whence.rs   # what a name is — the report `type` prints
 │   │   │   ├── completion.rs # the layered spec resolver behind Tab
 │   │   │   ├── reaper.rs   # the one place that calls waitpid; SIGCHLD handling
+│   │   │   ├── stack.rs    # makes a stack overflow report rather than abort
+│   │   │   ├── url.rs      # the file: URL encoder shared by :url and OSC 7
 │   │   │   ├── builtins.rs # cd, pwd, puts, type, … + job-builtin recognition
-│   │   │   └── exec.rs     # launch external commands + pipelines/redirection
+│   │   │   ├── exec.rs     # launch external commands + pipelines/redirection
+│   │   │   └── prelude.mesh # mesh's shipped defaults, written in mesh
 │   │   └── tests/
 │   │       ├── help/       # captured `--help` output, verbatim (see its README)
 │   │       └── man/        # captured `man` output, verbatim (see its README)
@@ -258,8 +279,10 @@ mesh/
 ├── ROADMAP.md              # milestones M0 → beyond
 ├── TODO.md                 # current-milestone checklist
 └── docs/                   # DESIGN.md (vision + language design, the "why/what"),
-                            # TOUR.md, REFERENCE.md (implemented), INTRO/PROMPT (design),
-                            # INTEGRATION.md (external tools)
+                            # TOUR.md, REFERENCE.md (implemented), HOOKS.md (the
+                            # lifecycle events), INTRO/PROMPT (design),
+                            # INTEGRATION.md (external tools), COMPARISON.md and
+                            # UPSTREAM.md (mesh against the other shells)
 ```
 
 ### How the code fits together
@@ -279,6 +302,27 @@ lines after it. A function call runs the body in a fresh function-local `vars`
 scope. A session `vars` store (global scope plus a stack of function-local scopes)
 and the `funcs` store persist across lines; the loop tracks the last exit status and
 returns it as the process exit code at EOF.
+
+Two things run around that loop, for a session that reaches it at all. The first
+is `prelude.mesh` — mesh's own defaults, written in mesh and embedded in the
+binary — evaluated ahead of the startup files, so a default like the window title
+is a hook a user can inspect and replace rather than Rust they cannot reach.
+`run_startup_files` takes the session's **resolved** interactivity as a parameter
+and evaluates the prelude only when that is true — the interactive path passes a
+literal `true`, the batch paths pass the `-i` flag through — so **interactivity
+is the condition, not the input shape**: an ordinary terminal session gets the
+prelude, a plain script, `-c` string, or piped run does not, and each of those
+under `-i` does. The guard is there because everything the prelude registers
+fires from the interactive loops, so a batch run would pay to parse it and never
+use it. (`-n` is upstream of all of this — it checks syntax and runs nothing,
+prelude and startup files included.) The `hooks` registry then fires the lifecycle
+events at their points in the loop: `preprompt` before a line is read, `preexec`
+and `postexec` around running it, `precd` / `postcd` around an actual `cd`,
+`jobdone` when a background job finishes, and `exit` on the way out. `run_logout`
+is the one function every *exit* path arrives at, which is why the drain, the
+title clear, and the `exit` hook all live there — and it is equally why a
+successful `exec` and a fatal signal run none of them: neither is an exit path,
+because neither leaves a shell to return to it.
 
 The shell internals live in the `crates/mesh-core` library; `crates/mesh` is a
 thin executable that calls its public `run` entry point. This keeps parser and
