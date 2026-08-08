@@ -6808,6 +6808,90 @@ to avoid" rather than promising the latter as done.
   - **Map patterns are out of scope here** — `[name: _n] = $m` is
     [deferred on its own terms](#destructuring), and a signature can only follow
     wherever that lands.
+- **A flat soft bind — open; leaning `= … else { … }`, with the dangling-`else`
+  question below to answer for whichever spelling wins.** The
+  [strict/soft pairs](#error-handling) give a soft bind, but only as a
+  **condition**, so each one costs a level of nesting and the body drifts right:
+
+  ```
+  for line in $(cmd):lines {
+    if [_key _val] = $line:match(/(\w+): (.*)/) {
+      if [_host _port] = $_val:match(/(.*):(\d+)/) {
+        ...                                        # two levels in, and the real work starts here
+      }
+    }
+  }
+
+  for line in $(cmd):lines {                       # the proposal
+    [_key _val]   = $line:match(/(\w+): (.*)/) else { continue }
+    [_host _port] = $_val:match(/(.*):(\d+)/)  else { continue }
+    ...                                            # flat, and both binds are live
+  }
+  ```
+
+  The borrow is Swift's `guard let` and Rust's `let … else`: a bind that escapes
+  into the **current** scope on success, where the failure block must *diverge*.
+
+  | Option | For | Against |
+  | --- | --- | --- |
+  | **`[a b] = expr else { … }`** *(leaning)* | No new keyword — `else` is already in the language, and this is Rust's `let … else` minus the `let` mesh does not have; reads as "bind these, else do that"; stays in the postfix grain of the [guard modifier](#conditionals-if-is-an-expression) | `else` appears with no preceding `if`, which has to be parsed and taught; an assignment statement grows a trailing block, which nothing else does. *(The dangling `else` below is a cost of the construct, not of this spelling — the `guard` row carries it too.)* |
+  | **`guard [a b] = expr else { … }`** | The keyword announces the diverging form *before* a long RHS, so it cannot hide at the end of the line; Swift precedent | A new keyword for something the plain form already spells; this document already uses *guard* for the postfix `if` / `unless` modifier, so the word would name two different things |
+  | **Elixir-style `with`, many binds and one `else`** | One block handles any of N failures — the flattest form for a parse-this-record function | A whole new block construct; the `else` cannot say *which* bind failed without inspecting; furthest from anything else in the language |
+  | **Skip it** | Nested `if`-binds already work and are already soft | Rightward drift on the parse-a-line loop, which is the exact shape [`INTRO.md`](INTRO.md) advertises |
+
+  **The dangling `else`, which neither spelling escapes.** A lone `if`
+  is a valid expression and yields `""` when false
+  ([Conditionals](#conditionals-if-is-an-expression), *decided: lenient*), so in
+
+  ```
+  [x] = if $cond { [v] } else { continue }
+  ```
+
+  the `else` can complete the right-hand `if` **or** be the soft-bind fallback,
+  and both readings parse. That is precisely the shape
+  [*an ambiguous spelling is an error*](#error-handling) refuses to resolve by
+  picking a winner, so the `else` option is not free: it needs an explicit
+  association rule, or a grouping requirement on a right-hand side that could take
+  an `else` of its own. Rust meets the same wall with `let … else` and answers by
+  restricting what the right-hand side may be.
+
+  **The keyword does not escape this**, which is worth writing down because
+  assuming it does is the natural mistake:
+  `guard [x] = if $cond { [v] } else { continue }` is ambiguous in exactly the
+  same way. A leading keyword marks where the construct *starts*, not where its
+  right-hand side *ends*, so the trailing `else` is still contested between the
+  inner `if` and the fallback. Requiring an `else` after every `guard` does settle
+  it — with one `else` present it has to be the guard's — but that *is* an
+  association rule, and one with a sharp edge: it silently takes the `else` a
+  reader wrote for the inner `if`. So the dangling `else` has to be answered for
+  **either** spelling, and the choice between them turns on the other rows of the
+  table rather than on this one.
+
+  Consequences worth stating:
+
+  - **The `else` block must diverge** — `return`, `fail`, `break`, `continue`,
+    `exit`. If it can fall through, execution reaches the next line with the names
+    unbound, which is the silent empty mesh refuses everywhere else. Swift and Rust
+    both require it. **But checking the *form* is not the guarantee it looks
+    like**, and the gap has to be closed before this is safe to build: `exit
+    status` with no code and `fail 0` both parse as diverging forms and both are
+    refused at run time *without leaving* — `exit status` "does not end the shell",
+    and `fail 0` is refused outright. A fallback built from either reports a
+    recoverable error and then falls through to exactly the unbound state the rule
+    exists to prevent. So either the fallback is restricted to forms that cannot
+    fail that way, or a fallback that *completes* is itself an error. That choice
+    is part of the proposal, not an implementation detail under it.
+  - **It applies to binding forms, not to lookups.** `[k v] = $s:match(…)` and a
+    plain list destructure are the candidates. `$xs[i]` and `$m.key` already have
+    `:get(…, default)` as their soft twin, and giving them a second one would be
+    the two-spellings problem for no gain.
+  - **It does not overlap the postfix guard.** `return unless $args:len > 0`
+    *tests* and skips a statement; this *binds* and guards the rest of the block.
+    Same instinct, different scale — which is the argument for keeping `guard` as
+    the postfix modifier's name and spelling this one with `else`.
+  - It adds a third column to the strict/soft table in
+    [Error handling](#error-handling): strict (errors), soft-nested (`if`-bind),
+    soft-flat (`else`-bind).
 - **Hook API — decided** ([Hooks and the prompt](#hooks-and-the-prompt)): hook
   points are insertion-ordered maps of named callables (the key is the handler's
   identity → re-source-safe, individually removable). Events `preprompt`,
