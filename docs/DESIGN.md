@@ -6656,6 +6656,101 @@ to avoid" rather than promising the latter as done.
   `if` and `match` through the same `eval_body` a `func` body uses, so the three
   agree: output streams, and the value is the last thing that produced one. `$(…)` is
   the thing that means "capture", and it still does.)*
+- **A `proc` / `func` split — open; leaning add `proc` only and leave `func`
+  alone.** The split already exists; it is at the **call site** rather than the
+  declaration. [Calling for a value](#calling-for-a-value-and-lambdas) chooses by
+  mode — `f arg` takes words, streams stdout, and its result is a status; `f(arg)`
+  takes expressions and its result is the return value; `:capture` is there for
+  when you genuinely want both channels. The open question is whether that choice
+  belongs to the **caller** or to the **declaration**. YSH (Oils) puts it at the
+  declaration: a `proc` takes words and answers with a status, a `func` takes typed
+  arguments and answers with a value. Tcl's `proc` is already cited
+  [above](#functions) for its signature vocabulary, so the word arrives with the
+  right connotation — a procedure, run for its effect.
+
+  Two shapes land on opposite sides, which is the argument in one screen: `ips()`
+  in [`INTRO.md`](INTRO.md) writes with `puts` and has no return value anyone
+  wrote, while a string-building helper returns a value and writes nothing.
+
+  ```
+  proc ips() {                          # words in, bytes out, a status back
+    for line in $(ip -o a sh up primary scope global):lines {
+      [_ _iface _afam _addr ..._rest] = $line:words
+      puts $_iface $_addr if $_afam ~ inet*
+    }
+  }
+
+  func path-string() {                  # values in, a value out
+    return $env.PATH:join(":")
+  }
+  ```
+
+  **"No return value anyone wrote" is not the same as none, and the gap is itself
+  an argument for the split.** `ips()` ends in a `for`, and a `for` collects a
+  value per completed pass into a list — `eval_for_passes` and
+  `run_ast_for_passes` in `repl.rs`, deliberately, so that a `for`'s result is the
+  aggregate rather than its last pass. Calling it for a value therefore hands back
+  a list of per-pass results, not nothing. Nobody wrote that aggregate and nothing
+  names it. Under the union **every** function carries a value channel whether or
+  not its author meant to fill one, so "what does this return?" has no answer
+  short of reading the body down to its last statement — which is precisely what a
+  declaration keyword would answer in one word.
+
+  | Option | For | Against |
+  | --- | --- | --- |
+  | **Keep mode-at-call-site** (today) | One definition serves both — `co main --amend` at the prompt and `x = co(main, amend: true)` in a script; nothing to rename; the caller asks for the channel it needs | The two argument grammars stay a *mode*, which is exactly the comma question [below](#open-questions); the `:capture` "doing two jobs at once" smell is a lint a reader notices, not something the language knows |
+  | **Split at the declaration** (both keywords narrow) | Argument grammar becomes a property of the callee — decided once, printable by `help`; `return` / `fail` divide cleanly along the two channels; a func with no byte channel is the tractable subset for the [static checks](../TODO.md) a resolver pass currently cannot do | `func` **narrows**, so most existing `func`s are procs — a rename across `TOUR.md`, `REFERENCE.md`, this file, and every ported config; loses the one-definition-two-ways affordance; two keywords where there was one, against *concise* |
+  | **Add `proc`, leave `func` the union** *(leaning)* | Purely additive — nothing existing breaks and no doc has to be renamed on day one; names the majority case (writes bytes, returns no value) and every external; `func` narrows by attrition as value-returning ones get written deliberately; if the split does not earn its keep the cost was one keyword, not a restructuring | For a while two spellings overlap, which is the redundancy [the `echo` / `read` question](#open-questions) calls the worst of its three outcomes — the difference is that this one is a *migration* with an end state, not a permanent pair |
+
+  *Rejected spelling: `sub` / `fun`.* `sub` is Perl's and Raku's word for the
+  **value-returning** thing, so it inverts the intended meaning for a reader
+  arriving from either.
+
+  **"Purely additive" holds only if `proc` is a *contextual* keyword.** Today the
+  word is an ordinary name: `func proc(..._args) { … }` is a legal definition and
+  `proc x` a legal call, so claiming it unconditionally the way `func` is claimed
+  would turn that call into declaration syntax or an error — a compatibility break,
+  which is exactly what the option is chosen for avoiding. mesh already has the
+  mechanism, and **`fork` is the precedent to copy** — the subshell keyword only
+  before a block, an ordinary command word otherwise, so `func fork() { … }` stays
+  reachable and `type fork` reports the function beside the keyword. `global` /
+  `unset` / `export` are *not* precedents here, though they read like ones: as
+  [`:kind`](#modifiers) sets out above, each claims the word wherever an
+  assignment does not follow, so no literal `global x` ever reaches a function.
+  They are keywords that merely look contextual. `proc` has to work the way `fork`
+  does — recognizing a complete declaration shape rather than the bare word — and
+  that requirement belongs in the option rather than being assumed by it.
+
+  **An argument for the split that does not survive, recorded so it is not made
+  again: "an external would simply be a proc, so `grep(foo)` stops being an
+  exception."** The [status decision](#open-questions) already got there without
+  any split — an external's result *is* a `Status`, so `grep(foo)` answers
+  `Status(1)` rather than erroring, and `f` / `$(f)` / `f()` mean the same three
+  things for an external as for a function
+  ([Calling for a value](#calling-for-a-value-and-lambdas)). That removes a reason
+  to split. **The uniformity is on the *result* side only, though, and the limit
+  is the interesting part:** a function takes a bare list as one typed positional
+  where an external still needs it spread or joined, so an external's *arguments*
+  are words in a way a func's are not. So "an external is a proc you did not
+  write" is a fair shorthand for the result channel and an overstatement anywhere
+  else — and what survives the correction is an **argument-grammar** asymmetry,
+  which is the axis the split is actually about.
+
+  **The wrinkle to resolve before `func` could ever narrow: hook slots hold both
+  kinds.** `$sh.prompt.dir = func() { … }` returns a styled string — a genuine
+  func. `$sh.postcd.fetch = func(_previous) { vcs auto-fetch & }` runs for effect
+  and has no return value anyone wrote — the same incidental channel as `ips()`
+  above, since a bare background statement records its launch `Status` as the
+  result (`run_recorded` in `repl.rs`: "for anything else — a command, a
+  background statement — the status *is* the result"). A proc by nature, stored in
+  a variable. *(The parameter is
+  not decoration: `postcd` supplies the previous directory and the binder is
+  exact, so a zero-parameter handler is rejected at dispatch — see
+  [`HOOKS.md`](HOOKS.md), which works through that same line.)* So either procs are
+  first-class values the way funcs are, or each hook point declares which kind its
+  slot takes and `$sh.prompt.*` and `$sh.postcd.*` answer differently. That is the
+  sharpest question the split raises. It does **not** block adding `proc`, which is
+  why the leaning is to add it and defer the rest.
 - **Hook API — decided** ([Hooks and the prompt](#hooks-and-the-prompt)): hook
   points are insertion-ordered maps of named callables (the key is the handler's
   identity → re-source-safe, individually removable). Events `preprompt`,
