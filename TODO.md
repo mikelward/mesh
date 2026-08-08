@@ -6307,9 +6307,14 @@ unguarded, alongside fish and elvish, and carries a `TODO:` naming this entry.
       behave exactly as its text.
 
       The refusal is in the **operator**, not in `Value::eq`, and that is forced:
-      `:dedup` is a `HashSet<Value>`, map keys hash to agree with it, and a
-      `match` literal arm is `==` under first-match traversal — none can accept a
-      fallible answer. `DESIGN.md` §"Comparison across types" is canonical.
+      `:dedup` is a `HashSet<Value>` and a
+      `match` literal arm is `==` under first-match traversal — neither can accept
+      a fallible answer. `DESIGN.md` §"Comparison across types" is canonical.
+      *(This sentence used to list map keys as a third case "hashing to agree"
+      with `Value::eq`. That was never true — `Value::Map` is
+      `Vec<(String, Value)>` (`vars.rs`:41) and scalar keys render to text before
+      lookup — so it is struck rather than carried forward. Raised by Codex on
+      mikelward/mesh#465.)*
 
       The reason `Status` gets no exception is now written down and is stronger
       than the "the defect is general" one recorded with the status decision: a
@@ -6319,12 +6324,85 @@ unguarded, alongside fish and elvish, and carries a `TODO:` naming this entry.
       *a type projecting into more than one other type gets no cross-type
       equality* — is what leaves `1 == 1.0` open rather than answered.
 
-- [ ] **`match` arms still compare totally, so the seam is real.** `$s == 0`
-      reports while `match $s { 0 => … }` is silently skipped. Widening the
-      refusal to arms would break heterogeneous `match`, so the scope was left at
-      the operator — narrowing later accepts strictly less, so nothing written
-      against today's rule breaks. Decide whether arms should refuse once there
-      is a use that wants it. Same for `in` / `:has`, which answer `false`.
+      ⚠️ **The last paragraph is superseded** — kept because it describes what
+      shipped, which is still what the binary does. "Respecting both is
+      contradictory" is right; "so respect neither" does not follow, and
+      respecting exactly one (the code, which is lossless) breaks the chain just
+      as well. The rule is now stated as equivalence classes, with `Status` and
+      `Integer` in the numeric one. See the next entry, which supersedes this
+      paragraph and nothing else here: the refusal, the styled-value grouping and
+      the operator-vs-`Value::eq` placement all still describe the tree.
+
+- [ ] **A status equals its code: `$sh.status == 0` becomes true.** *(Decided, not
+      built — `DESIGN.md` §"Comparison across types" is canonical.)* The seam this
+      entry recorded was that `$s == 0` reported while `match $s { 0 => … }` was
+      skipped in silence. It closes by making the pair **equal**, not by refusing
+      in more places:
+
+      ```mesh
+      $sh.status == 0                                  # true on success
+      match $sh.status { 0 => "ok" ; _ => "failed" }   # takes the `0` arm
+      [status(0) 0]:dedup:len                          # 1
+      status(0) == true                                # still an error
+      ```
+
+      **Why the int and not the bool, and why not both.** Both would force
+      `0 == status(0) == true`. The code alone is fine because it is
+      **injective**; success is not — all 255 failing codes collapse to one
+      `false`, so respecting it would give `status(1) == false == status(2)` and
+      hence `status(1) == status(2)`, which is `false` today and must stay so. The
+      general rule, stated as **classes** rather than pairs because `==` is
+      transitive: *equality partitions the types into classes; a type joins at
+      most one, and only through a lossless projection into it.* `Status` joins
+      the **numeric** class alongside `Integer`. The two formulations agree while
+      the class has two members; a pairwise rule breaks as soon as a third joins,
+      since `a == b` and `b == c` force `a == c` where the pair rule refuses it —
+      non-transitive, and unable to satisfy the `Eq`/`Hash` contract `:dedup`
+      needs. Stated as a class, a later member inherits the equality instead of
+      needing its own ruling. Raised by Codex on mikelward/mesh#465.
+
+      **Two drafts were wrong before this one, both recorded on #465.** The first
+      made an int arm against a status an **error**; that forecloses
+      `for x in [status(2) 1] { match $x { status(1) => … ; 1 => … ; _ => … } }`,
+      which runs today, since a per-arm refusal aborts on an arm a later iteration
+      needs. The second justified the refusal by claiming a status subject is
+      always monotyped — false, `status(N)` is a public constructor. Refusing more
+      places is never the free tightening it looks like: it accepts strictly less,
+      so no *new* program becomes valid and existing ones stop working.
+
+      Build notes. **Two places, not one.** The equality itself goes in
+      **`Value::eq`**, which is what arms, `in` and `:dedup` read and why they
+      agree for free. But `eval_binary` gates *before* it ever gets there:
+      `if type_phrase(&left) != type_phrase(&right)` rejects the pair
+      (`repl.rs`:8141), so `Value::eq` alone leaves `$sh.status == 0` still
+      reporting and dropping the hint would only shorten the error. **The
+      mismatch gate must admit the status/int pair explicitly** — one class
+      check rather than a phrase comparison — while `Value::eq` supplies the
+      answer. Raised by Codex on mikelward/mesh#465 against an earlier draft of
+      these notes that named only `Value::eq`. **`Hash` has to match** the
+      new `eq` or `HashSet<Value>` breaks its own invariant: a `Status` hashes as
+      its code. **Map keys are out of scope** — `Value::Map` is
+      `Vec<(String, Value)>` and scalar keys render to text before lookup
+      (`[status(5): "a"]` reprs `['5': 'a']`), so a status and its code already
+      key one entry without consulting `Value::eq`; do not cite them as a
+      consequence. Drop the `Status`/`Integer` arm from `comparison_hint`
+      (`repl.rs`:8001) —
+      that pair no longer reports — and keep the `Status`/`Boolean` arm, whose
+      "test it directly (`if … { }`)" wording is still right. `type_phrase` is
+      unchanged. Add tests that a status matches an int arm, that
+      `[status(0) 0]:dedup` is one element, and that `status(1) != status(2)`
+      still holds.
+
+      **`docs/REFERENCE.md` is deliberately untouched** and updates with the
+      implementation, not with this entry — it is "a terse lookup for everything
+      mesh implements today" (`REFERENCE.md`:3), and `status(0) == 0` still
+      reports in the tree. Its status section and its `==` examples both state
+      the current refusal and must change in the same commit that changes the
+      behavior. Raised by Codex on mikelward/mesh#465 after a draft updated it
+      early.
+
+      Not in scope, unchanged: `in` / `:has` answer `false` on a type mismatch for
+      pairs that do not compare; ordering (`$s > 1`) still errors.
 
 - [ ] **Ordering across types is not settled, and its fall-through is a bug.**
       `$s > 1` errors, as `1 > "1"` does, so equality and ordering now at least
