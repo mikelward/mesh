@@ -6751,6 +6751,63 @@ to avoid" rather than promising the latter as done.
   slot takes and `$sh.prompt.*` and `$sh.postcd.*` answer differently. That is the
   sharpest question the split raises. It does **not** block adding `proc`, which is
   why the leaning is to add it and defer the rest.
+- **Destructuring in a signature — open; leaning yes, positionals only.**
+  [Destructuring](#destructuring) binds a list's elements to names at an
+  assignment and the *same* pattern grammar drives a [`match`](#matching-match)
+  arm — but a signature cannot use it, so a function taking a pair opens with
+  bookkeeping:
+
+  ```
+  func connect(_pair) {
+    [_host _port] = $_pair
+    ...
+  }
+
+  func connect([_host _port]) { ... }        # the proposal
+  ```
+
+  Raku's subsignatures (`sub handle([$host, $port])`) are the closest precedent;
+  Rust destructures in a parameter pattern, and Erlang/Elixir match in the clause
+  head. It is the pattern grammar in a third position rather than a new one.
+
+  | Option | For | Against |
+  | --- | --- | --- |
+  | **Skip it** | Nothing new to learn; the unpack line is one line, and it is already the strict form, so a wrong shape errors either way | The most common small function opens with bookkeeping; the signature says `_pair` where every caller thinks in host and port, and that useless name is what `help` prints |
+  | **Positionals only** *(leaning)* | Reuses the [destructure](#destructuring) pattern verbatim — same brackets, same `...rest`, same `_` discard, same atomic all-or-nothing binding; no new grammar to specify; `help` can print the shape a caller actually passes | One more way to write a parameter; a defaulted or flag parameter cannot carry a pattern, so the restriction has to be stated rather than inferred |
+  | **Positionals and flags** | Uniform across the whole signature | A flag whose value arrives destructured is rare, and at the call site `--pair=…` gives the reader nothing to match the pattern against |
+
+  Consequences worth stating:
+
+  - **The shape error moves to the call.** `connect(host)` is refused naming the
+    parameter and the shape it wanted, before the body runs — where today it is
+    refused on the unpack line, one statement in. It is a *shape* check, not an
+    arity one: one argument arrives for one parameter, so the count is right and
+    what fails is that the argument is not a two-element list. Same fail-loud
+    rule, one step earlier, which is the same argument the
+    [static checks](../TODO.md) item makes.
+  - **Two separator conventions meet in one line.** Parameters are
+    comma-separated (`func f(_a, _b)`) and list patterns are space-separated
+    (`[_host _port]`), so `func connect([_host _port], _timeout)` mixes both. It is
+    consistent — brackets are pattern grammar, parens are signature grammar — but
+    it is the first place the two sit side by side, and it will read oddly before
+    it reads obviously.
+  - **A signature destructure is strict, with no soft twin.** The
+    [strict/soft pairs](#error-handling) work because the soft form has somewhere
+    to put the "no" — an `if` to skip, a default to return. A signature has
+    neither, so a shape mismatch is an error, full stop. That is the right answer
+    for a *required* positional and it is worth writing down rather than leaving
+    to be inferred.
+  - **Every binder inside a pattern joins the signature's name checks.** A
+    signature's parameter names must be distinct and cannot be `env`, and a
+    nested pattern has to flatten into that rule rather than sit beside it — so
+    `func f([_x _y], _x)` is refused for the duplicate exactly as `func f(_x, _x)`
+    is. Reusing the pattern grammar does not settle this on its own: an ordinary
+    destructure only ever validates duplicates as part of binding, because it has
+    no signature to collide with. `_` stays exempt, being a discard rather than a
+    binder.
+  - **Map patterns are out of scope here** — `[name: _n] = $m` is
+    [deferred on its own terms](#destructuring), and a signature can only follow
+    wherever that lands.
 - **Hook API — decided** ([Hooks and the prompt](#hooks-and-the-prompt)): hook
   points are insertion-ordered maps of named callables (the key is the handler's
   identity → re-source-safe, individually removable). Events `preprompt`,
