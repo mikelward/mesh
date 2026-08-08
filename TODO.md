@@ -6906,7 +6906,60 @@ of each PR had landed by another route, but these pieces had not.
       To reproduce under contention, `taskset -c 0 cargo test --workspace` is
       the sharpest form, and is what surfaced the three below.
 
-- [x] **The pty suite is flaky in CI, in more than one place.** ✅ **Closed.**
+- [ ] **Reopened: a ninth sighting, `the_shipped_hooks_name_the_window` phase
+      241.** The entry below closed on seven consecutive green runs and said in
+      as many words to reopen if a sighting returned. One has, on a test the
+      closed entry never listed and in code that landed after its evidence was
+      gathered.
+
+      Seen on CI for mikelward/mesh#468, a **documentation-only** branch — four
+      `.md` files, no `crates/` change — which is what makes it evidence rather
+      than a suspect: the same branch went green twice before on `28b7800` and
+      `4dcf326`, and the full suite passes locally.
+
+      Phase 241 is the last step of `title_ownership_harness`: after `exit 0` is
+      typed, the harness `waitpid`s the shell and requires a normal exit with
+      status `0`. So what failed is the session *leaving*, not any of the title
+      assertions ahead of it — every one of those passed.
+
+      Two reasons not to file it as more of the same. The first is a
+      **hypothesis, not a finding**: *if* the shell got as far as processing
+      `exit 0`, it was inside `run_logout` — where the `jobdone` drain, the
+      `/dev/tty` title clear, and the `exit` hooks all now run — and the shipped
+      title hooks (`6d58724`, `81f766f`, `c18c0ad`) landed **after** the
+      seven-green run that closed the entry, so that path is not one the closing
+      evidence covered. Phase 241 does not establish it got there. The check is
+      three disjuncts — `waitpid` not returning the shell's pid, `WIFEXITED`
+      false, or a nonzero status — so what it proves is only that the harness
+      **could not confirm a normal exit**. That is weaker again than "the shell
+      left abnormally": an `EINTR` in the harness's own `waitpid` returns the
+      same 241 as a shell that died on a signal, which returns the same 241 as
+      one that reached `run_logout` and left nonzero. Treating the expanded exit
+      path as the suspect is a lead to check, not a diagnosis to work from —
+      mistaking one for the other is what made the earlier sightings take as
+      long as they did.
+
+      The second reason stands on its own: the two sightings left listed
+      unfixed are phase 140 and phase 170. This is neither, so "the handover
+      race explains it" is not available without checking.
+
+      **It did not reproduce locally.** `taskset -c 0 cargo test -p mesh --test
+      cli -- --test-threads=24`, the sharpest form named above, ran green twice
+      over the whole suite, and the test alone ran green three times. That is
+      the same "did not reproduce" standing as phases 140 and 170 — weaker than
+      a diagnosis, and not grounds to strike the sighting out.
+
+      Next step, when someone picks this up: the CI runner is a two-core
+      `ubuntu-latest`, so the contention there is not what one pinned core on a
+      four-core box reproduces. Either run the suite against that shape, or
+      instrument phase 241 to say *which* of its three disjuncts fired — a
+      `waitpid` that did not match, a non-normal exit, or a nonzero status —
+      since a bare phase code
+      with no line under it is exactly what made the earlier sightings
+      unreadable.
+
+- [x] **The pty suite is flaky in CI, in more than one place.** ✅ **Closed
+      — see the reopened entry above.**
       Eight distinct failures over its life, and the reading that kept it open —
       *different tests each time, so one property of the harness rather than N
       bugs* — was right about the shape and wrong about the property. It was
