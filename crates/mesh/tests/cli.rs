@@ -20685,6 +20685,103 @@ puts $dot:exts $dot:bare
 }
 
 #[test]
+fn ancestors_walks_a_path_up_to_its_root() {
+    // The path itself first, the root last. A relative path stops at its first
+    // component rather than stepping off the front into the empty path, and the
+    // empty string walks nothing.
+    let out = run_with_input(
+        r#"deep = /a/b/c
+rel = "x/y"
+puts $deep:ancestors:repr
+puts $rel:ancestors:repr
+puts "/":ancestors:repr
+puts "":ancestors:repr
+puts $deep:ancestors:rest:first $deep:ancestors:last
+"#,
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "['/a/b/c', '/a/b', '/a', '/']\n['x/y', 'x']\n['/']\n[]\n/a/b /\n",
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn ancestors_turns_a_find_up_search_into_a_list_iteration() {
+    // What the modifier is for: the `cd ..`-in-a-subshell loop that `find_up`,
+    // project-root detection and `rootdir` each write by hand becomes a `for`
+    // over a list — reading `pwd()`, the validated shell-owned directory, rather
+    // than a possibly-stale `$env.PWD`. The marker sits two levels above the
+    // starting directory, so a walk that stopped early or skipped the start
+    // would answer differently.
+    let dir = fresh_dir("ancestors_find_up");
+    let leaf = dir.join("a/b/c");
+    std::fs::create_dir_all(&leaf).expect("create the walk");
+    std::fs::write(dir.join("a/marker"), "").expect("write the marker");
+    let out = run_with_input(&format!(
+        r#"cd {}
+for d in pwd():ancestors {{
+  if "$d/marker":exists {{
+    puts $d
+    break
+  }}
+}}
+"#,
+        leaf.display()
+    ));
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        format!("{}\n", dir.join("a").display()),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn parents_is_not_a_second_name_for_the_upward_walk() {
+    // `DESIGN.md` weighed the two names and kept `:ancestors`: "parents" reads as
+    // excluding the path itself, which is the one element the walk must have. So
+    // `:parents` is not a modifier at all rather than an alias for this one, and
+    // the reader hears that rather than "not implemented yet".
+    let out = run_with_input("puts \"/a/b\":parents\n");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("`:parents` is not a modifier"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(!out.status.success());
+}
+
+#[test]
+fn ancestors_refuses_a_list_and_maps_over_one_on_request() {
+    // One path in, a whole walk out, so element-wise mapping would answer with a
+    // list of lists — the one-string rule `:words` and `:split` already follow.
+    // `:map(:ancestors)` is the spelling that does want the nesting.
+    let refused = run_with_input("ps = [/a /b]\nputs $ps:ancestors\n");
+    assert!(
+        String::from_utf8_lossy(&refused.stderr).contains(":map(:ancestors)"),
+        "{}",
+        String::from_utf8_lossy(&refused.stderr)
+    );
+    assert!(!refused.status.success());
+
+    let mapped = run_with_input("ps = [/a/b /c]\nputs $ps:map(:ancestors):repr\n");
+    assert_eq!(
+        String::from_utf8_lossy(&mapped.stdout),
+        "[['/a/b', '/a', '/'], ['/c', '/']]\n",
+        "{}",
+        String::from_utf8_lossy(&mapped.stderr)
+    );
+}
+
+#[test]
 fn real_resolves_symlinks_and_dot_segments_to_an_absolute_path() {
     // The `readlink -f` a config otherwise forks for, on a syscall the shell
     // already has. Rough edge 16 from the config port.

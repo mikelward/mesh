@@ -2627,6 +2627,7 @@ f
 | `:tilde` | string or list | `$HOME` written back as `~` — the inverse of the `~` a word expands. Whole components only, so `/home/username` is not `~name` when `$HOME` is `/home/user`. A path outside `$HOME`, and any path when `$HOME` is unset or `/`, is unchanged. Never asks the filesystem, so it cannot fail. |
 | `:real` | path or list | The path with every symlink, `.` and `..` resolved, absolute. Errors on a path it cannot resolve. |
 | `:url` | path or list | The path as a `file://host/path` URL, absolutized but not resolved. Errors on a path holding a `..`, and on the empty string. |
+| `:ancestors` | path | The path itself, then every directory above it, as a list — `/a/b/c` is `[/a/b/c /a/b /a /]`. One path, not a list; the empty string walks nothing. |
 | `:upper` / `:lower` | string or list | Change case; maps over list elements. |
 | `:int` | string | Parse an integer, failing loudly on invalid input. |
 | `:bool` | string or boolean | Parse `1`/`true`/`0`/`false`; warn and read `false` for anything else. `:bool(DEFAULT)` answers `DEFAULT` there instead, and says nothing. |
@@ -2721,6 +2722,46 @@ follows each symlink first and applies `..` to wherever it landed, so
 `a/link/../report` is two different files that can both exist. `:real:url` is the
 spelling that resolves it. A `.` needs no refusal; the empty string is refused
 rather than quietly meaning the current directory.
+
+`:ancestors` walks a path **upward** — the path itself first, then each directory
+above it, ending at the root it is written against:
+
+```mesh
+puts /a/b/c:ancestors:join(" ")     # /a/b/c /a/b /a /
+puts /a/b/c:ancestors:rest:first    # /a/b     — the strict "above me" reading
+```
+
+The path itself is the first element because that is where a `find_up` search
+starts: a marker in the starting directory is the first thing those searches look
+for, and a list that skipped it would have every caller putting back the path they
+already had. `:rest` drops it where the walk really should start one level up.
+
+That search is the reason the modifier exists — the `cd ..`-in-a-subshell loop
+every shell config writes by hand becomes a `for` over a list:
+
+```mesh
+func find-up(name) {
+  for dir in pwd():ancestors {
+    if "$dir/$name":exists { return $dir }
+  }
+  return false
+}
+```
+
+[`pwd()`](#builtins) rather than `$env.PWD`: the call asks where the shell
+actually is, where the variable is whatever was last written to it.
+
+It is **lexical**, like `:dir` and unlike `:real` — it slices the string it was
+given and asks the filesystem nothing, so no component has to exist, a `..` is a
+step it reports rather than resolves, and `:real:ancestors` is the walk with
+symlinks and dot segments taken out first. A **relative** path stops at its first
+component (`x/y` is `[x/y x]`) rather than stepping off the front into a path with
+no spelling, and the empty string walks nothing at all: `[]`.
+
+Unlike the path components beside it, `:ancestors` takes **one path rather than a
+list**, since one path already answers with a list and mapping element-wise would
+nest one walk per element inside another. That is the rule `:words` and `:split`
+follow, and `$paths:map(:ancestors)` is the spelling that does want the nesting.
 
 `:prepend`, `:append`, and `:extend` are the **pure** counterparts of `+=`: they
 return a new list rather than writing one, so they compose in a chain where a

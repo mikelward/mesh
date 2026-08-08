@@ -7778,7 +7778,6 @@ pub(crate) fn modifier_accepts_arguments(name: &str) -> bool {
 /// `the_two_modifier_tables_do_not_overlap` catches.
 const MODIFIER_NAMES: &[&str] = &[
     "add",
-    "ancestors",
     "append",
     "atime",
     "capture",
@@ -7809,7 +7808,6 @@ const MODIFIER_NAMES: &[&str] = &[
     "multiline",
     "num",
     "old",
-    "parents",
     "prepend",
     "quotemeta",
     "raw",

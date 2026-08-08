@@ -104,6 +104,13 @@ pub enum Modifier {
     /// rather than a path: `link($report:base, $report:url)`. Shares its encoder
     /// with `OSC 7`, so the terminal and the shell name a file the same way.
     Url,
+    /// `:ancestors` — this path and every directory above it, nearest first, so
+    /// `/a/b/c` is `[/a/b/c /a/b /a /]`. The upward walk `find_up`, project-root
+    /// detection and `rootdir` all write by hand as a `cd ..` loop; as a list it
+    /// is `for dir in pwd():ancestors`. **Lexical**, like the other path
+    /// components — it slices the string it was given and never asks the
+    /// filesystem, so `:real:ancestors` is the walk with symlinks resolved.
+    Ancestors,
     // File tests: `-e`, `find -type`, `-r`, `-w`. Scalar questions about one path,
     // mapping element-wise over a list like the transforms above.
     Exists,
@@ -144,6 +151,7 @@ pub(crate) const NAMED_MODIFIERS: &[(&str, Modifier)] = &[
     ("tilde", Modifier::Tilde),
     ("real", Modifier::Real),
     ("url", Modifier::Url),
+    ("ancestors", Modifier::Ancestors),
     ("len", Modifier::Len),
     ("code", Modifier::Code),
     ("tty", Modifier::Tty),
@@ -2069,6 +2077,21 @@ pub(crate) fn apply_modifier(value: Value, modifier: Modifier) -> Result<Value, 
                 message: "requires a path".into(),
             }),
         },
+        // One path in, its whole upward walk out — so unlike the path components
+        // beside it this cannot map element-wise over a list without nesting one
+        // walk per element inside another list. It takes exactly one path, the
+        // rule the other one-to-many modifiers (`:words`, `:split`) already
+        // follow, and `$paths:map(:ancestors)` is how a list is walked.
+        Modifier::Ancestors => match value {
+            Value::String(path) => Ok(Value::List(ancestors(&path))),
+            other => Err(ExpandError::Modifier {
+                name: name.into(),
+                message: format!(
+                    "requires a path, not {} — `:map(:ancestors)` walks each of a list",
+                    value_kind(&other)
+                ),
+            }),
+        },
         // A file test asks one question of one path, so on a list it maps
         // element-wise like any other value modifier.
         Modifier::Exists | Modifier::Type | Modifier::Read | Modifier::Write => match value {
@@ -2604,6 +2627,7 @@ fn modifier_name(modifier: Modifier) -> &'static str {
         Modifier::Tilde => "tilde",
         Modifier::Real => "real",
         Modifier::Url => "url",
+        Modifier::Ancestors => "ancestors",
         Modifier::Len => "len",
         Modifier::First => "first",
         Modifier::Last => "last",
@@ -2753,6 +2777,9 @@ fn modify_string(value: String, modifier: Modifier) -> String {
         // can fail, so it is handled where a `Result` is available rather than here.
         Modifier::Real
         | Modifier::Url
+        // A string in, a *list* out, so it cannot be one of the string-to-string
+        // arms above however lexical the walk is.
+        | Modifier::Ancestors
         | Modifier::Code
         | Modifier::Int
         | Modifier::Flag
@@ -2800,6 +2827,30 @@ fn bare_name(name: Option<&str>) -> &str {
     name[offset..]
         .find('.')
         .map_or(name, |dot| &name[..offset + dot])
+}
+
+/// `:ancestors` — `path` itself, then each directory above it, ending at the
+/// root the path is written against: `/a/b/c` → `[/a/b/c /a/b /a /]`, and the
+/// relative `a/b/c` → `[a/b/c a/b a]`.
+///
+/// **The path itself is the first element**, which is what makes the walk the
+/// `find_up` one: a marker file in the starting directory is the first thing
+/// those searches look for, and a list that skipped it would need the caller to
+/// prepend the very path they had. `:rest` drops it where the strict "above me"
+/// reading is wanted.
+///
+/// A **relative** path stops at its first component rather than reaching for the
+/// working directory, since walking off the front of one names nothing this can
+/// spell — `std`'s own walk yields the empty path there, and the empty string is
+/// not a directory. The empty string therefore walks nothing at all and yields
+/// `[]`, the answer the split modifiers give it too.
+fn ancestors(path: &str) -> Vec<Value> {
+    std::path::Path::new(path)
+        .ancestors()
+        .map(|ancestor| ancestor.to_string_lossy().into_owned())
+        .filter(|ancestor| !ancestor.is_empty())
+        .map(Value::String)
+        .collect()
 }
 
 pub(crate) fn slice<T>(
@@ -3488,6 +3539,79 @@ mod tests {
         assert_eq!(urls.len(), 2);
         assert!(matches!(&urls[0], Value::String(url) if url.ends_with("/a")));
         assert!(matches!(&urls[1], Value::String(url) if url.ends_with("/b")));
+    }
+
+    #[test]
+    fn ancestors_walks_from_the_path_itself_up_to_its_root() {
+        // The path is the first element because that is where `find_up` starts
+        // looking; `:rest` is the strict "above me" reading.
+        assert_eq!(
+            apply_modifier(Value::String("/a/b/c".into()), Modifier::Ancestors),
+            Ok(list(&["/a/b/c", "/a/b", "/a", "/"]))
+        );
+        assert_eq!(
+            apply_modifier(Value::String("/".into()), Modifier::Ancestors),
+            Ok(list(&["/"]))
+        );
+    }
+
+    #[test]
+    fn ancestors_of_a_relative_path_stops_at_its_first_component() {
+        // Walking off the front of a relative path reaches the working directory,
+        // which this cannot spell without asking where the process is — and the
+        // empty path `std` yields there is not a directory. A written `.` is kept,
+        // because the writer spelled it.
+        assert_eq!(
+            apply_modifier(Value::String("a/b/c".into()), Modifier::Ancestors),
+            Ok(list(&["a/b/c", "a/b", "a"]))
+        );
+        assert_eq!(
+            apply_modifier(Value::String("./a".into()), Modifier::Ancestors),
+            Ok(list(&["./a", "."]))
+        );
+        // Nothing to walk, so nothing comes back — the answer the split modifiers
+        // give the empty string too.
+        assert_eq!(
+            apply_modifier(Value::String(String::new()), Modifier::Ancestors),
+            Ok(Value::List(Vec::new()))
+        );
+    }
+
+    #[test]
+    fn ancestors_is_lexical_and_keeps_the_path_as_it_was_written() {
+        // Purely string surgery, like `:dir` and unlike `:real`: no component has
+        // to exist, a `..` is a step the walk reports rather than resolves, and a
+        // trailing slash survives on the path itself. `:real:ancestors` is the
+        // resolved walk.
+        assert_eq!(
+            apply_modifier(
+                Value::String("/nothing-is-here/../b".into()),
+                Modifier::Ancestors
+            ),
+            Ok(list(&[
+                "/nothing-is-here/../b",
+                "/nothing-is-here/..",
+                "/nothing-is-here",
+                "/"
+            ]))
+        );
+        assert_eq!(
+            apply_modifier(Value::String("/a/b/".into()), Modifier::Ancestors),
+            Ok(list(&["/a/b/", "/a", "/"]))
+        );
+    }
+
+    #[test]
+    fn ancestors_refuses_a_list_rather_than_nesting_a_walk_per_element() {
+        // One path in, a whole walk out, so mapping element-wise would answer with
+        // a list of lists. `:map(:ancestors)` is how a list is walked, and the
+        // diagnostic says so.
+        let refused = apply_modifier(list(&["/a", "/b"]), Modifier::Ancestors);
+        let Err(ExpandError::Modifier { name, message }) = refused else {
+            panic!("`:ancestors` should refuse a list: {refused:?}");
+        };
+        assert_eq!(name, "ancestors");
+        assert!(message.contains(":map(:ancestors)"), "{message}");
     }
 
     #[test]
