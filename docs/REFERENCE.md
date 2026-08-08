@@ -1633,11 +1633,14 @@ multiline continuation prompts.
 | `precd` | `target` | Before the working directory changes, still in the old one. `target` is where it is about to go. |
 | `postcd` | `previous` | After it has changed, in the new directory. `previous` is where it came from. |
 | `jobdone` | `id, command, status` | Once per background job the shell finds finished, alongside its `[N] Done` notice. `status` is a [status value](#exit-status). |
-| `exit` | `status` | Before the shell exits, however the session ended. `status` is the [status value](#exit-status) it is leaving with. |
+| `exit` | `status` | Before the shell exits, on every path that leaves it: an interactive `exit`, end of input, a script, a `-c` string, an `exit` in a startup file. **Two ways out do not reach it**, both because no shell survives to run it — a successful [`exec`](#builtins), which replaces the process image, and a signal that kills the shell — so it is a teardown convenience rather than a guarantee; see below. `status` is the [status value](#exit-status) it is leaving with. |
 
 Every `status` argument above is a **status value**, not an integer, so a handler
 forwarding one reports the failure it was told about. Test it directly — `if not
-$status { … }` — since `$status != 0` compares across types and is always true.
+$status { … }` — which asks the question in the shell's own terms. Comparing
+against a code works as well, since a status equals the integer it carries:
+`$status != 0` is a valid failure test, and `$status == 2` asks about one
+particular code.
 
 ```mesh
 func command-started(cmd) { puts "running $cmd" }
@@ -1652,7 +1655,7 @@ on postexec log command-finished
 job ended, not the instant it ended. A job you `wait` for does not reach it: the
 status went to the caller, which is what the hook is there to tell you.
 
-`exit` runs on **every** way a session ends: `exit`, Ctrl-D, the end of a
+`exit` runs on every way a session *ends*: `exit`, Ctrl-D, the end of a
 script or a `-c` string, and an `exit` from a startup file. It is the hook for
 tearing down what a session set up, and a script cleaning up after itself is as
 much that case as an interactive session is.
@@ -1666,9 +1669,19 @@ on exit tmp clean-up
 last command's status for a bare `exit` or an end of input. It matches bash's
 `$?` inside a `trap … EXIT`.
 
-Two things it does not cover yet. A shell **killed by a signal** runs nothing;
-so does one that dies on `SIGKILL`, which no shell can catch. And a `fork { … }`
-subshell leaving is not the session ending, so it runs no handler.
+**Three ways get past it**, and the first is the one that catches people,
+because the session does end and the handler still does not run. A successful
+[`exec`](#builtins) **replaces the process image** — `replace_process` does not
+return, so nothing after it happens, this hook included, and the `clean-up`
+above leaks its directory without a word. A shell **killed by a signal** runs
+nothing either, `SIGKILL` least catchably of all. And a `fork { … }` subshell
+leaving is not the session ending, so it runs no handler.
+
+So this is a **teardown convenience, not a guarantee**. It is the right place
+for what is merely untidy to leave behind — a scratch directory, a title, a
+daemon started for the session. Anything that must not leak, because something
+else blocks on it — a lock, a mount, a remote reservation — wants an owner that
+outlives the shell rather than a handler two ordinary exits skip.
 
 On the way out, every job the shell knows about is reported **before** the
 `exit` hook, so a handler that tears down what `jobdone` was writing to can rely

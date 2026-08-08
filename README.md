@@ -79,27 +79,34 @@ install. It takes the first of four sources that answers: a curated file under
 `~/.local/share/mesh/completions/`, else the command's manual page, else a
 bounded `--help` probe of the command, else files and directories. Builtins and
 defined functions use their generated help the same way. File, directory, and
-enumerated option values narrow argument completion to the expected type. A growing slice of the language
-is in place: quoting and escapes, `~` and filename globs, captures and heredocs,
-typed scalar/list/map values, arithmetic and comparisons, regex and glob matching
-with `~`, collection iteration and destructuring, `while`/`loop`, `if`/`match`
-expressions, postfix `if`/`unless` guards, postfix value modifiers, functions —
-value calls, lambdas, and the higher-order `:map`/`:filter`/`:each` — `fork`
-subshells, environment writes, scripts and `source`, and styled, clickable
-output. For a hands-on walk through the main features, see
-[`docs/TOUR.md`](docs/TOUR.md); for a terse lookup of the whole surface,
+enumerated option values narrow argument completion to the expected type. A
+growing slice of the language is in place: quoting and escapes, `~` and filename
+globs, captures and heredocs, typed scalar/list/map values — with statuses and
+flags as value types of their own — arithmetic and comparisons, regex and glob
+matching with `~`, collection iteration and destructuring, `while`/`loop`,
+`if`/`match` expressions, postfix `if`/`unless` guards, postfix value modifiers
+including ones a user declares with `func _s:name()`, functions — value calls,
+lambdas, `&name` references, `wrapper func` and `alias`, and the higher-order
+`:map`/`:filter`/`:each` — `fork` subshells, environment writes from `export`
+through the `NAME=value cmd` prefix to the `with` block, lifecycle hooks behind
+the prompt and the window title, `timeout` and bounded waits, scripts and
+`source`, and styled, clickable output. For a hands-on walk through the main
+features, see [`docs/TOUR.md`](docs/TOUR.md); for a terse lookup of the surface,
 [`docs/REFERENCE.md`](docs/REFERENCE.md). That covers the completed M3 language
 surface and the work since; later design work remains tracked in
 [`ROADMAP.md`](ROADMAP.md) and [`TODO.md`](TODO.md).
-[`docs/COMPARISON.md`](docs/COMPARISON.md) sets mesh against bash, zsh, fish,
-elvish, and nushell — where it is safer, where it asks for more quoting than
-they do, where they are stricter than it is, and what it gives up.
+[`docs/COMPARISON.md`](docs/COMPARISON.md) sets mesh against bash, zsh, YSH,
+fish, elvish, and nushell — where it is safer, where it asks for more quoting
+than they do, where they are stricter than it is, and what it gives up.
 [`docs/UPSTREAM.md`](docs/UPSTREAM.md) asks the follow-up question: which of
 these ideas another shell could simply adopt, and which are grammar and so
 cannot travel.
 [`docs/INTEGRATION.md`](docs/INTEGRATION.md) works through the external tools a
 bash or zsh user arrives with — starship, atuin, fzf, carapace, zoxide, direnv —
 saying which already work, which are blocked, and on what.
+[`docs/HOOKS.md`](docs/HOOKS.md) does the same for the hook registry the prompt
+and the window title are built on: what exists today, and what is left to
+decide.
 
 ## Name
 
@@ -112,8 +119,12 @@ overloaded in infra (service mesh, mesh networking) and sits one letter from
 Language design remains in draft. Implementation has completed the M2 shell
 runtime (pipelines, redirection, and job control) and completed **M3** with typed
 values, the clean-break parser, explicit `...$list` argument spread, functions,
-conditionals, collection loops, destructuring, and matching. See
-[`ROADMAP.md`](ROADMAP.md).
+conditionals, collection loops, destructuring, and matching. Work continues past
+M3 rather than as a new milestone — statuses and flags as values, user-declared
+modifiers, the hook registry behind the prompt and the window title, the
+environment as values, and bounded waiting have landed since. See
+[`ROADMAP.md`](ROADMAP.md) for the arc and [`TODO.md`](TODO.md) for the working
+front.
 
 ## License
 
