@@ -8017,38 +8017,22 @@ fn condition_hint(value: &Value) -> &'static str {
 
 /// How to ask the comparison you meant, where the pair has a ready spelling.
 ///
-/// Only the two status pairs earn one. They are the shell reflexes — `$sh.status
-/// == 0` and `$sh.status == true` — so they are what a reader reaches for, and
-/// each has a spelling that says which of a status's two readings was wanted:
-/// its **code**, or its **success**. That a status admits both, and equality
-/// therefore respects neither, is the whole of `DESIGN.md` §"Comparison across
-/// types". Every other mismatch is a plain refusal, since a hint that only
-/// restated the two type names would be noise.
+/// Only the status/bool pair earns one now. `$sh.status == 0` used to be here
+/// too and no longer reports at all: a status compares to an int by its code
+/// (`DESIGN.md` §"Why `Status` compares to an int"), so the reflex spelling is
+/// simply correct and needs no hint. Against a **bool** there is still no
+/// comparison to offer — success is a lossy reading of a status and cannot carry
+/// equality — so the hint sends the writer to the condition instead. Every other
+/// mismatch is a plain refusal, since a hint that only restated the two type
+/// names would be noise.
 ///
 /// The hint is generated from **both** the operator and the operand the writer
 /// actually wrote, because discarding either one produces a hint that is worse
-/// than none: it looks pasteable and asks a different question. `$s != 0`
-/// answered with `$s:code == 0` reverses the predicate, and `status(3) == 5`
-/// answered with `:code == 0` turns a code-specific test into a success test.
-/// Both raised in review.
+/// than none: it looks pasteable and asks a different question. `== false` and
+/// `!= true` both ask about failure, so the polarity needs the pair. Raised in
+/// review.
 fn comparison_hint(left: &Value, right: &Value, negated: bool) -> Option<String> {
-    let operator = if negated { "!=" } else { "==" };
     match (left, right) {
-        (Value::Status(_), Value::Integer(code)) | (Value::Integer(code), Value::Status(_)) => {
-            // Only 0–255 names a status, so a code outside it gets the `:code`
-            // half alone — `status(300)` is itself an error, and a hint that
-            // does not run is worse than a shorter one.
-            Some(match u8::try_from(*code) {
-                Ok(code) => format!(
-                    "compare the code (`…:code {operator} {code}`) \
-                     or a status (`… {operator} status({code})`)"
-                ),
-                Err(_) => format!(
-                    "compare the code (`…:code {operator} {code}`); \
-                     no status carries a code outside 0-255"
-                ),
-            })
-        }
         (Value::Status(_), Value::Boolean(wanted)) | (Value::Boolean(wanted), Value::Status(_)) => {
             // Testing a status directly asks whether it *succeeded*, so the
             // polarity is the operator and the literal together, not either
@@ -8113,15 +8097,26 @@ fn compile_regex(value: &RegexValue) -> Result<regex::Regex, String> {
     expand::compile_regex(value)
 }
 
+/// The two operands are in the **numeric** equivalence class, so `==` compares
+/// them rather than refusing. A status joins through its code, which is
+/// lossless; `Value::eq` supplies the answer (`DESIGN.md` §"Why `Status`
+/// compares to an int"). Written as a class test rather than a `Status`/`Integer`
+/// pair so a later member is one arm here, not a second special case.
+fn numeric_pair(left: &Value, right: &Value) -> bool {
+    matches!(
+        (left, right),
+        (Value::Status(_), Value::Integer(_)) | (Value::Integer(_), Value::Status(_))
+    )
+}
+
 fn eval_binary(left: Value, op: parser::BinaryOp, right: Value) -> Result<Value, String> {
     use parser::BinaryOp::*;
-    // A value compares to its own type. Across types `==` and `!=` **refuse**
-    // rather than answering `false`, because a quiet answer is indistinguishable
-    // from a real inequality: `$sh.status == 0` is the shell reflex, and as a
-    // silent `false` the writer cannot tell "the types do not meet" from "the
-    // command succeeded and this is somehow still false". Refusing names the
-    // fix. `if 0` already sets the loud precedent for a question mesh will not
-    // guess the meaning of.
+    // A value compares within its own **equivalence class**. Across classes `==`
+    // and `!=` **refuse** rather than answering `false`, because a quiet answer
+    // is indistinguishable from a real inequality: the writer cannot tell "the
+    // types do not meet" from "these values are genuinely unequal". `if 0`
+    // already sets the loud precedent for a question mesh will not guess the
+    // meaning of.
     //
     // The refusal is the **top-level operand pair only**. Everything else uses
     // total equality — a nested pair (`[--help] == ["--help"]`) is unequal
@@ -8130,7 +8125,7 @@ fn eval_binary(left: Value, op: parser::BinaryOp, right: Value) -> Result<Value,
     // `:dedup`, list `-`, hashing and `match` dispatch are built on, and each
     // of those can only accept a bool. So the refusal has to live in the
     // operator, never in the equality beneath it. `DESIGN.md` §"Comparison
-    // across types" states the resulting seam.
+    // across types" is canonical.
     if matches!(op, Equal | NotEqual) {
         // Kinds are `type_phrase`'s own groupings, which is what keeps a styled
         // value comparable with its text — both answer "a string", as the rule
@@ -8138,7 +8133,11 @@ fn eval_binary(left: Value, op: parser::BinaryOp, right: Value) -> Result<Value,
         // other variant stands alone. Deriving the kind from the phrase also
         // means the message can never read "cannot compare a string with a
         // string", and a new variant gets a kind the moment it gets a name.
-        if type_phrase(&left) != type_phrase(&right) {
+        //
+        // A status and an int are the exception, and it has to be *here* rather
+        // than only in `Value::eq`: this gate runs first, so an equality the
+        // operator never reaches is an equality nobody sees.
+        if type_phrase(&left) != type_phrase(&right) && !numeric_pair(&left, &right) {
             let mut message = format!(
                 "cannot compare {} with {}",
                 type_phrase(&left),

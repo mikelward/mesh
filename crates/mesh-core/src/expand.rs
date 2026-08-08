@@ -122,8 +122,9 @@ pub enum Modifier {
     /// question cannot be pointed at an unrelated one.
     Tty,
     /// The integer inside a [`Value::Status`]. The spelling for arithmetic and
-    /// for a comparison against a number, since a status compares only with
-    /// another status: `$s:code > 1` where `$s > 1` is a type error.
+    /// for **ordering**, which stays same-type: `$s:code > 1` where `$s > 1` is a
+    /// type error. Equality needs no such help — `$s == 0` compares the code
+    /// already (`DESIGN.md` §"Comparison across types").
     Code,
 }
 

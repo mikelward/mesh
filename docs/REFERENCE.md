@@ -1795,24 +1795,26 @@ mesh already loses type there (the int `5` and the string `"5"` both write `5`, 
 `status(5)`, which is forced by its round-trip contract, and
 [`:code`](#modifiers) is how you reach the integer.
 
-It compares like every other type, which is to say **strictly**: a cross-type
-`==` **reports** rather than answering `false`, so `status(0) == 0` and
-`status(0) == true` are both errors naming the spelling to use instead, and
-`$s > 1` is an error too. `$s == status(0)` and `$s:code == 0` are what work. So
-a `$sh.status == 0` written out of shell reflex no longer says nothing quietly —
-it says what to write.
+It compares **strictly, with one opening**: a cross-type `==` reports rather than
+answering `false`, so `status(0) == true` is an error and `$s > 1` is too — but
+**`status(0) == 0` is `true`**. A status compares to an **int**, by its code, and
+to nothing else, so `$sh.status == 0` written out of shell reflex reads
+correctly. `$s == status(0)` and `$s:code == 0` still work and say the same
+thing.
 
-The reason it compares with neither an int nor a bool is that a status **admits
-both readings**: `$s:code` is its integer and `not not $s` is its success, and an
-equality respecting both would make `0 == status(0) == true` — hence `0 == true`,
-which `if 0` refuses to let you even ask. It respects neither, and each reading
-keeps its own spelling.
+The reason it is the int and not the bool is that the code is **lossless** —
+distinct statuses have distinct codes — while success collapses all 256 codes
+onto two booleans. An equality respecting success would make
+`status(1) == false == status(2)`, hence `status(1) == status(2)`, which is
+`false` and must stay so. Respecting *both* is worse still: it gives
+`0 == status(0) == true`, hence `0 == true`, which `if 0` refuses to let you even
+ask. So equality takes the code, and `not not $s` is how you take the other
+reading explicitly.
 
-One seam, deliberate and worth knowing: the refusal is the `==` / `!=` operator
-only. Underneath, equality stays total — so a `0` arm in a `match` on a status is
-silently **skipped** rather than reported, `1 in [1, "a"]` answers, and
-`[1, 1, "1"]:dedup` gives two elements. That totality is what `:dedup`, map keys
-and `match` dispatch are built on.
+Because this is a genuine equality rather than an operator exemption, everything
+built on `Value`'s equality agrees with it: a `0` arm in a `match` on a status
+**takes** the arm, `0 in $sh.pipestatus` answers, and `[status(0) 0]:dedup` gives
+one element — a status and its code are one value.
 
 A **condition** — the subject of `if` / `while`, a `stmt if cond` guard, a `match`
 arm guard, or an operand of `and` / `or` / `not` — is a **bool, a status, or a
@@ -3061,17 +3063,19 @@ indistinguishable from a real inequality:
 
 ```mesh
 1 == "1"           # error: cannot compare an int with a string
-$sh.status == 0    # error: cannot compare a status with an int; …
+status(0) == true  # error: cannot compare a status with a bool; …
 1 == 1             # true
 style("a", fg: red) == "a"   # true — a styled value is its text
+$sh.status == 0    # true on success — a status compares to an int by its code
 ```
 
-A styled value and a plain string are one type for this, the only grouping the
-rule makes. The refusal is the **top-level operands of `==` / `!=`** and nothing
-else: nested pairs, `in`, `:dedup`, map keys and `match` literal arms all use
-total equality and answer `false` rather than reporting, since each of those can
-only accept a bool. `DESIGN.md`
-§"Comparison across types" states that seam and why it is scoped this way.
+A styled value and a plain string are one type for this, and a status and an int
+are the one **cross-type** pair that compares. The refusal is the **top-level
+operands of `==` / `!=`** and nothing else: nested pairs, `in`, `:dedup` and
+`match` literal arms all use total equality and answer `false` rather than
+reporting, since each of those can only accept a bool — and because status-to-int
+is a real equality rather than an operator exemption, all of them agree with it.
+`DESIGN.md` §"Comparison across types" is canonical.
 
 `not` is a **reserved word**, and it negates one of two things: a **value**, or a
 **command's status**. Which one is decided by the operand — a value after it is the

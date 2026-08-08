@@ -6324,8 +6324,11 @@ unguarded, alongside fish and elvish, and carries a `TODO:` naming this entry.
       *a type projecting into more than one other type gets no cross-type
       equality* — is what leaves `1 == 1.0` open rather than answered.
 
-      ⚠️ **The last paragraph is superseded** — kept because it describes what
-      shipped, which is still what the binary does. "Respecting both is
+      ⚠️ **Superseded in two places**, kept for the record of how the first
+      answer was reached. The last paragraph's conclusion is one; the other is
+      "the refusal is in the operator, not in `Value::eq`", which was true when
+      written and is no longer the whole story — the status/int equality *is* in
+      `Value::eq`, and the operator gate merely stops refusing it. "Respecting both is
       contradictory" is right; "so respect neither" does not follow, and
       respecting exactly one (the code, which is lossless) breaks the chain just
       as well. The rule is now stated as equivalence classes, with `Status` and
@@ -6333,8 +6336,8 @@ unguarded, alongside fish and elvish, and carries a `TODO:` naming this entry.
       paragraph and nothing else here: the refusal, the styled-value grouping and
       the operator-vs-`Value::eq` placement all still describe the tree.
 
-- [ ] **A status equals its code: `$sh.status == 0` becomes true.** *(Decided, not
-      built — `DESIGN.md` §"Comparison across types" is canonical.)* The seam this
+- [x] **A status equals its code: `$sh.status == 0` is true.** ✅ (landed)
+      `DESIGN.md` §"Comparison across types" is canonical. The seam this
       entry recorded was that `$s == 0` reported while `match $s { 0 => … }` was
       skipped in silence. It closes by making the pair **equal**, not by refusing
       in more places:
@@ -6370,7 +6373,7 @@ unguarded, alongside fish and elvish, and carries a `TODO:` naming this entry.
       places is never the free tightening it looks like: it accepts strictly less,
       so no *new* program becomes valid and existing ones stop working.
 
-      Build notes. **Two places, not one.** The equality itself goes in
+      Built in two places, as the notes predicted. The equality itself is in
       **`Value::eq`**, which is what arms, `in` and `:dedup` read and why they
       agree for free. But `eval_binary` gates *before* it ever gets there:
       `if type_phrase(&left) != type_phrase(&right)` rejects the pair
@@ -6393,13 +6396,11 @@ unguarded, alongside fish and elvish, and carries a `TODO:` naming this entry.
       `[status(0) 0]:dedup` is one element, and that `status(1) != status(2)`
       still holds.
 
-      **`docs/REFERENCE.md` is deliberately untouched** and updates with the
-      implementation, not with this entry — it is "a terse lookup for everything
-      mesh implements today" (`REFERENCE.md`:3), and `status(0) == 0` still
-      reports in the tree. Its status section and its `==` examples both state
-      the current refusal and must change in the same commit that changes the
-      behavior. Raised by Codex on mikelward/mesh#465 after a draft updated it
-      early.
+      **`docs/REFERENCE.md` moved with the behavior**, not with the decision —
+      it is "a terse lookup for everything mesh implements today"
+      (`REFERENCE.md`:3), so its status section and its `==` examples changed in
+      the same commit that changed the binary, not in the design PR. Raised by
+      Codex on mikelward/mesh#465 after a draft updated it early.
 
       Not in scope, unchanged: `in` / `:has` answer `false` on a type mismatch for
       pairs that do not compare; ordering (`$s > 1`) still errors.
