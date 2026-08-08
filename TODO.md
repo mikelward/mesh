@@ -8431,6 +8431,202 @@ a one-line edit. Every claim below was checked against the built shell.
       that are errors today — change no accepted behavior and stay available
       whatever is decided.
 
+- [ ] **What status should a `return` of a non-bool, non-status value leave?**
+      Two types carry a status meaning and `return` honors both: a bool, where
+      `false` reports `1`, and a status, which forwards its own code. Every
+      other type lands on `0`, including every value a reader would expect to be
+      the "empty" one. Measured against `main`:
+
+      | `return` value | exit status |
+      | --- | --- |
+      | `false` | `1` |
+      | `true` | `0` |
+      | `status(N)` | `N` |
+      | `""`, `"0"`, `"x"` | `0` |
+      | `0`, `1` | `0` |
+      | `[]`, `[1]`, `[:]` | `0` |
+
+      That rule is the documented one — `REFERENCE.md` §"Functions" says
+      `return expr` "succeeds (status `0`) unless that value is `false` or a
+      nonzero status" — and for the two types that have an answer it is exactly
+      right: `return $a == $b` carries its own, and `return $sh.status` forwards
+      a failure rather than returning a number successfully.
+
+      The question is the **default under everything else**. A string, an int, a
+      list and a map all land on `0`, and `0` is not a neutral placeholder — it
+      is the code for "succeeded". So a type with no status meaning is given one
+      anyway, and given the affirmative one.
+
+      **The problem is not the mapping, it is that command position applies it
+      where value position refuses to.** The same function, asked the same
+      question, two spellings:
+
+      ```mesh
+      func f() { return "" }
+
+      if f()  { … }    # a string is not a condition; compare it (`… != ""`)
+      if f    { … }    # takes the yes branch, silently
+      ```
+
+      The value call gets mesh's stated stance — no truthy values, report rather
+      than guess, the same stance behind `if $xs:len` being refused and a
+      cross-type `==` reporting. Command position quietly does the opposite. A
+      string-returning predicate is therefore correct in one position and a
+      silent lie in the other, with no diagnostic marking the difference.
+
+      Found porting `mikelward/conf`, where fifteen functions can answer `""` for
+      "nothing found" — `rootdir`, `projectname`, `find-up`, `session-name` and
+      `ssh-client-host` among them. So `if rootdir { … }` is always-yes.
+
+      That config already works around it, and its own comment is the argument
+      for closing the hole. Beside `find-up`, which answers `""` on a miss:
+
+      > Ask with an explicit comparison — `if find-up("marker") != "" { … }` —
+      > since mesh has no truthy values; a string is not a condition.
+
+      That is the value-position rule, restated by hand because the author hit
+      it. One position taught them the rule; the other silently exempts itself
+      from it.
+
+      **Option A — leave it.** `""` stays `0`; the mapping is unchanged.
+      *For:* no change; the documented rule stays one sentence; a function whose
+      body ends in a command still forwards that command's status, which is the
+      case the channel split exists for.
+      *Against:* the inconsistency above is permanent, and it is the silent kind.
+      Every string-returning predicate is a trap in command position, and the
+      language offers no way to notice — no error, no warning, and the yes branch
+      is taken.
+
+      **Option B — make the empty value fail.** `""` → `1`, and presumably `[]`,
+      `[:]` and `0` with it.
+      *For:* `if rootdir { … }` starts meaning what a shell user reads it as.
+      *Against:* this is truthiness, which mesh rejected on purpose, arriving
+      through the status channel instead of the condition one. It also forces a
+      table nobody can keep straight — if `""` fails, does `"0"`? bash says the
+      string `0` is true and the *status* `0` is success, and mesh would now need
+      a third answer for a value that is neither. Worse, it makes the two
+      positions disagree in a new way rather than agreeing: `if f()` would still
+      *refuse* `""` while `if f` now reads it as false, so a reader still cannot
+      move a call between positions and keep its meaning.
+
+      **Option C — refuse it.** A `return` of a value that is neither a bool nor
+      a status has no status meaning, so using that function in command position
+      is an error, worded like the condition refusal it mirrors.
+      *For:* the two positions finally agree, and they agree on mesh's existing
+      answer rather than a new one. It is the same move already made for
+      `if $xs:len`, for cross-type `==`, and for `"$xs"` with a collection: name
+      the mistake instead of picking a reading. Nothing that works today silently
+      changes meaning — the programs it would newly reject are the ones that are
+      already wrong.
+      *Against:* it is a new refusal on a path that currently accepts everything,
+      so it needs a survey of what actually calls a value-returning function in
+      command position before the blast radius is known. A function called purely
+      for its side effects whose last statement happens to be a `return "…"`
+      would start erroring, and that is a real shape — though the value it
+      returns is being discarded in that position anyway, which is the argument
+      that it was always a mistake.
+
+      *Where it would have to live, which is the part that decides whether it is
+      worth it.* The check **cannot** go where the status is derived. `status_of`
+      (`repl.rs:1444`) is one function feeding at least four consumers, and Option C
+      wants to reject in exactly one of them:
+
+      | Consumer | What it does with the derived code | Option C's answer |
+      | --- | --- | --- |
+      | `call_func` — command position | branches on it | **reject** |
+      | `call_func_for_value` — `f()` | discards it, keeps the value | keep working |
+      | a bare value statement | sets `shell.result` and the status | ? |
+      | `f():capture` | `.status`, documented as a derived view of `.value` | ? |
+      | `return` in a sourced file | the file's status | ? |
+
+      `return` builds `Step::Return(value, code)` with the code already computed
+      — at the control-flow arm and again in `make_return` — so the split between
+      the two callers happens *after* the derivation. Rejecting inside
+      `status_of` would therefore break `f()` too, which is the spelling this
+      option exists to preserve, and would take `:capture` and sourced returns
+      with it.
+
+      So Option C is not "make the derivation stricter"; it is a **caller-boundary
+      rule** — only command position refuses. That is more work than the one-line
+      diagnostic it sounds like, and it needs an answer for each row above before
+      it can be implemented at all. `:capture` is the awkward one: its `.status`
+      is documented as "a derived view rather than an independent channel", so
+      either it keeps deriving `0` for a string — leaving the inconsistency alive
+      in a third place — or it errors, and `f():capture` stops being total.
+
+      And "the value is there to classify" holds for only one of the two ways a
+      function produces one. `call_func` restores the caller's `shell.result`
+      *before* it matches on how the body ended, so:
+
+      - **explicit `return`** — the value arrives inside `Step::Return(value,
+        code)` and is dropped by the `_` in `Step::Return(_, code) =>
+        Step::Continue(code)`. It is right there; the pattern simply ignores it.
+      - **falling off the end** — `func f() { "" }` — the body's value lived in
+        `shell.result`, which the restore has already overwritten, and `executed`
+        is a bare `Step::Continue(code)` carrying no value at all. Nothing is left
+        to classify.
+      - **a bare `return`** — `Ok(None) => Step::Return(shell.result.clone(),
+        last)`, and `call_func` initialized `shell.result` to the empty string
+        before the body ran. So the payload is `""` and the arm cannot tell it
+        from `return ""`: `func a() { return }` and `func b() { return "" }` both
+        answer `[]` from `${a()}` / `${b()}`. Classifying the payload would reject
+        the bare `return`, which is settled and documented — it preserves the last
+        status — and is the ordinary early exit (`return if $x == ""`).
+      - **a body that produces nothing** — `func nop() {}`, or one ending in a
+        statement with no value. `shell.result` still holds that same initialized
+        empty string, and only `shell.produced` separates the three states
+        (`Status` / `Value` / `Nothing`). By value alone `${nop()}` and
+        `func f() { "" }` are both `[]`, so threading the result without the
+        `produced` flag would reject every no-value function as though it had
+        returned a string.
+
+      Neither of those is a corner case. The second is what every function whose
+      body is a single expression looks like — and it has the same split today,
+      `func f() { "" }` making `if f()` report and `if f` answer yes. The third
+      is the ordinary early exit.
+
+      So Option C has to reconstruct a **four-part boundary state**, not classify
+      one value: the value from an explicit `return`; the implicit result,
+      captured before `shell.result` is restored; whether an operand was written
+      at all, a distinction that exists at the return site as `Ok(None)` versus
+      `Ok(Some(…))` and is erased when it becomes a `Step::Return`; and which of
+      `Produced`'s three states the body ended in. Every one of those is a
+      distinction the value alone cannot carry, because `""` is what the empty
+      string, the bare `return`, and the empty body all look like by then.
+
+      **And `call_func` is not the command-position boundary.** It has two
+      production callers: command position, and `run_hooks` (`repl.rs:11246`),
+      which calls it and throws the `Step` away on purpose — the comment beside
+      it says why, "a hook runs on the shell's schedule, not the user's, so what
+      it runs must not become `$sh.status`". A refusal placed there would fire
+      for a hook whose result is deliberately ignored, and a `preprompt` handler
+      ending in a string would print the new diagnostic on every prompt. So the
+      option needs a call-context distinction as well as the four-part state, or
+      the boundary has to move somewhere that does not exist yet.
+
+      That last one settles what the four before it suggested. This option's cost
+      was revised upward on **five** consecutive reviews, each time by reading the
+      path rather than the behavior. It began as "a one-line diagnostic"; it is
+      now "reconstruct a four-part state, at a boundary that was built to discard
+      it, which is also shared with a caller the rule must not apply to". The
+      first four said the boundary lacks the information; the fifth says it is the
+      wrong boundary.
+
+      The honest reading is therefore that **Option C costs more than the
+      inconsistency it removes**, and that Option A is the answer — not because
+      leaving a silent trap is good, but because every attempt to close it lands
+      on machinery built for a different purpose. If Option C is ever revisited it
+      should start from a new boundary rather than from `call_func`, and the case
+      for it has to be made against that cost rather than against the one-liner it
+      still reads as.
+
+      Not urgent, and deliberately kept apart from the open `ok CMD` question in
+      `DESIGN.md` §"Functions": that one is about *spelling* a status-to-bool
+      crossing the caller asks for, this one is about whether command position
+      should be performing an unannounced crossing of its own. Answering one
+      does not answer the other, but Option C would make the pair consistent —
+      a crossing only ever happens where it is written.
+
 ## Icebox / decide later
 
 - [ ] **`[…]` in command-argument position is not a list.** `f [a b]` reports
