@@ -615,8 +615,16 @@ src archive.tar.gz archive.tar gz
 </pre>
 
 `:exts` returns every extension (`tar.gz` above), while `:bare` removes every
-extension (`archive`). `:upper` and `:lower` change string case. Modifiers chain
-from left to right:
+extension (`archive`). `:ancestors` goes the other way, walking a path upward
+into the list a `find_up` search iterates over — the path itself first, the root
+last:
+
+<pre>
+mesh$ <strong>puts /a/b/c:ancestors:join(" ")</strong>
+/a/b/c /a/b /a /
+</pre>
+
+`:upper` and `:lower` change string case. Modifiers chain from left to right:
 
 <pre>
 mesh$ <strong>puts $file:base:upper</strong>

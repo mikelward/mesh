@@ -299,6 +299,7 @@ member lands next.)*
 | `:bare` | `foo` | basename minus **all** extensions |
 | `:real` | *(absolute)* | resolved real path |
 | `:url` | *(absolute)* | `file://host/path` URL |
+| `:ancestors` | `[a/b/foo.tar.gz a/b a]` | the path, then every directory above it |
 
 Rules:
 
@@ -330,20 +331,33 @@ Rules:
   reach for `:bare` when you mean "strip it all." Controlled peeling is also
   available via chaining (`$f:stem:stem`). `:bare` is one letter from `:base`
   (basename, extensions **kept**) — the mnemonic is *bare* = stripped down.
+- `:ancestors` is the **upward walk** `find_up`, project-root detection and
+  `rootdir` each write by hand as a `cd ..`-in-a-subshell loop: `pwd():ancestors`
+  is `[/a/b/c /a/b /a /]`, so the search becomes a plain list iteration over
+  `pwd()` — the *validated* shell-owned cwd, not the possibly-stale `$env.PWD`.
+  It **includes the path itself**, because that is where those searches start
+  looking and a list that skipped it would have every caller putting back the path
+  they already had; `:rest` is the strict "above me" reading. It includes the `/`
+  root for the same reason — a marker file can be there, and stopping short would
+  make the walk's own end the one directory it could not answer for. A **relative**
+  path stops at its first component (`x/y` → `[x/y x]`) rather than stepping off
+  the front into a path with no spelling, and the empty string walks nothing at
+  all (`[]`). Like `:dir` and unlike `:real` it is **lexical** — no component has
+  to exist, a `..` is a step it reports rather than resolves, and `:real:ancestors`
+  is the resolved walk. It takes **one path**, not a list: one path already answers
+  with a list, so mapping element-wise would nest a walk per element, and
+  `$paths:map(:ancestors)` is the spelling that wants that. The rejected name was
+  `:parents`, which reads as excluding the path itself — the one thing the walk
+  must include.
 
-*(TODO — decisions surfaced porting real `PATH` / `find_up` code:*
+*(TODO — a decision surfaced porting real `PATH` / `find_up` code:*
 - ***Transform-vs-predicate overlap.*** Keeping directories is the settled
   `:dirs` / `:d` filter modifier; the open question is only the footgun sitting
   next to it — `:dir` is *dirname* (a transform), so `$paths:filter(:dir)` silently
   keeps **everything** (a dirname is always a truthy string) when `$paths:dirs` (the
   directory **filter** modifier) was meant. Decide whether a transform modifier
   surfacing as a predicate's truthy value should be a **loud error** rather than a
-  quiet keep-all.
-- ***Upward path walk — `:ancestors` / `:parents`.*** `find_up`, project-root
-  detection, and `rootdir` all want `pwd():ancestors` → `[/a/b/c /a/b /a /]`, turning
-  a `cd ..`-in-a-subshell loop into a plain list iteration — `pwd()`, the *validated*
-  shell-owned cwd, not the possibly-stale `$env.PWD`. Decide the name and whether it
-  includes the path itself and the `/` root.)*
+  quiet keep-all.)*
 
 This modifier system is the direct answer to
 [fish #4002](https://github.com/fish-shell/fish-shell/issues/4002) ("a

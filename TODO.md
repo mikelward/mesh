@@ -1850,6 +1850,24 @@ all under "Beyond M3 — External tool integration".
       name arrives lossily in the call and byte-exact from the command form: a
       mesh string is UTF-8, the same boundary `precd` / `postcd` already hand a
       path across.
+- [x] **`:ancestors`, the upward path walk** — *landed*. `find_up`, project-root
+      detection and `rootdir` each wrote the same `cd ..`-in-a-subshell loop;
+      `pwd():ancestors` is `[/a/b/c /a/b /a /]`, so the search is a `for` over a
+      list and reads the directory the shell is actually in rather than whatever
+      `$env.PWD` was last set to. It answers `DESIGN.md`'s open question in the
+      section it was asked: the **name** is `:ancestors` (`:parents` reads as
+      excluding the path itself, and is now no modifier at all rather than an
+      alias), and the walk **includes both ends** — the path, because that is
+      where a `find_up` search starts looking, and `/`, because a marker file can
+      be there.
+
+      Lexical like `:dir` and unlike `:real`: no component has to exist, a `..`
+      is a step it reports rather than resolves, and `:real:ancestors` is the
+      resolved walk. It takes **one path** rather than mapping over a list, since
+      one path already answers with a list — the rule `:words` and `:split`
+      follow, with `$paths:map(:ancestors)` for the nesting. A relative path stops
+      at its first component rather than stepping off the front into the empty
+      path, and the empty string walks nothing.
 - [ ] **Should the cwd have a variable form too — `$sh.pwd` or `$sh.cwd`?** Three
       spellings already answer this question (`pwd`, `pwd()`, `$env.PWD`), and the
       case for a fourth is **interpolation**: a prompt segment is mostly a string,
