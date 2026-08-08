@@ -160,11 +160,15 @@ impl PartialEq for Value {
         match (self, other) {
             (Value::Integer(left), Value::Integer(right)) => left == right,
             (Value::Boolean(left), Value::Boolean(right)) => left == right,
-            // Against an int this falls to the `_` arm, where `1 == "1"` already
-            // lands: `status(0) == 0` is false, and `$s == status(0)` is the
-            // spelling. No exception is carved for the type — cross-type
-            // comparison is one general question (`TODO.md`), not a per-type patch.
             (Value::Status(left), Value::Status(right)) => left == right,
+            // A status and its code are one value: both are in the **numeric**
+            // equivalence class, joined through the code, which is lossless.
+            // Success is not a candidate — it collapses 255 codes onto `false`,
+            // which would make `status(1) == status(2)` (`DESIGN.md` §"Why
+            // `Status` compares to an int"). Keeping this in `eq` rather than in
+            // the operator is what makes `match`, `in` and `:dedup` agree.
+            (Value::Status(code), Value::Integer(value))
+            | (Value::Integer(value), Value::Status(code)) => i64::from(*code) == *value,
             (Value::List(left), Value::List(right)) => left == right,
             (Value::Map(left), Value::Map(right)) => left == right,
             (Value::Regex(left), Value::Regex(right)) => left == right,
@@ -210,7 +214,11 @@ impl std::hash::Hash for Value {
             Value::Function(value) => (9u8, value).hash(state),
             Value::Flag(value) => (10u8, value).hash(state),
             Value::FlagTerminator => 11u8.hash(state),
-            Value::Status(value) => (12u8, value).hash(state),
+            // Hashes into the **integer** bucket, as its code, because that is
+            // what it compares equal to — `status(0)` and `0` are one value, so
+            // they must be one key or `HashSet<Value>` breaks its own invariant
+            // and `:dedup` starts depending on the order it met them.
+            Value::Status(code) => (1u8, i64::from(*code)).hash(state),
         }
     }
 }

@@ -15456,9 +15456,7 @@ fn a_status_is_a_condition_and_the_boolean_words_take_one() {
 }
 
 #[test]
-fn a_status_compares_only_with_another_status() {
-    // No exception is carved for the type: it follows the cross-type rule now in
-    // force for every pair, which **refuses** rather than answering `false`.
+fn a_status_compares_with_an_int_and_with_nothing_else() {
     let out = run_with_input(
         "s = status(0)\n\
          puts ($s == status(0))\n\
@@ -15467,24 +15465,32 @@ fn a_status_compares_only_with_another_status() {
     );
     assert_eq!(String::from_utf8_lossy(&out.stdout), "true\ntrue\ntrue\n");
 
-    // `$sh.status == 0` is the shell reflex, so it is the pair the diagnostic
-    // has to teach rather than merely refuse. A status admits two readings — its
-    // code and its success — and the hint names the spelling for each, which is
-    // why equality itself respects neither (`DESIGN.md` §"Comparison across
-    // types").
-    let against_int = run_with_input("s = status(0)\nputs ($s == 0)\nputs after\n");
-    let stderr = String::from_utf8_lossy(&against_int.stderr);
-    assert!(
-        stderr.contains("cannot compare a status with an int")
-            && stderr.contains(":code == 0")
-            && stderr.contains("status(0)"),
-        "{stderr:?}"
+    // `$sh.status == 0` is the shell reflex, and it is simply **true** on
+    // success: a status and its code are one value, joined through the code
+    // because that reading is lossless (`DESIGN.md` §"Why `Status` compares to
+    // an int"). No diagnostic, no `:code` to reach for.
+    let against_int = run_with_input(
+        "s = status(0)\n\
+         puts ($s == 0)\n\
+         puts ($s != 0)\n\
+         puts (status(5) == 5)\n\
+         puts (0 == $s)\n",
     );
-    assert_eq!(String::from_utf8_lossy(&against_int.stdout), "after\n");
+    assert!(against_int.stderr.is_empty(), "{:?}", against_int.stderr);
+    assert_eq!(
+        String::from_utf8_lossy(&against_int.stdout),
+        "true\nfalse\ntrue\ntrue\n"
+    );
 
-    // The other projection, refused the same way: a status is truthy as a
-    // *condition* without being equal to `true`, and conflating the two is what
-    // would force `0 == true` by transitivity.
+    // Distinct statuses stay distinct — the property that disqualifies the
+    // *success* reading, which would collapse all 255 failures onto `false` and
+    // so make these two equal.
+    let distinct = run_with_input("puts (status(1) == status(2))\n");
+    assert_eq!(String::from_utf8_lossy(&distinct.stdout), "false\n");
+
+    // The other projection is refused, and that is what keeps the chain from
+    // reaching `0 == true`: a status is truthy as a *condition* without being
+    // equal to `true`.
     let against_bool = run_with_input("s = status(0)\nputs ($s == true)\nputs after\n");
     let stderr = String::from_utf8_lossy(&against_bool.stderr);
     assert!(
@@ -15494,36 +15500,14 @@ fn a_status_compares_only_with_another_status() {
     );
     assert_eq!(String::from_utf8_lossy(&against_bool.stdout), "after\n");
 
-    // A hint is built from the operator **and** the operand, because dropping
-    // either produces something that looks pasteable and asks a different
-    // question: `$s != 0` hinted as `$s:code == 0` inverts the branch, and
-    // `status(3) == 5` hinted as `:code == 0` turns a code test into a success
-    // test. Both raised in review.
-    for (source, code_form, status_form) in [
-        ("$s == 0", "`…:code == 0`", "`… == status(0)`"),
-        ("$s != 0", "`…:code != 0`", "`… != status(0)`"),
-        ("$s == 5", "`…:code == 5`", "`… == status(5)`"),
-        ("$s != 5", "`…:code != 5`", "`… != status(5)`"),
-    ] {
-        let out = run_with_input(&format!("s = status(3)\nputs ({source})\n"));
-        let stderr = String::from_utf8_lossy(&out.stderr);
-        assert!(
-            stderr.contains(code_form) && stderr.contains(status_form),
-            "{source} should hint {code_form} and {status_form}: {stderr:?}"
-        );
-    }
-
-    // A code outside 0-255 has no status to name, so the `status(N)` half is
-    // dropped rather than suggesting `status(300)`, which is itself an error.
-    for source in ["$s == 300", "$s == -1"] {
-        let out = run_with_input(&format!("s = status(3)\nputs ({source})\n"));
-        let stderr = String::from_utf8_lossy(&out.stderr);
-        assert!(
-            stderr.contains("no status carries a code outside 0-255")
-                && !stderr.contains("or a status"),
-            "{source}: {stderr:?}"
-        );
-    }
+    // A code no status can carry is not an error, just unequal — there is
+    // nothing to teach, since the comparison is meaningful and simply false.
+    let out_of_range = run_with_input("s = status(3)\nputs ($s == 300)\nputs ($s == -1)\n");
+    assert!(out_of_range.stderr.is_empty(), "{:?}", out_of_range.stderr);
+    assert_eq!(
+        String::from_utf8_lossy(&out_of_range.stdout),
+        "false\nfalse\n"
+    );
 
     // The bool pair's polarity is the operator and the literal together: `==
     // false` and `!= true` both ask about failure, so both want `not`.
@@ -15551,15 +15535,29 @@ fn a_status_compares_only_with_another_status() {
     );
     assert_eq!(String::from_utf8_lossy(&ordered.stdout), "after\n");
 
-    // So a `0` arm never matches a status, and `status(0)` is the arm that does.
-    let arms = run_with_input(
+    // A `0` arm and a `status(0)` arm now name the *same* value, so first-match
+    // decides between them rather than type does — whichever is written first
+    // wins, and neither is dead code.
+    let int_first = run_with_input(
         "func f() { return status 0 }\n\
          x = match f() { 0 => int-arm\n\
            status(0) => status-arm\n\
            _ => neither }\n\
          puts $x\n",
     );
-    assert_eq!(String::from_utf8_lossy(&arms.stdout), "status-arm\n");
+    assert_eq!(String::from_utf8_lossy(&int_first.stdout), "int-arm\n");
+
+    let status_first = run_with_input(
+        "func f() { return status 0 }\n\
+         x = match f() { status(0) => status-arm\n\
+           0 => int-arm\n\
+           _ => neither }\n\
+         puts $x\n",
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&status_first.stdout),
+        "status-arm\n"
+    );
 }
 
 /// Cross-type `==` **refuses**, and the refusal lives in the *operator* so that
@@ -15579,7 +15577,7 @@ fn cross_type_equality_refuses_at_the_operator_and_stays_total_beneath() {
         ("1 == \"1\"", "cannot compare an int with a string"),
         ("1 != \"1\"", "cannot compare an int with a string"),
         ("0 == false", "cannot compare an int with a bool"),
-        ("status(0) == 0", "cannot compare a status with an int"),
+        ("status(0) == true", "cannot compare a status with a bool"),
         ("[1] == 1", "cannot compare a list with an int"),
     ] {
         let out = run_with_input(&format!("puts ({source})\nputs after\n"));
@@ -15619,18 +15617,42 @@ fn cross_type_equality_refuses_at_the_operator_and_stays_total_beneath() {
     );
     assert!(total.stderr.is_empty(), "{:?}", total.stderr);
 
-    // And a `match` literal arm of another type simply does not match. This is
-    // the seam: `$s == 0` reports while a `0` arm against the same status is
-    // quietly skipped. Widening the refusal to arms would break heterogeneous
-    // `match`, so it is left as the documented cost of the operator-level scope.
+    // A `match` literal arm of another type still simply does not match, and a
+    // `0` arm against a **status** now *takes*, because arms read the same
+    // `Value::eq` the operator does. That is the seam closing from the equality
+    // side rather than by teaching arms to refuse — which would have aborted a
+    // `match` over a collection holding statuses beside ints.
     let arms = run_with_input(
         "func f() { return status 0 }\n\
          x = match f() { 0 => int-arm\n\
            _ => fell-through }\n\
-         puts $x\n",
+         puts $x\n\
+         y = match \"s\" { 0 => int-arm\n\
+           _ => fell-through }\n\
+         puts $y\n",
     );
-    assert_eq!(String::from_utf8_lossy(&arms.stdout), "fell-through\n");
+    assert_eq!(
+        String::from_utf8_lossy(&arms.stdout),
+        "int-arm\nfell-through\n"
+    );
     assert!(arms.stderr.is_empty(), "{:?}", arms.stderr);
+
+    // Because the equality is in `Value::eq`, `Hash` has to agree or
+    // `HashSet<Value>` breaks its own invariant: a status and its code are one
+    // key, so `:dedup` collapses them, while two distinct statuses stay two.
+    let numeric = run_with_input(
+        "xs = [status(0) 0]\n\
+         puts $xs:dedup:len\n\
+         ys = [status(1) status(2) 1]\n\
+         puts $ys:dedup:len\n\
+         puts (0 in [status(0)])\n\
+         puts (status(0) in [0])\n",
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&numeric.stdout),
+        "1\n2\ntrue\ntrue\n"
+    );
+    assert!(numeric.stderr.is_empty(), "{:?}", numeric.stderr);
 }
 
 #[test]
