@@ -17576,6 +17576,25 @@ fn help_names_a_declared_return_type() {
 }
 
 #[test]
+fn an_evaluated_lambda_keeps_the_return_type_it_declared() {
+    // A lambda's declaration has to survive *evaluation*, not just parsing: a
+    // hook slot receives the value, and by then the tree is gone. The unit test
+    // builds the callable by hand, so only running the whole path covers the
+    // forwarding in between. Raised in review as a P1.
+    let typed = run_with_input("f = str func() { \"x\" }\ntype f\n");
+    assert!(
+        String::from_utf8_lossy(&typed.stdout).contains("a function returning str"),
+        "{:?}",
+        String::from_utf8_lossy(&typed.stdout)
+    );
+    // And still plain for one that declared nothing — the absence is the report.
+    let untyped = run_with_input("f = func() { \"x\" }\ntype f\n");
+    let stdout = String::from_utf8_lossy(&untyped.stdout);
+    assert!(stdout.contains("a function"), "{stdout:?}");
+    assert!(!stdout.contains("returning"), "{stdout:?}");
+}
+
+#[test]
 fn a_bare_return_carries_the_result_so_far() {
     // `return` on its own exits early carrying the body's result *so far*, not a
     // freshly minted status: a value the body produced, the status of a command

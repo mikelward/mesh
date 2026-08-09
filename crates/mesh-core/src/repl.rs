@@ -5130,10 +5130,7 @@ fn eval_expr(
             parameters,
             captures,
             body,
-            // Parsed and carried on the expression; the callable does not hold it
-            // yet, so a typed lambda still behaves as an untyped one at the call.
-            // Narrowing it lands with the rest of the narrowing — `TODO.md`.
-            return_type: _,
+            return_type,
         } => {
             let mut captured = Vec::with_capacity(captures.len());
             for name in captures {
@@ -5148,6 +5145,7 @@ fn eval_expr(
                 parameters.clone(),
                 captured,
                 body.clone(),
+                *return_type,
             )))
         }
         // A bare `:name` is the function that applies that modifier — the value, not

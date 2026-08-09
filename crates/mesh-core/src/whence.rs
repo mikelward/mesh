@@ -625,6 +625,13 @@ fn shape(value: &Value) -> String {
         // `j = cmd &` binds a job whose members and job-reference behavior are
         // nothing like a stream's.
         Value::Job(_) => "a job handle".to_owned(),
+        // A lambda's declared return type is the one thing about it worth
+        // printing — it has no literal form, so the shape is the whole answer,
+        // and "what does calling this give me?" is what a reader is asking.
+        Value::Function(function) => match function.return_type() {
+            Some(declared) => format!("a function returning {}", declared.as_str()),
+            None => "a function".to_owned(),
+        },
         other => crate::repl::value_kind(other).to_owned(),
     }
 }
@@ -791,6 +798,46 @@ mod tests {
         assert_eq!(
             rendered("deploy", &found, false),
             "deploy is a function\n    func deploy(target, --force, ...hosts)\n"
+        );
+    }
+
+    #[test]
+    fn a_lambda_reports_the_return_type_it_declared() {
+        // The annotation has to survive onto the *callable*, not just the parsed
+        // syntax: a hook slot receives the value, and by then the AST is gone.
+        // `type` is where that becomes visible today. Raised in review as a P2.
+        let mut vars = Vars::new();
+        let body = Source {
+            statements: Vec::new(),
+            span: 0..0,
+        };
+        vars.set_value(
+            "f",
+            Value::Function(crate::vars::FuncValue::lambda(
+                Vec::new(),
+                Vec::new(),
+                body.clone(),
+                Some(ReturnType::Str),
+            )),
+        );
+        vars.set_value(
+            "g",
+            Value::Function(crate::vars::FuncValue::lambda(
+                Vec::new(),
+                Vec::new(),
+                body,
+                None,
+            )),
+        );
+        let funcs = Funcs::new();
+        assert_eq!(
+            rendered("f", &look_up("f", &funcs, &vars), false),
+            "f is a variable\n    a function returning str\n"
+        );
+        // And nothing invented for one that declared none.
+        assert_eq!(
+            rendered("g", &look_up("g", &funcs, &vars), false),
+            "g is a variable\n    a function\n"
         );
     }
 
