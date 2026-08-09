@@ -7132,6 +7132,215 @@ two other shells' answers turned out to be strictly better than ours.
       Worth settling before the language is widely written, since it changes
       every existing single-quoted string.
 
+- [ ] **A `match` must be exhaustive — most likely by requiring a default arm.**
+      Directed by mikelward. **Option B of the five weighed under §"Decisions needed", *How
+      loud should a mismatch be?*** — that entry is where the choice is made;
+      this one is the build notes for it. Don't start until it is chosen. This
+      **reverses a lean**: `DESIGN.md` §Matching records
+      *"whether non-`_`-exhaustive matches must be total is (open) — leaning
+      lenient (a `match` with no arm hit yields `""`, like a no-`else` `if`)"*,
+      and lenient is what ships — `r = match "x" { 0 => "y" }` binds `r` to the
+      empty string and leaves the status `0`, so a subject nobody wrote an arm
+      for is indistinguishable from an arm that produced `""`.
+
+      ```mesh
+      match $kind { file => … ; dir => … }             # error: not exhaustive
+      match $kind { file => … ; dir => … ; _ => … }    # fine — the default arm
+      ```
+
+      **mikelward has since steered the spelling**: *"I don't care too much about
+      the partial keyword stuff. maybe the user just has to provide a default
+      arm."* So the leading answer is the **no-keyword** row of the table below —
+      a default arm, and nothing new in the grammar. `partial match` stays
+      weighed rather than deleted, because the reason it was attractive (an
+      empty `_ => {}` reads as an oversight rather than a decision) is a real
+      cost of the simpler spelling and should be visible when this is settled.
+
+      **The rule has to be syntactic, and that is the whole design question.**
+      mesh has no static types, so there is no way to prove a set of arms covers
+      a subject: nothing tells the checker that `$kind` is a bool, so `true` and
+      `false` arms cannot be known total, and `0..=255` cannot be known to
+      exhaust a status. The only arm that provably catches everything is `_`.
+
+      **A future subject binder does *not* join it, and an earlier draft said it
+      would** (Codex, #472). Neither candidate spelling for the binder deferred
+      alongside `status(n)` in `DESIGN.md` §Matching is total: `match expr as s`
+      names the subject and covers no cases at all, and a Rust-style
+      `name @ pattern` inherits its coverage from `pattern`, so `name @ 0` is as
+      partial as a bare `0`. Counting either as a catch-all would let the check
+      accept a `match` with no total arm — the exact hole this entry exists to
+      close. The check admits a pattern only if it is **independently
+      guaranteed to match every value**; a future binding form qualifies only if
+      it is explicitly defined as unconditional, and that has to be stated when
+      the form is chosen rather than assumed here. So *exhaustive* here
+      can only mean **"has an unguarded catch-all arm"** — a one-line check over
+      the parsed arms, needing no resolver and no type inference. That is worth
+      stating plainly rather than leaving readers to expect Rust's version and
+      find a weaker one; it is also why this is the entry in this section that
+      can actually be built, unlike the unbound-variable item above.
+
+      ***Unguarded* is load-bearing, not a qualifier** — thanks to Codex on
+      #472. The grammar allows a guard on any arm, `_` included, and a guard is
+      not evaluated until the arm is reached, so
+
+      ```mesh
+      r = match "x" { _ if false => "never" }     # today: r is ""
+      ```
+
+      has a catch-all by any syntactic reading and matches nothing. Under the
+      check as specified it is **rejected** — the catch-all is guarded, so the
+      `match` is not exhaustive and never runs to bind anything. A check
+      counting bare `_` would instead accept it and preserve exactly the silent
+      empty this entry exists to remove, which is the failure the qualifier
+      guards against. Two consequences for the check: a guarded
+      catch-all does **not** satisfy it, and `_` inside an **alternation**
+      does — `"a" | _ => …` is total today (verified), so the check reads
+      through `MatchPattern::Alternation` rather than only looking at
+      whole-pattern `_`.
+
+      **Why it is worth having anyway**, given how weak the check is: the
+      failure it catches is the one shells make constantly — a `match` over a
+      known-small set that silently grows a case. The value is not proving
+      coverage, it is forcing the writer to *say* which of the two they meant,
+      the same way `partial` says it.
+
+      Spellings weighed:
+
+      | Option | For | Against |
+      | --- | --- | --- |
+      | **Require a default arm, no keyword** *(leaning — mikelward's steer)* | Zero grammar; the catch-all is already the spelling, and Rust makes you write the same no-op. No word to reserve and no call shape to repair — the `partial match …` question below simply does not arise | An empty `_ => {}` reads as an oversight rather than a decision, which is exactly what a keyword would have said |
+      | **`partial match …`** | Says the intent in the word a reader meets first, before the arms; leaves `match` meaning the safe thing | A new contextual keyword, and it takes the `partial match …` call shape — see the compatibility note below, now moot under the leaning row |
+      | **A trailing `else` on the `match`** | Reuses a keyword | Contested by the dangling-`else` question already open on the flat soft bind, and it is a *body*, not a declaration of intent |
+
+      **Every spelling costs a source edit at each non-exhaustive site — but not
+      the same edit**, and an earlier draft said "nothing to migrate" on the
+      leaning row and then described one migration for all three (Codex, #472).
+      The count is shared, and what has been surveyed is a **floor, not a
+      total**: **8 of the 17** *multi-arm* examples in `docs/` (7 of 14 in
+      `DESIGN.md`, 1 of 3 in `REFERENCE.md`) have no unguarded catch-all today.
+      That sample excludes the shape the rule hits hardest — a **one-arm
+      `match` whose arm is not an unguarded catch-all**, which is most of them
+      in practice, since a one-arm form is the normal way this file and `docs/`
+      illustrate a rule (`DESIGN.md`:5016 is `match "x" { 0 => … }`, written to
+      show a miss). Not *every* one-arm site: `match 1 { _ => … }` is one arm
+      and already exhaustive, as is a lone `"a" | _ => …` under the alternation
+      rule above, and both need no edit — an earlier draft said one arm implied
+      non-exhaustive, which is the same over-claim by one word (Codex, #472).
+      `crates/mesh/tests/cli.rs` carries more of both. So read the figure as
+      "at least", never as the inventory. What differs
+      is what each site gains:
+
+      | Spelling | The edit at a non-exhaustive site | On top of that |
+      | --- | --- | --- |
+      | Require a default arm | add `_ => …` — an arm, and a decision about what it does | nothing; no word reserved, no call shape touched |
+      | `partial match …` | add the keyword, leaving the arms alone | the `partial match …` call shape, migrated by quoting the head — see below |
+      | Trailing `else` | add an `else` body | the dangling-`else` question |
+
+      The default-arm row asks for the most thought per site, since an `_` arm
+      has to *do* something; the keyword asks for the least. That cuts against
+      the leaning row and is worth seeing plainly rather than being folded into
+      one shared number.
+
+      **The compatibility cost of the keyword — kept because it is why the
+      leaning moved, though moot if the no-keyword row wins.** An earlier
+      draft checked that `func partial() { … }` and `partial = 1` still parse and
+      concluded the contextual claim was free. It isn't: the conflicting shape is
+      **invocation**, not definition. `partial match foo` is a legal call today,
+      passing `match` as the first argument — verified, `func partial(a, b)` run
+      as `partial match foo` binds `a=match`, `b=foo`. Claiming the word wherever
+      `match` follows takes exactly that sequence. This is narrower than the
+      `wrapper` / `fork` / `with` precedents it was compared to: those are
+      claimed before a *construct* keyword or a binding shape, where `match` is
+      an ordinary word a command may well be passed. Every other call shape
+      survives, as with the existing contextual keywords — only this one sequence
+      is taken.
+
+      **The escape is quoting the command head**, and it already works:
+      `'partial' match foo` invokes `func partial(a, b)` with `a=match`,
+      `b=foo` — verified. It falls out of the mechanism rather than needing to be
+      added, since the contextual checks go through `Parser::word`, which is
+      `is_bare_text` (`Parser::word`, `parser.rs`:7457), so a quoted head can never trigger a
+      keyword while still resolving a function. `command partial match foo` is
+      *not* the escape — `command` resolves externals only, so it reports
+      `command not found: partial` against a function of that name. Both of these
+      came from Codex on #472: the first review found the invocation break, which
+      an earlier draft missed by testing only definitions, and the second found
+      the quoted spelling, which the same draft wrongly called nonexistent after
+      testing only `command`.
+
+      So the cost is an **edit**, not an unavoidable break: one sequence
+      changes meaning and has a one-character fix. It belongs to the
+      **`partial match` row alone** — an earlier draft recorded it against the
+      no-keyword row, which never claims the word and so never takes the call
+      shape (Codex, #472).
+
+      **Open, raised by mikelward: should `else` be mandatory too?** *"maybe
+      `else` should be mandatory too… don't decide now but open questions
+      there."* Recorded, not settled. The argument is pure consistency — this
+      entry's whole case is that a construct which silently yields `""` when
+      nothing matched is indistinguishable from one that matched and produced
+      `""`, and a no-`else` `if` is that same shape. `DESIGN.md` says so in the
+      very sentence being reversed: *lenient … like a no-`else` `if`*. Verified:
+      `x = if false { "yes" }` binds `x` to `''`.
+
+      What has to be answered before it could be built:
+
+      - **Statement position must be exempt, and that is the whole difficulty.**
+        `if $x { do-thing }` on its own line is the commonest shape in any shell,
+        and there is no missing case there — no value is wanted, so nothing is
+        silently empty. Requiring `else` on it would be absurd. So the rule can
+        only bite in **expression position**, which mesh already distinguishes
+        for how a block yields a value (see `DESIGN.md` §Matching, "How an arm
+        body yields a value"). Whether a rule that applies in one position and
+        not the other is worth its explanation is the real question.
+      - **Whether `match` and `if` must agree.** If `match` needs a default and
+        `if` does not, that asymmetry needs a reason better than "we did one
+        first". The reason may exist — arms are a pattern→result mapping where
+        omission is easy to miss, while an `if` has exactly two branches and the
+        missing one is visible — but it should be written down rather than left
+        as an accident of ordering.
+      - **The postfix guard is exempt, by construction rather than by choice**
+        (Codex, #472). `DESIGN.md` §Conditionals defines `stmt if cond` /
+        `stmt unless cond` as *"deliberately limited to a single statement — no
+        `else`, no block"*, so there is no spelling for an `else` there, and
+        `return unless $args:len > 0` would have no legal repair. It is also
+        statement position, which the exemption above already covers, so this
+        follows twice over. A **block** `unless cond { … }` is a different case
+        and tracks whatever `if` decides.
+
+      Consequences to settle with it:
+
+      - **What a `partial match` yields when nothing hits**, if the keyword row
+        wins after all.** Keeping today's `""`
+        and status `0` is the smallest change and matches a no-`else` `if`. The
+        alternative is a nonzero status, which would make the miss testable —
+        but that is a second decision and should not ride in silently.
+      - **Statement position too, or expression position only — and note that
+        requiring it there reverses a recorded rule.** In statement position the
+        value *is* discarded, so nothing downstream receives the empty and the
+        "silent `""`" argument does not reach it. `DESIGN.md` §"Open questions"
+        already records that exemption for the coupled `else`/totality question:
+        a statement-position `match` runs its arms for effect, produces no empty
+        for anything to receive, and stays permitted under *every* option there.
+        Verified — a statement-position `match` that hits no arm survives with
+        status `0`. So requiring a catch-all everywhere is not the neutral "rule
+        with no clause to remember" an earlier draft called it (Codex, #472): it
+        reverses that exemption, and it has to say so and carry the effect-only
+        sites in its migration count, which the `docs/` figures above exclude.
+        Expression-position-only leaves the recorded rule standing.
+      - **It changes the meaning of existing code, but not much of it.** The edit
+        is one catch-all arm or one keyword per site, and the tree's own
+        footprint is `docs/` examples only — the prelude has no `match` at all. Audit
+        `crates/mesh/tests/` in the same pass; those are the bulk of the sites.
+      - **It does *not* help type-strict equality, despite the adjacency.** Worth
+        stating because the opposite is the natural assumption and an earlier
+        draft of §"Beyond M3 — Type-strict equality" made it: a `match` that
+        already has `_` passes this check and still silently redirects to `_`
+        when a `0` arm stops matching a status, and requiring catch-alls
+        everywhere *increases* the number of sites in that state. The two
+        entries are independent, and B leaves A's silent rows exactly as they
+        are.
+
 ## Expand a word once per command
 
 **Asked by the repo owner** while declared modifiers landed: the intent was one
