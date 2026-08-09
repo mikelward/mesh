@@ -12637,13 +12637,18 @@ fn typed_header_follows(after: &str) -> bool {
     if !tail.starts_with([' ', '\t']) {
         return false;
     }
-    // A name, then its signature opener. The name is whatever runs up to the
-    // paren; empty means `func (`, which is a lambda rather than a definition.
+    // A name, then its signature opener. The parser reads tokens, so whitespace
+    // between the two is invisible to it and `int func f ()` is a definition
+    // there; this reader works on raw text and has to allow the same gap, or the
+    // spelling with a space stops being recognized as a header and its malformed
+    // body runs at top level.
     let name = tail.trim_start_matches([' ', '\t']);
-    let Some(open) = name.find('(') else {
+    let after_name = name.trim_start_matches(|c: char| !c.is_whitespace() && c != '(');
+    // Nothing consumed means no name — `func (` is a lambda, not a definition.
+    if after_name.len() == name.len() {
         return false;
-    };
-    open > 0 && !name[..open].contains(char::is_whitespace)
+    }
+    after_name.trim_start_matches([' ', '\t']).starts_with('(')
 }
 
 /// The type words [`strip_type_marker`] knows, kept beside the parser's own set
@@ -18006,6 +18011,11 @@ mod tests {
         // `wrapper` strip exists.
         for input in [
             "int func f() {\nputs hi\n",
+            // The parser reads tokens, so a space before the signature opener is
+            // invisible to it; this reader must allow the same gap or the body
+            // stops being quarantined. Raised in review as a P1.
+            "int func f () {\nputs hi\n",
+            "int wrapper func f (...xs) {\nputs hi\n",
             "int wrapper func f(...xs) {\nputs hi\n",
             "status func f() {\nputs hi\n",
             // Reserved, and still a header: the diagnostic has to be the
