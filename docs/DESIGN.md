@@ -451,15 +451,15 @@ puts ubuntu:latest    # `:latest` is not a modifier; quote the whole word to kee
                       # a variable (`"${x}:latest"`)
 ```
 
-**When that error fires has since moved to run time**, though what is reserved has
-not. [Declaring a modifier](#modifiers) lets a user add to the vocabulary, so the
-parser can no longer hold the whole list and cannot tell a typo from a name declared
-elsewhere; `:latest` is diagnosed when the line runs rather than when it is read. The
-*grammar* reservation below is untouched — `ubuntu:latest` is still a modifier
-position and never text — and the escapes above are still the escapes. That move is
-**shipped**: the parser's gate on `MODIFIER_NAMES` is open for a value subject, for
-the `:name` reference, and for the regex-literal suffix alike, and
-`parser::unknown_modifier_message` carries the wording to its new site.
+**That error fires at run time** *(shipped)*, though what is reserved is a
+grammar question and is decided earlier. [Declaring a modifier](#modifiers) lets
+a user add to the vocabulary, so the parser cannot hold the whole list and cannot
+tell a typo from a name declared elsewhere; `:latest` is diagnosed when the line
+runs rather than when it is read. The reservation below is unaffected —
+`ubuntu:latest` is a modifier position and never text — and the escapes above are
+the escapes. The parser's gate on `MODIFIER_NAMES` is open for a value subject,
+for the `:name` reference, and for the regex-literal suffix alike, with
+`parser::unknown_modifier_message` carrying the wording.
 
 **The flag suffix on a [regex literal](#operators-and-matching) is opened with the
 rest** *(shipped)*, because a regex flag **is** a modifier — one whose subject is a
@@ -479,11 +479,10 @@ ordinary postfix chain, resolved against that subject when it runs. What that bu
 narrow and worth stating exactly: a declared modifier may follow a regex literal. The
 flags themselves already reach a pattern by every other route.
 
-The diagnostic survives the move with better grounds, not worse. `/a/:g` reports that
-`:g` is not a regex flag today because the parser guessed the subject from syntax; at
-run time the subject *is* a pattern, so the same message can be given for a reason the
-parser only inferred — and the flag names it lists are still a closed set, since a
-built-in modifier name cannot be redeclared.
+The diagnostic is unaffected: `/a/:g` reports that `:g` is not a regex flag, and at
+run time the subject *is* a pattern, so the message rests on the subject rather than
+on a guess from syntax. The flag names it lists are a closed set, since a built-in
+modifier name cannot be redeclared.
 
 Underneath both is one rule, the same one the `:ident` reservation above states:
 **shape decides, vocabulary does not.** A colon and an identifier is a modifier
@@ -504,10 +503,8 @@ flag needs a pattern subject, and a string is not one.
 once, in extended mode, rather than compiled and then modified — which is what
 [`re()`](#tests-and-comparisons) already says, and why `re($x, extended: true)` exists.
 Making the suffix an ordinary postfix chain does not change that; it constrains *when*
-the literal compiles, not what the grammar reads. It used to compile eagerly, before
-any postfix ran, and the contract was unmet — `/foo#(/:x` reported `invalid regex` —
-which was a bug to fix alongside rather than a behavior to preserve. `Expr::Regex` now
-carries the flag, so the literal is built with it.
+the literal compiles, not what the grammar reads. `Expr::Regex` carries the flag, so
+the literal is built with it rather than compiled and then modified.
 
 What folds is the **leading run** of flags, and it closes at the first modifier that is
 not one — because that is exactly how far the text still belongs to the literal. Past
@@ -523,38 +520,31 @@ just as `re($x, extended: true)` is for the constructor. Nothing is applied
 retroactively and no ordering rule is added; a literal simply has to be constructible
 before a chain can run on it.
 
-*(The [`re()`](#tests-and-comparisons) note used to state this more strongly — "never
-as a post-hoc modifier on a finished value" — which the implementation has never done:
-post-hoc `:x` on a pattern whose text is *valid* works, and is tested. That sentence is
-narrowed to what actually holds, so the two sections agree: a post-hoc flag cannot
-rescue text that never compiled.)*
+*(A post-hoc `:x` on a pattern whose text is *valid* works, and is tested; what it
+cannot do is rescue text that never compiled. [`re()`](#tests-and-comparisons)
+states the same limit.)*
 
 **Only a bare identifier after the colon is claimed** — the reservation is of the
 shape, not of the colon. `key:2`, `key:/path`, `key:`, `http://x` and `a:$b` all keep
 the punctuation reading they had, so the break is narrower than "colons are taken".
 
 A name the vocabulary *does* hold but the engine cannot apply yet (`:sort`) parses
-and reports at run time. That was once the *distinguishing* case, an unknown name
-having failed earlier; both now report at run time, and the two stay worded
+and reports at run time, exactly as an unknown name does. The two stay worded
 differently because "no such modifier" and "not implemented yet" are different
-answers even when they arrive together.
+answers even when they arrive together, and the parser tests `MODIFIER_NAMES` for
+neither. Reserving `:ident` in the grammar is what makes argument position agree
+with expression position.
 
-The parser tests `MODIFIER_NAMES` for neither, now that both report at run time. So
-reserving `:ident` in the grammar does not introduce a new rule; it makes argument
-position agree with expression position, which is where the inconsistency was.
+The alternative — gating on the name list — is worse in the way that matters.
+Under it the reserved vocabulary **grows silently with every modifier added**:
+`img:raw` is text until someone adds `:raw`, and then it quietly stops being.
+`:kind` and `:where` are two such names on their own, each owing a deprecation
+cycle. Reserving the whole shape up front makes that class of change a non-event:
+adding a modifier cannot break argument text, because `:ident` was never argument
+text.
 
-The alternative — keep gating on the name list — was written into an earlier
-draft of this entry and is worse in the way that matters. Under it the reserved
-vocabulary **grows silently with every modifier added**: `img:raw` is text until
-someone adds `:raw`, and then it quietly stops being. This proposal is itself the
-first instance, since `kind` and `where` are two new names, and the entry had to
-float a deprecation cycle to cope. Reserving the whole shape up front makes that
-class of change a non-event: adding a modifier can no longer break argument text,
-because `:ident` was never argument text.
-
-It also fails loudly. `ubuntu:latest` becomes "unknown modifier" the day the rule
-lands, rather than working for two years and then changing meaning under a
-release note nobody read.
+It also fails loudly. `ubuntu:latest` is "unknown modifier" outright, rather than
+working for two years and then changing meaning under a release note nobody read.
 
 The cost is a one-time, fully-known break rather than a creeping one, and it is
 real: `docker run ubuntu:latest`, `git show HEAD:file`, `rsync host:src dst` and
@@ -570,11 +560,10 @@ comment, and no unquoted one appears in command-argument position at all. The
 pain lands on interactive typing rather than on configuration, which is worth
 saying plainly because it is the part a repo survey cannot measure.
 
-**Quoting the subject does not preserve the old reading**, and that is the part a
-reader is most likely to get wrong, because quoting is the usual escape from
-shell metacharacters. It does not help here — `"abc":upper` is literal `abc:upper`
-today and becomes `ABC`, exactly as the bare form does. What the quotes have to
-enclose is the **whole token**:
+**Quoting the subject does not stop the modifier**, and that is the part a reader
+is most likely to get wrong, because quoting is the usual escape from shell
+metacharacters. It does not help here — `"abc":upper` is `ABC`, exactly as the
+bare form is. What the quotes have to enclose is the **whole token**:
 
 ```
 puts "abc":upper      # ABC        — the modifier applies; quoting the subject changes nothing
@@ -585,14 +574,14 @@ puts 'abc:upper'      # abc:upper  — likewise
 So the escape hatch exists and is cheap, but it is `"img:raw"` rather than the
 `"img":raw` a reader might reach for first.
 
-**And "quote the whole token" is not the rule when the subject is a variable** —
-that phrasing is wrong in the case people will actually hit. A modifier already
-binds inside a double-quoted string, so quoting does not stop it:
+**"Quote the whole token" is not the rule when the subject is a variable**, which
+is the case people will actually hit. A modifier binds inside a double-quoted
+string, so quoting does not stop it:
 
 ```
 x = "abc";    puts "$x:upper"      # ABC          — quoted, and the modifier applies
 x = "abc";    puts "${x}:upper"    # abc:upper    — braces stop it
-x = "ubuntu"; puts "$x:latest"     # ubuntu:latest today; an ERROR under this rule
+x = "ubuntu"; puts "$x:latest"     # an ERROR — `:latest` is not a modifier
 x = "ubuntu"; puts "${x}:latest"   # ubuntu:latest — safe either way
 ```
 
@@ -656,12 +645,11 @@ answered: option A keeps it exactly and `if:kind` stays `keyword`; option B has
 when nothing is found — which is a different contract, not a tweak. Everything
 else in this section holds either way; this paragraph is where the two diverge.
 
-*(Still open, but no longer even-handed: the shipped `type -t` answers `keyword`
-for a bare `if`, which is option A's behavior. That is evidence rather than a
-decision — `-t` is bash's vocabulary and was not written to settle this — but
-"one vocabulary in every form" applies to `:kind` too, so choosing B would put
-two answers about the same word in the tree and now costs a change to `type` as
-well.)*
+*(Still open, but not even-handed: the shipped `type -t` answers `keyword` for a
+bare `if`, which is option A's behavior. That is evidence rather than a decision
+— `-t` is bash's vocabulary and was not written to settle this — but "one
+vocabulary in every form" applies to `:kind` too, so choosing B would put two
+answers about the same word in the tree and costs a change to `type` as well.)*
 
 `keyword` is the one that is easy to miss, and it is **defined by the grammar,
 not by a list of favorites**: a keyword is a word the parser claims *in command
@@ -832,13 +820,10 @@ func if(_x) { … }; "if" arg    # a real function, hidden by `keyword`
 
 (Both spellings resolve func → external, so either can be the thing hidden.)
 
-The second is the harder case. An earlier draft of this entry claimed the
-bare-subject decision softened it — that once the guard reads `if if:kind` the
-subject is bare, and bare is the spelling the parser really does claim. **That
-reasoning is wrong**, and the decision above is what makes it wrong: modifiers
-take values, so `if:kind`, `"if":kind` and `$n:kind` over a variable holding
-`"if"` are one call on one string. How the receiver was spelled never reaches
-`:kind`, and therefore cannot pick which reading it reports.
+The second is the harder case, and **the receiver's spelling cannot soften it**:
+modifiers take values, so `if:kind`, `"if":kind` and `$n:kind` over a variable
+holding `"if"` are one call on one string. How the receiver was spelled never
+reaches `:kind`, and therefore cannot pick which reading it reports.
 
 The question is better stated with the receiver left out of it entirely. `:kind`
 is handed the name `if`. That name behaves one way as a bare command head — the
@@ -909,10 +894,9 @@ The keyword, builtin and func layers do not apply: no keyword, builtin or `func`
 name can contain a slash, so a slashed receiver is external-or-nothing. That much
 is forced.
 
-**What it resolves to is not.** An earlier draft of this entry recorded a second
-forced result — that `./tool:kind` must be `external` wherever the file is
-executable, since the shell runs it. That is false, and the exec bit is simply
-not the predicate. A script with mode 755 whose shebang names a missing
+**What it resolves to is not.** `./tool:kind` is *not* forced to `external`
+wherever the file is executable: the exec bit is not the predicate. A script with
+mode 755 whose shebang names a missing
 interpreter is executable by every permission test and still does not run:
 
 ```
@@ -1282,10 +1266,10 @@ Which is the same thing `func f { g }` buys and the same thing it does not: defi
 order is irrelevant *between* a function and what its body calls, and entirely relevant
 for a call written above the definition. Modifiers get that rule, not a stronger one.
 
-**The cost is that a typo'd modifier fails at run time.** `$x:fop` is no longer a
-syntax error; it fails when the line runs, naming the modifier. That is a real loss,
-and an earlier revision of this section treated avoiding it as the whole reason to
-require a declaration. Two things make it the right trade.
+**The cost is that a typo'd modifier fails at run time.** `$x:fop` is not a
+syntax error; it fails when the line runs, naming the modifier. That is a real loss —
+avoiding it is the one serious argument for resolving a declaration at load time — and
+two things make it the right trade.
 
 mesh already takes exactly this loss one rung over. A typo'd *read* — `$staus` — is a
 run-time unbound-variable error rather than a syntax error, the accepted cost of having
@@ -1301,11 +1285,11 @@ not found`, and so does an alias defined after a function that uses it. bash's
 looked up late. Early resolution is what makes the aliases brittle, and there is no
 reason `:name` should be the one construct in mesh that repeats it.
 
-**What this removes.** An earlier revision built three further rules on a load-time
-check: declarations **hoisted** so a forward use had a body to call, declarations
-**banned below top level** so nothing could bind conditionally, and the **`source`
-boundary** left explicitly undecided because a sourced library's modifiers could not be
-seen by a text-only pre-pass. None of the three is needed once resolution is late. A
+**What late resolution removes.** A load-time check needs three further rules to hold
+together: declarations **hoisted** so a forward use has a body to call, declarations
+**banned below top level** so nothing can bind conditionally, and the **`source`
+boundary** left undecided because a sourced library's modifiers cannot be seen by a
+text-only pre-pass. None of the three is needed when resolution is late. A
 nested or conditional `func _s:name()` is as legal as a nested `func` and binds the same
 way; a library's modifiers work in the script that sources them; and textual order
 decides which body is live exactly as it does for `func`. The blocked `source` question
@@ -1659,8 +1643,7 @@ exponent form — it prints `1e300` as 301 digits. Digit *selection* is Rust's
 **Where mesh diverges, it diverges deliberately.** Each of these buys something
 the [fail-loud](#variables-and-assignment) model needs, so none should be
 "simplified" back toward Rust. The list is the notable ones rather than a closed
-set — an earlier draft claimed "and only three" and was twice wrong, which is
-itself the argument against counting:
+set:
 
 - **A normalized value space — no NaN, no infinity, no negative zero.** Rust
   yields all three (`-4.0 % 2.0` is `-0` there, and prints that way); mesh raises
@@ -1735,8 +1718,8 @@ an equal one — the reason `42` and `'42'` are already spelled apart there — 
 `1` would read back as an integer, which divides differently.
 
 **`%` stays dividend-signed** for floats as for integers, so `(-10 % 3)` and
-`(-10.0 % 3.0)` are both `-1`. Python answers `2` here; mesh diverges deliberately
-and has since the integer rule was set, and one operator cannot have two sign
+`(-10.0 % 3.0)` are both `-1`. Python answers `2` here; mesh diverges deliberately,
+following the integer rule, since one operator cannot have two sign
 conventions. The operation is **`fmod`** — C's `fmod`, Rust's `%` — which is
 already dividend-signed; a zero divisor is a loud error, as it is for `/`.
 
@@ -1783,9 +1766,8 @@ followed by `.5`; and the `0x` / `0o` / `0b` prefixes take neither, an integer b
 the only thing a radix literal names.
 
 A leading zero means **neither octal nor decimal**: `007` is the *string* `007`.
-The open question here used to be octal-or-decimal, and the note recorded that
-`007` silently parsing as `7` was "the one answer that is certainly wrong" — it
-was, and the reason generalizes past leading zeros. An integer carries no record
+`007` silently parsing as `7` is the one answer that is certainly wrong, and the
+reason generalizes past leading zeros. An integer carries no record
 of how it was written, so any spelling that is not the number's own is lost the
 moment it binds. A **decimal** literal is therefore an integer only when its text
 is that integer's own spelling, which leaves `007`, `08`, `+5` and `-0` as
@@ -2579,17 +2561,11 @@ instead. Kept as the record and as possible future sugar:
   neither adopted: *string → regex* ("like `match`": terse, but inverts the universal
   "quotes mean literal" and risks `$x ~ 'a.b'` matching `axb`), and
   *quotes-mean-literal* (`'…'` inert, regex only via `re` / `/…/`). Revisitable.
-- **Removing the two single-quote escapes.** The thread's original question — the old
-  design made `'…'` raw with only `\'` / `\\`, and asked whether to drop those to make
-  it *fully* raw. Overtaken by adopting Model B: `'…'` is now the *escaped*
-  non-interpolating string (so `\'` is simply part of a full escape set), and rawness
-  lives in `r'…'`. No longer open.
 
 #### Bare words and quoted values — decided
 
 **A bare word is a command; a quoted word is a string literal.** One sentence, and it
-holds in every position a statement is read — including the tail of a block, which is
-where it used to stop holding.
+holds in every position a statement is read, the tail of a block included.
 
 ```mesh
 x = if true { pwd }        # runs pwd, yields its output
@@ -2615,22 +2591,13 @@ and reading `true` as a boolean surprises nobody; the shell also stops forking
 spelling that is not a lone bare word — `./true`, `command -- true` — exactly as `./42`
 still runs a file called that.
 
-Getting here took two steps. The bare/quoted rule below settled the *block tail*, which
-left `true`/`false` split by position: `x = if true { false }` was the boolean while
-`func no() { false }` ran the program and resulted in `1`, because
-`parser::outranks_a_command` excused only integers and quoted words while the block-tail
-rule also excused booleans. Both are falsy, so no condition could tell them apart and
-the difference showed only in the *value*. The two carve-outs now match.
+The carve-out is the same in both directions: `parser::outranks_a_command` excuses
+integers, quoted words and booleans alike, so `x = if true { false }` and
+`func no() { false }` both give the boolean. Splitting them by position would hide the
+difference, since both readings are falsy and no condition could tell them apart —
+only the *value* would differ.
 
-What this replaced was a **single-bare-word block-tail coercion**: a one-word block was
-read as a scalar literal, so `{ pwd }` was the string `"pwd"` while `{ pwd . }` ran.
-Three footguns came out of that, and the worst was silent — `x = if true { pwd }` bound
-`"pwd"` with no error to show for it. Adding an argument flipped a literal into an
-execution, and the same block text meant different things in statement and expression
-position. Quoting was inert in the tail (`{ pwd }` and `{ "pwd" }` agreed), so there was
-no reliable way to *ask* for either reading.
-
-The cost is one spelling: a lone quoted word no longer runs, so a program whose path
+The cost is one spelling: a lone quoted word does not run, so a program whose path
 needs quoting is reached through **`command -- "/opt/my program"`**. Quoting a command
 name that *takes arguments* is unaffected — `"if" x` still resolves func → external, as
 [Command resolution](#command-resolution-and-help) specifies, because that is a
@@ -3586,10 +3553,9 @@ open:*
 
     *Deferred, and noted only so the constraint is written down: a name
     containing a **dot** cannot be defined at all — `func a.b()` is refused in
-    every spelling, quoted included. The refusal now names the reason rather than
-    pointing at the dot (it used to be the bare ``expected `(` ``), and it is a
-    runtime error against that one definition rather than a syntax error against
-    the file, but the rule itself is unchanged. bash, zsh and fish all accept one,
+    every spelling, quoted included. The refusal names the reason rather than
+    pointing at the dot, and it is a runtime error against that one definition
+    rather than a syntax error against the file. bash, zsh and fish all accept one,
     which is how their `set_up_ssh_aliases` loops give an FQDN `Host` entry a
     command. Command position looks unambiguous (a bare word there is already a
     command name, and dotted program names are ordinary), so the parser change
@@ -3760,9 +3726,8 @@ Rules:
   (the return value), `.out` and `.err` (its stdout / stderr, as **raw byte-strings**
   — split them with the usual [`:lines`](#modifiers) / `:split` / `:nulls` modifiers
   as needed, so the record bakes in no split policy), and `.status` (the exit
-  **int** — becoming a **`Status`** under the [status decision](#open-questions),
-  which is the "richer status value" this line used to leave as a TODO. It has to
-  move with `$sh.status`: `.status` is the *only* result channel for an external
+  **int** — becoming a **`Status`** under the [status decision](#open-questions).
+  It has to move with `$sh.status`: `.status` is the *only* result channel for an external
   capture, so leaving it an int would make `return $r.status` forward a failure as
   successful data — the very bug that decision types `$sh.status` to prevent). Read them with ordinary field
   access — `r = f(x):capture` binds `r`, then `$r.value` / `$r.out:lines` read it. It is an
@@ -3886,7 +3851,7 @@ the bare-`grep(foo)` error does.
 the rest of the division: the call yields `Status(0)`, so `:map(&puts)` produces
 a list of statuses and a prompt segment gets a piece rendering as `0`. Neither
 is *useful*, and both are still mistakes — but they are mistakes the value
-system no longer has a way to catch, which is the diagnostic cost the decision
+system has no way to catch, which is the diagnostic cost the decision
 accepts above rather than a second rule. What stays is the slot's own
 requirement: a segment that must return a **string** still refuses a `Status` on
 its own terms, not on "the call produced nothing.")*
@@ -3917,8 +3882,8 @@ continuation — `x = \up` already binds `"up"` — so it would silently change 
 spelling rather than add one.
 
 *Not a second spelling: `:name` for a user's own.* `:upper` is already a one-argument
-function reference in value position, and [it has since been decided](#modifiers) that
-a user may add to that vocabulary — by **declaring a modifier**, `func _s:name()`, and
+function reference in value position, and [a user may add to that
+vocabulary](#modifiers) — by **declaring a modifier**, `func _s:name()`, and
 only that way. An ordinary `func helper(_s)` is *not* callable as `$x:helper`; the
 declaration is what makes a modifier, which is the whole of that decision. Either way,
 this does not make `&name` and `:name` alternatives for the same job. The line between them
@@ -3927,8 +3892,8 @@ modifier form, applying to the subject on its left; `&name` is the general refer
 any arity, any slot, usable wherever a value goes. A reader can still predict which
 applies without knowing whether a name shipped with the shell.
 
-**A lambda captures by an explicit list — `with (…)`** *(decided — a change from what
-runs today, and a reversal of what an earlier revision of this section decided)*. The
+**A lambda captures by an explicit list — `with (…)`** *(decided; not what runs
+today)*. The
 body's scope parent is the *session*, so a lambda sees session and global bindings but
 not the function-locals beside it, even when it is called immediately, in the same
 scope:
@@ -3997,26 +3962,24 @@ mutate something a lambda can see. For a shell that is a fair trade — `:map` /
 `:filter` / `:len` cover most accumulation — but it is a real limit and not a temporary
 one.
 
-*What this reverses.* An earlier revision decided that a lambda captures its **defining
-scope**, with "by binding or by value" left open as a sub-question, and asked for the
-scope rung to be built as a parent link. That is withdrawn. Three things follow from
-the withdrawal, all of them simplifications:
+*What an explicit list buys.* The alternative — capturing the **defining scope**,
+with "by binding or by value" a sub-question and the scope rung built as a parent
+link — costs three things the list does not:
 
 - **Scope depth stays two.** A lambda's scope is its parameters plus its captured
   copies, and its parent is the session. There is no chain to walk and no parent link
   to build, so [§Scope](#variables-and-assignment)'s "two is the current depth, not a
-  cap" is no longer under pressure from this decision.
-- **The by-binding / by-value sub-question is answered by removal.** Capture is always
+  cap" is under no pressure from this decision.
+- **The by-binding / by-value sub-question does not arise.** Capture is always
   by value, and only of what is named. Reading a *session* variable from a body stays
   late, because the session outlives every frame — which is the principle the whole
   rule rests on: **you may read late only from a scope that outlives you.** A frame
   that is going away has to hand its values over, and handing over is a copy.
-- **The shadowing question dissolves.** The previous revision reasoned that a lambda
-  parameter may not shadow a captured local, since a captured scope is a rung. With an
-  explicit list the enclosing frame is *not* a rung — it is not in scope at all — so
-  there is nothing to shadow. What remains is an ordinary duplicate-binding error when
-  a parameter and a captured name collide, which is the same check a repeated parameter
-  already gets.
+- **There is no shadowing question.** A captured *scope* would be a rung, so a lambda
+  parameter shadowing a captured local would need a rule. With an explicit list the
+  enclosing frame is *not* a rung — it is not in scope at all — so there is nothing to
+  shadow. What remains is an ordinary duplicate-binding error when a parameter and a
+  captured name collide, which is the same check a repeated parameter already gets.
 
 It also retires a justification used elsewhere: the decision that a flag's value is
 captured at assignment rejected the late alternative as "a closure in disguise, which
@@ -4512,21 +4475,18 @@ settled and one stays open:
    tracked there (see [Functions](#functions) and the value-production item in
    [Open questions](#open-questions)). Whatever `func` does, arms do.
 
-**`int → status` is gone — superseded twice over.** This paragraph used to record
-"keep it": a bare int read as an exit code rather than data, its truthiness following the
-status view rather than the number. That is **no longer true of the implementation or of
-the design.** `0b107f6` dropped the `Integer` arm from `status_of`, so a returned int has
-projected to status `0` since; and the [status decision](#open-questions) settles the
-question deliberately, giving a status its own type and spelling (`status(N)`,
+**`int → status` is gone.** A bare int is data, not an exit code: `status_of` carries
+no `Integer` arm, so a returned int projects to status `0`, and the [status
+decision](#open-questions) gives a status its own type and spelling (`status(N)`,
 `return status N`) so that `return 5` is the integer five, successfully, with no residual
 about "an int whose masked status is nonzero."
 
-What the old paragraph got right is worth keeping, because it is the reason the
-projection stays *total* rather than being abolished: external commands exit `0` for
-success with no typed value to consult, so for `if X { … }` to mean "did X succeed"
-whether `X` is `grep -q …` or a mesh function, success must be truthy on both sides. That
-interchangeability is preserved — it is just carried by `Status` and `false` now, rather
-than by every integer. Two live scraps this left, both pointed at their canonical homes:
+The projection stays *total* rather than being abolished, and for one reason:
+external commands exit `0` for success with no typed value to consult, so for
+`if X { … }` to mean "did X succeed" whether `X` is `grep -q …` or a mesh function,
+success must be truthy on both sides. That interchangeability is carried by `Status`
+and `false` rather than by every integer. Two live scraps, both pointed at their
+canonical homes:
 
 - **Empty `""` / `[]` truthiness** — **closed** by
   [condition truthiness](#conditionals-if-is-an-expression) settling as *no truthy
@@ -4658,11 +4618,11 @@ sets the loud precedent for a question mesh declines to guess the meaning of.
 
 `$sh.status == 0` is the case that forced the shape of the rule. It is the
 spelling shell reflex reaches for; a quiet `false` there is *always* wrong and
-*never* says so, and an earlier draft answered that by making it an **error**
-naming `:code`. Comparing the code is the better answer — the reflex is not a
-category error, it is the obvious reading of a value whose canonical projection
-is exactly that integer, so mesh takes the reading instead of teaching a longer
-spelling for it. Where a pair genuinely has no reading, the refusal stands. See
+*never* says so. Erroring and naming `:code` would answer that too, but comparing
+the code is better — the reflex is not a category error, it is the obvious reading
+of a value whose canonical projection is exactly that integer, so mesh takes the
+reading instead of teaching a longer spelling for it. Where a pair genuinely has no
+reading, the refusal stands. See
 [Why `Status` compares to an int](#why-status-compares-to-an-int-and-to-nothing-else)
 for why exactly one pair opens and the other stays shut.
 
@@ -4675,9 +4635,9 @@ compare a string with a string".
 stylistic. `Value`'s equality is what [`:dedup`](#modifiers) (a hash set), `in`,
 and [`match`](#matching-match) literal
 arms are built on, and each of those can only accept a bool — a fallible equality
-would have nothing to hand them. (Map keys used to be listed here as a fourth
-case "whose `Hash` must agree". They are not one: a map's keys are **text**, so
-they never consult `Value::eq` at all — see the note below.) So the refusal is scoped to the **top-level
+would have nothing to hand them. (Map keys are *not* a fourth case: a map's keys
+are **text**, so they never consult `Value::eq` at all — see the note below.) So
+the refusal is scoped to the **top-level
 operand pair of `==` / `!=`**, and everything beneath it stays total:
 
 ```mesh
@@ -4698,10 +4658,10 @@ match $sh.status { 0 => "ok" ; _ => "failed" }   # takes the `0` arm — same eq
 0 in $sh.pipestatus                              # true if any stage succeeded
 ```
 
-**This is why comparing beat refusing.** The seam this section used to record was
-that `$s == 0` reported while a `0` arm against the same status quietly did not
-match, and the obvious repair was to make the arm report too. It was the wrong
-repair, for a reason worth keeping written down: an arm is dispatch under
+**This is why comparing beat refusing.** The seam to close was `$s == 0`
+reporting while a `0` arm against the same status quietly did not match, and the
+obvious repair — make the arm report too — is the wrong one, for a reason worth
+keeping written down: an arm is dispatch under
 first-match traversal, so a refusal there **aborts the whole `match`** at the arm
 it reaches, including arms a later subject needs. A status is an ordinary value —
 `status(N)` is a public constructor — so a collection may hold statuses beside
@@ -4811,7 +4771,7 @@ projection but a rendering, and `--tag=v2` against `"--tag=v2"` is the very
 distinction the type exists to keep — so it is alone in its class and refuses
 everything, which is exactly what it does today.
 
-**Equality is one relation; the seam it used to leave is gone.** Because
+**Equality is one relation, and it leaves no seam.** Because
 [`match`](#matching-match) arms, [`:dedup`](#modifiers) and `in` are all built on
 the same total equality, making `status(0) == 0` true makes all of them agree at
 once:
@@ -4922,10 +4882,10 @@ nothing is indistinguishable from a real empty string and flows downstream under
 that a destructure would refuse. That is the accepted cost
 of the terse one-liner ([Conditionals](#conditionals-if-is-an-expression),
 "Decided: lenient"); the only lever to close it — requiring `else` in *binding*
-position — was weighed and declined for ergonomics. ***Reopened***, and this
-paragraph used to say "the one place", which was wrong: an unmatched
-[`match`](#matching-match) yields `""` too, and so does a function with
-[no expression to yield](#functions). See [Open questions](#open-questions).
+position — was weighed and declined for ergonomics. ***Reopened***; see [Open
+questions](#open-questions). It is not the *only* silent empty either: an
+unmatched [`match`](#matching-match) yields `""` too, and so does a function with
+[no expression to yield](#functions).
 
 **An ambiguous spelling is an error.** Where one spelling has two genuinely
 plausible readings, mesh refuses rather than picking a winner. The standard the
@@ -4954,8 +4914,8 @@ answer rather than a refusal.
 
 The rule has a cost, and making it explicit is the point of writing the rule
 down: every refusal is a spelling somebody has to write differently, and the
-flag-equality decision shows the sharper version, where an operator that could
-not previously fail becomes fallible. So the rule earns its place only where
+flag-equality decision shows the sharper version, where an operator that fails
+nowhere else becomes fallible. So the rule earns its place only where
 the two readings are genuinely both plausible. It is not a license to refuse
 anything merely unusual — refusing the unusual is just a smaller language.
 
@@ -6150,7 +6110,7 @@ produce it — is one of:
 A segment slot holds an [**`&name` reference**](#calling-for-a-value-and-lambdas) —
 late-bound, so re-sourcing rebinds it, the same rule the hooks use — or a
 `func(){ … }` lambda. A **bare word is an ordinary string**, exactly as it is in
-every other value position, so the slot no longer inverts the quoting rule
+every other value position, so the slot does not invert the quoting rule
 (`&host` calls the `host` segment; `host` and `"host"` both render the text). And
 **multiple lines are multiple entries** — a list is always the pieces of *one*
 line, never several lines. So there are no separator entries to name:
@@ -6178,10 +6138,10 @@ func auth-info() { if ssh-id-missing() { style("SSH", fg: yellow) } }   # no els
 
 (Segments use `if` *expressions* to pick a string — not `and`/`or`, which combine
 bools, not values — and the `auth` segment leans on the decided
-no-`else`-yields-`""` rule so "not applicable" is just an empty contribution. The
-`nl1` / `nl2` separator keys an earlier draft needed are gone: lines come from the
-map's shape, and the only structural entries — `rule`, a deliberate blank
-`newline` — carry *meaningful* names, never a positional filler like `nl3`.)
+no-`else`-yields-`""` rule so "not applicable" is just an empty contribution.
+There are no `nl1` / `nl2` separator keys: lines come from the map's shape, and
+the only structural entries — `rule`, a deliberate blank `newline` — carry
+*meaningful* names, never a positional filler like `nl3`.)
 
 **Color comes from a `style` helper, not raw escapes.** The value call
 `style("no-ssh-id", fg: yellow, bold: true)` returns a **styled value** — text and
@@ -6578,10 +6538,9 @@ to avoid" rather than promising the latter as done.
   private helper is never promoted to public vocabulary by accident, and the subject
   and its `...` form get somewhere to live. **Resolution is at call time**, the same
   rule as command position, which costs the parse-time unknown-modifier error and buys
-  consistency with every other name in the language. An earlier revision kept a
-  load-time check instead and grew three rules to support it — hoisting, top-level-only
-  declarations, and a blocked `source` boundary — all since removed. See
-  [Modifiers](#modifiers).
+  consistency with every other name in the language — and spares the three rules a
+  load-time check needs (hoisting, top-level-only declarations, a blocked `source`
+  boundary). See [Modifiers](#modifiers).
 - **Interpolation shape — open, for later.** Requiring braces around a modifier's
   argument (above) is a step in that direction, not the answer to it. `${…}` accepts
   **two grammars** today — `"${xs:join("-")}"` (bare name) and `"${$xs:join("-")}"`
@@ -6632,10 +6591,9 @@ to avoid" rather than promising the latter as done.
   whether functions/blocks should require an **explicit value keyword** instead of the
   settled implicit **last-expression** rule. Language-wide — it
   touches every value-producing block: `if`, `match`, `for`, and `func` alike.
-  *(The **single-bare-word block-tail coercion** this used to be bundled with is
-  **gone** — settled independently by
-  [Bare words and quoted values](#bare-words-and-quoted-values--decided), which did not
-  need a value keyword to get there. The general assignment-RHS rule stays either way.)*
+  *(The block tail itself is not part of it: [Bare words and quoted
+  values](#bare-words-and-quoted-values--decided) settles that without a value
+  keyword, and the general assignment-RHS rule stays either way.)*
   *(**Spelling, if one is ever needed: `result`, not `yield`.** The two are not
   interchangeable names for one thing. `yield` means **generator** in every language a
   reader is likely to arrive from — Python, JavaScript, Ruby, C# — where it emits *many*
@@ -6650,20 +6608,11 @@ to avoid" rather than promising the latter as done.
   **contextual**, like `fork` / `global` / `unset`, so a program or variable of that
   name stays reachable.)*
 
-  *(**Implicit stdout capture in value position is gone** *(decided; shipped)*. A
-  value-position block used to run its body under a capture and yield the bytes,
-  gated on exit 0. It was never intended — `func` never did it, and the rule was
-  always that a block streams unless something explicitly captures or calls it — and
-  three sharp edges came out of it. The **same block text** either streamed or was
-  silently eaten depending on whether anyone bound the result, so
-  `x = if true { echo hi }` swallowed `hi` while the bare statement printed it. The
-  capture took **every** statement's stdout rather than the tail's, so
-  `{ puts a; some-cmd }` yielded the `a` too. And the exit-0 gate failed **silently**:
-  `x = if true { grep -q zzz f }` left `x` unbound, surfacing as an "unbound variable"
-  on a later line with nothing to say why. `eval_value_body` (repl.rs) now routes
-  `if` and `match` through the same `eval_body` a `func` body uses, so the three
-  agree: output streams, and the value is the last thing that produced one. `$(…)` is
-  the thing that means "capture", and it still does.)*
+  *(**There is no implicit stdout capture in value position** *(decided; shipped)*.
+  `eval_value_body` (repl.rs) routes `if` and `match` through the same `eval_body` a
+  `func` body uses, so all three agree: a block streams unless something explicitly
+  captures or calls it, and its value is the last thing that produced one. `$(…)` is
+  the thing that means "capture".)*
 - **A `proc` / `func` split — open; leaning add `proc` only and leave `func`
   alone.** The split already exists; it is at the **call site** rather than the
   declaration. [Calling for a value](#calling-for-a-value-and-lambdas) chooses by
@@ -6840,9 +6789,9 @@ to avoid" rather than promising the latter as done.
   The borrow is Swift's `guard let` and Rust's `let … else`: a bind that escapes
   into the **current** scope on success, where the failure block must *diverge*.
 
-  **Two independent axes, which an earlier draft of this entry collapsed into
-  one.** Swift and Rust each write a prefix *and* spell the fallback `else`, so
-  copying either wholesale hides that these are separate choices:
+  **Two independent axes, easily collapsed into one.** Swift and Rust each write a
+  prefix *and* spell the fallback `else`, so copying either wholesale hides that
+  these are separate choices:
 
   | Axis | Options |
   | --- | --- |
@@ -6977,8 +6926,7 @@ to avoid" rather than promising the latter as done.
   **"The one place" is wrong, and this document names two more.**
   [Matching](#matching-match) records that a `match` with no arm hit yields `""`
   too — "like a no-`else` `if`" — with totality for non-`_`-exhaustive matches
-  left *(open)*; lenient was its position before this, and is now coupled to the
-  question here rather than standing as a current lean of its own.
+  left *(open)*, coupled to the question here rather than carrying a lean of its own.
   [Functions](#functions) adds a third: a function with **no expression to
   yield** — an empty body, or a bare `return` *before anything ran* — results in
   `""` with status `0`, "the same 'nothing produced, nothing failed' answer a
@@ -7438,19 +7386,16 @@ remain under-specified.
   $s > 1             # still an error; ordering is not settled by that entry
   ```
 
-  An earlier draft of this line read "`Status` carves no exception in comparison"
-  and made `$s == 0` an error naming the other two spellings. The exception is
-  real, and it is not special-casing: a status has a lossless projection to a
-  number, which is what class membership takes.
+  `$s == 0` comparing rather than erroring is not special-casing: a status has a
+  lossless projection to a number, which is what class membership takes.
 
-  Two earlier drafts of this entry tried to fix the ergonomics locally — first by
-  erroring on `Status`-vs-int alone, then by **making the two compare equal**.
-  Both were set aside on the grounds that a `Status` admits **two** projections,
-  its code and its success, both reachable as values (`$s:code` and `not not $s`),
-  so an equality respecting both would force `0 == true` by transitivity.
+  The objection to making the two compare equal is that a `Status` admits **two**
+  projections, its code and its success, both reachable as values (`$s:code` and
+  `not not $s`), so an equality respecting both would force `0 == true` by
+  transitivity.
 
-  **The second draft was right and the reasoning against it was incomplete**, which
-  is why the [comparison entry](#comparison-across-types) has since revived it.
+  **That reasoning is incomplete**, which is why the [comparison
+  entry](#comparison-across-types) takes the pair.
   "Respecting both is contradictory" does not imply "respect neither" — respecting
   exactly one breaks the chain too, since `0 == true` is underivable while
   `status(0) == true` stays refused. And the choice between the two is forced
@@ -7506,9 +7451,8 @@ remain under-specified.
   an **int** it returns the *number*, successfully — the exact failure this entry
   exists to remove, sitting at the likeliest place to meet it. As a `Status` it
   forwards correctly, and a prompt segment still prints `5` by the rendering rule
-  above. This used to cost `$sh.status == 0`, which read silently false and then,
-  under a later draft, reported. It costs nothing now: a status compares to an int
-  by its code, so the reflex spelling is simply **true on success** — see
+  above. It costs the reflex spelling nothing: a status compares to an int
+  by its code, so `$sh.status == 0` is simply **true on success** — see
   [Comparison across types](#comparison-across-types). `if $sh.status { … }`
   remains the idiomatic test.
   **`$sh.pipestatus`** becomes a list of `Status` for the same reason.
@@ -7600,17 +7544,14 @@ remain under-specified.
   `return value X` fills stop being two ideas that happen to share a word. They
   are the same channel, read two ways.
 
-  *(Honest history: an earlier draft asserted the command-tail change on the
-  weak grounds that it "types an int correctly," was rightly challenged — an
-  external genuinely has no mesh value of its own — and was withdrawn. It returns
-  here on the stronger footing that a call with no value is unrepresentable
-  without a null. The bug was always the **int**, not the existence of a value.)*
+  *(The grounds matter: "it types an int correctly" is not one, since an external
+  genuinely has no mesh value of its own. What carries the change is that a call
+  with no value is unrepresentable without a null. The bug is the **int**, not the
+  existence of a value.)*
 
-  [Match arms](#matching-match) were already documented to yield a command's
-  status in expression position, so they agree with the command-tail rule
-  without changing. The [function table](#functions) had a third answer —
-  "none" for a command-tailed body — and this entry updates that row to
-  `Status(n)` rather than leaving the document holding two.
+  [Match arms](#matching-match) already yield a command's status in expression
+  position, so they agree with the command-tail rule without changing, and the
+  [function table](#functions)'s row for a command-tailed body is `Status(n)`.
 
   **What changes, as an implementation checklist.** Not a compatibility
   analysis — the language has no users, nothing here is owed backward
@@ -7656,9 +7597,7 @@ remain under-specified.
     a failure, which is the defect this whole entry exists to remove. The
     comparison is *not* part of the argument: under [Comparison across
     types](#comparison-across-types) a status and an int compare by the code, so
-    `if $status != 0` reads correctly either way. (An earlier draft of this
-    paragraph claimed an int made that test "always true", inherited from the
-    superseded refusal; it never applied to `!= 0` against an int at all.) The
+    `if $status != 0` reads correctly either way. The
     shipped examples still get updated: `docs/PROMPT.md`'s status line,
     `docs/REFERENCE.md`'s `jobdone` handler, and `docs/COMPARISON.md`'s syntax
     sample now read the `Status` directly (`if not $status { … }`,
@@ -7721,14 +7660,11 @@ remain under-specified.
   `status=0`) is precisely those two disagreeing, which the invariant forbids.
 
   **`.status` is a `Status`**, for the same reason `$sh.status` is: it holds a
-  status. An earlier draft of this paragraph hesitated over that, on the grounds
-  that `$r.status == 0` would then read silently false — but that objection
-  applied **identically to `$sh.status`**, which the entry types without
-  hesitation, so using it to block one field and not the other was simply
-  inconsistent. The objection has since been removed at the root rather than
-  answered: `$r.status == 0` is **true** on success, since a status compares to
-  an int by its code (see [Comparison across
-  types](#comparison-across-types)).
+  status. The objection you would expect — that `$r.status == 0` then reads
+  silently false — does not arise: `$r.status == 0` is **true** on success, since
+  a status compares to an int by its code (see [Comparison across
+  types](#comparison-across-types)). It would apply identically to `$sh.status`
+  in any case, so it could never have blocked one field and not the other.
 
   What remains genuinely worth flagging is the ergonomic risk you would expect: a
   reader reaches for `.value` expecting data and finds a status, or checks
@@ -7797,9 +7733,8 @@ remain under-specified.
     Handle-like variants with no byte form (`Stream`, `Job`) were the alternative
     model and do not fit — a status has an obvious number.
 
-  **The *status-to-bool word* below is largely subsumed** — though not by the
-  projection question, which is what an earlier draft of this paragraph claimed.
-  It is subsumed by the two rules above: a command-tailed function now returns
+  **The *status-to-bool word* below is largely subsumed** — not by the projection
+  question but by the two rules above: a command-tailed function returns
   `Status(n)`, and a `Status` is a condition, so the case `ok` was invented for
   writes itself:
 
@@ -7860,7 +7795,7 @@ remain under-specified.
 - **A status-to-bool word — open; leaning `ok`, but much reduced.** *(The
   [status decision](#open-questions) above shrinks this from a gap to a
   convenience: a command-tailed function returns `Status(n)` and a `Status` is a
-  condition, so a command-conditioned predicate no longer needs the written-out
+  condition, so a command-conditioned predicate needs no written-out
   branch. `and` / `or` / `not` admit a `Status` too, so storing, negating and
   combining need no bool either. What is left is wanting a **bool**
   specifically, which is a preference rather than a gap.)* A
@@ -7967,7 +7902,7 @@ remain under-specified.
   | Implicit terminator when the command declares no options — **applied to every command**, `func` included | `puts --force` prints, `func f(a)` takes `f --force` as a positional, the question disappears with no new spelling, and every form then behaves as `wrapper func` already does. | It is the refusal, deleted. Wherever the rule fires today it fires because nothing there can match the flag, which is exactly the set this would silence: `func f(a)` called as `f --frce` reports `unknown flag` now and would bind `a = --frce` instead. That is the guess between *pass this option* and *pass this text* that the rule exists not to make, and the caller who meant an option learns about it downstream rather than at the call. |
   | Implicit terminator for **builtins only** | Smaller blast radius; the option-less builtins are the shapes people actually forward into. And by fact 2 the language already tolerates a non-refusing form — `wrapper func` — so a second one is not the precedent it looks like. | A plain `func` with no such parameter would go on refusing, so the two disagree on identical-looking calls. Weaker than it first reads, given `wrapper func`, but the difference is that `wrapper` is *written* at the definition: you can see which reading you get. A builtins-only rule is invisible at the call. |
   | Diagnostic only | Cheapest, and it decides nothing. The message already names `puts -- --force`; it could name the forwarding spelling too, since a caller who hit this from inside a wrapper needs `puts -- ...$rest` rather than the scalar escape. | Changes how fast the cost is learned, not what it is. And the improvement has to be **unconditional**, which is a weaker message than a targeted one: by the time the refusal runs, a spread-delivered flag is indistinguishable from a written one — `expand::Written` is `Data`/`Flag`/`Terminator` with no provenance, and `Argv` keeps only the words and those marks, so nothing records that an element arrived via `...$rest`. Naming the forwarding form only when it applies would mean carrying a spread-origin bit through expansion, which is real work for a message. |
-  | **Spread of an expression** at a command boundary, `...$r:map(func(e) { "$e" })` | The conversion itself already exists, for a list of strings and flags: quoting is the scalar half (`x = --force; puts "$x"` prints `--force`, one of the three ways `docs/REFERENCE.md` lists) and `:map` distributes it — `x = $r:map(func(e) { "$e" }); puts ...$x` prints `a --force b`, leaving plain strings unchanged. What the direct form needs is not a flag feature at all: `CommandItem::Value` had no spread variant, the *same* gap tracked for `puts ...$x:split(":")` and `ls ...glob($p)` — all three gave the identical syntax error. **That gap has since closed on its own**, which spends this candidate's best argument: it no longer pays for itself elsewhere, because the two entries it would have closed as a side effect are closed. What survives is that it is compatible — it accepts programs that were errors and retires nothing — and that `...$r:map(func(e) { "$e" })` now parses, so the spelling is available to judge on its own merits rather than blocked. | Correspondingly not the small change the "just a spelling" reading suggests — it is the general spread-of-expression feature, with a parser change behind it. And for *this* question it is not even a substitute, let alone a shorter one. Quoting each element replaces it with a string, so the forwarded list arrives stripped of every type it carried, and a **collection** does not survive at all: for `s("a", [1 2], "b")`, `puts -- ...$r` renders the list where `$r:map(func(e) { "$e" })` fails with `$e: list value needs \`...\` in command arguments`. So it converts flags at the cost of everything else a rest list can hold, where the terminator preserves all of it — and it is written per call site, and longer than the `--`. Judge it on its own merits now that the two entries it would have closed are closed without it. Not a use of `:flag`, which runs the other way and is the identity on a flag. |
+  | **Spread of an expression** at a command boundary, `...$r:map(func(e) { "$e" })` | The conversion itself already exists, for a list of strings and flags: quoting is the scalar half (`x = --force; puts "$x"` prints `--force`, one of the three ways `docs/REFERENCE.md` lists) and `:map` distributes it — `x = $r:map(func(e) { "$e" }); puts ...$x` prints `a --force b`, leaving plain strings unchanged. What the direct form needs is not a flag feature at all: it is the spread variant on `CommandItem::Value`, the *same* gap `puts ...$x:split(":")` and `ls ...glob($p)` sat behind. That is built, which spends this candidate's best argument — it does not pay for itself elsewhere, because the two entries it would have closed as a side effect are closed. What survives is that it is compatible — it accepts programs that were errors and retires nothing — and that `...$r:map(func(e) { "$e" })` parses, so the spelling can be judged on its own merits. | Correspondingly not the small change the "just a spelling" reading suggests — it is the general spread-of-expression feature, with a parser change behind it. And for *this* question it is not even a substitute, let alone a shorter one. Quoting each element replaces it with a string, so the forwarded list arrives stripped of every type it carried, and a **collection** does not survive at all: for `s("a", [1 2], "b")`, `puts -- ...$r` renders the list where `$r:map(func(e) { "$e" })` fails with `$e: list value needs \`...\` in command arguments`. So it converts flags at the cost of everything else a rest list can hold, where the terminator preserves all of it — and it is written per call site, and longer than the `--`. Judge it on its own merits: the two entries it would have closed are closed without it. Not a use of `:flag`, which runs the other way and is the identity on a flag. |
 
   Leaning: **keep the terminator and improve the diagnostic**, which is one
   candidate plus the null one — and the compatibility argument reaches only
@@ -8021,14 +7956,12 @@ remain under-specified.
     with no diagnostic is the one people type.
   - **The parenthesized form does not reach an external command yet.**
     `/bin/echo (*.txt)` reports ``a list needs `...` to become command arguments``,
-    and the spelling it points at, `/bin/echo ...(*.txt)`, is itself a syntax error:
-    `CommandItem::Value` had no spread variant, the same gap tracked for
-    `ls ...glob($p)` and `puts ...$x:split(":")`. **That gap has since closed** —
-    `CommandItem::Value` carries a `spread` marker and all three parse, so
-    `/bin/echo ...(*.txt)` runs. What remains here is the *bare* parenthesized form,
-    which still reports and still points at the spread. Note what closing the gap
-    bought:
-    it made `rm ...(* - *.bak)` *parse*, not `rm (* - *.bak)` work — a
+    though the spelling it points at, `/bin/echo ...(*.txt)`, does run:
+    `CommandItem::Value` carries a `spread` marker, so that and `ls ...glob($p)`
+    and `puts ...$x:split(":")` all parse. What remains here is the *bare*
+    parenthesized form, which reports and points at the spread. Note the limit of
+    what the spread buys:
+    it makes `rm ...(* - *.bak)` *parse*, not `rm (* - *.bak)` work — a
     parenthesized list is one list-valued argument either way, so the spread is
     part of this candidate's spelling rather than a temporary workaround. So it is
     not self-contained, and the case people care about is still behind this entry.
@@ -8041,8 +7974,8 @@ remain under-specified.
     here, since none of them touches what `-` means in a value context.
   - **A qualified glob is one word, and one word reaches argv.** `/bin/echo *(d)`
     prints the directory and `*(f)` omits it, in front of an external, with no
-    parens and no spread — the type qualifiers are implemented (`TODO.md` said
-    otherwise; that entry was stale). The `:`-modifier form does *not* have this
+    parens and no spread — the type qualifiers are implemented. The `:`-modifier
+    form does *not* have this
     property: `puts *:f` in the same position is an ordinary glob word that matches
     nothing, and only `(*:f)` filters. Of the predicates, the **boolean** ones are
     built and filter correctly (`*(x)`, `*(f, exec: true)`, and `*(f, empty: false)`
