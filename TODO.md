@@ -5494,16 +5494,22 @@ and the postfix parses cheaper. Build one, then look at it.
             is not available yet. Adding it later may still invalidate scripts
             written against its absence; that is accepted, so do not design
             around it.
-      - [ ] **The "returns a value, unspecified" escape hatch is required, not
-            optional — and it blocks the narrowing.** Trying the migration
-            proved it: the closed set does not cover the value kinds mesh
-            already has. `func ident(x) { return $x }` in `cli.rs` is handed a
-            **job**, and there is no `job` in the vocabulary, nor a `styled`, an
-            `Instant`, or a `Duration`. Without a hatch the narrowing makes that
-            function unwritable rather than merely unannotated. Decide between
-            widening the vocabulary to every kind (grows forever, puts `job` in a
-            reader's way) and one hatch word (smaller, and the honest thing to
-            say about an identity function) **before** landing the narrowing.
+      - [x] **`value` says "a value channel, of unstated kind".** *(landed —
+            `ReturnType::Value`.)* Trying the migration is what forced it: the
+            set does not cover the value kinds mesh already has, and
+            `func ident(x) { return $x }` in `cli.rs` is handed a **job**, with
+            no `job` in the vocabulary and none wanted. No concrete spelling fits
+            an identity function — what it returns is whatever it was given — so
+            this is the true answer rather than an escape from giving one.
+      - [ ] **Consider renaming `value` to `any`.** Both were judged good;
+            `value` went first because it is the design's own word for the
+            channel, where `any` is the conventional gradual-typing spelling and
+            reads as a claim about a type system this deliberately is not. Worth
+            revisiting once there is real code written against it — the argument
+            for `any` is that readers arrive knowing it, and that is the kind of
+            thing only use settles. A rename is a one-word change in
+            `ReturnType::from_word`, `as_str`, and `TYPE_MARKER_WORDS`, plus
+            whatever has been written in the meantime.
       - [ ] Still open: whether a compound kind is writable at all (`list`, or a
             list of what).
       - [ ] **User-defined types are not a goal** — the set is closed on purpose.
@@ -5542,7 +5548,7 @@ and the postfix parses cheaper. Build one, then look at it.
       `for`-aggregate nobody wrote (`eval_for_passes` / `run_ast_for_passes` in
       `repl.rs`), and it is the breaking half of the change.
 
-      **Blocked on the escape hatch above**, and measured rather than guessed:
+      **Unblocked now `value` exists**, and measured rather than guessed:
       implemented against the suite it fails **61 of 1108** cli tests — 5.5%,
       which does bear out the design's claim that the migration lands on the
       minority — across **156** definitions needing a type. Most are honest and
