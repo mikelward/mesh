@@ -6455,14 +6455,16 @@ Turned up by the prior-art survey written into
 queued work — the survey found them, it did not decide them.
 
 - [ ] **A way to postfix-apply a function that was not declared as a modifier.**
-      Raku spells it `.&f`, D and Nim get it free from UFCS, Hack and the JS
-      proposal get it from a topic token that lets the subject land in any
-      argument slot. mesh requires `func _s:name()`, which is deliberate — it stops
+      Raku spells it `.&f`, D and Nim get it free from UFCS, Hack's `$$` names a
+      slot so the subject can land anywhere in the call. mesh requires
+      `func _s:name()`, which is deliberate — it stops
       a private one-argument helper from becoming public vocabulary by accident —
       but the cost is that a chain stops dead at any function written before anyone
       knew it would be chained, including every function in a library mesh does not
-      own. `$xs:map(:base)` already passes a chain link as a value, so the machinery
-      for an `:apply(f)` / `:then(f)` escape hatch is mostly present. The question is
+      own. `$xs:map(&up)` and `$xs:map(:base)` already pass a callable as an
+      argument, so the machinery for an `:apply(&f)` / `:then(&f)` escape hatch is
+      mostly present — and it takes the `&`, since a bare `f` is the string `"f"`
+      (`REFERENCE.md` §Functions, "Function references"). The question is
       whether the escape hatch re-opens the accident the declaration was there to
       prevent, or whether writing `:apply` at the call site is enough of a
       declaration.
