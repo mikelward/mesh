@@ -6633,6 +6633,65 @@ unguarded, alongside fish and elvish, and carries a `TODO:` naming this entry.
       backs `$env` and the `in` operator, which have narrowness of their own to
       settle in the same pass.
 
+## `DESIGN.md` states the same decision in several places
+
+Raised by the review of mikelward/mesh#470 and mikelward/mesh#473, where **six
+of sixteen findings** were one section of `docs/DESIGN.md` disagreeing with
+another. That is not a run of bad luck: at ~7,900 lines the document restates
+most decisions in three to five places — the section that owns the construct, a
+cross-reference from a related section, the Core surface summary, and often an
+Open questions entry — with nothing keeping them in step. A correction applied
+at one site silently leaves the others asserting the old answer.
+
+The worked example is the lenient no-`else` `if`, whose position lived in four
+places at once:
+
+| Site | What it said |
+| --- | --- |
+| `Conditionals` | **Decided: lenient**, with the alternative "considered and dropped" |
+| `Error handling` | the accepted cost, and "the one place mesh hands you a silent empty" |
+| `Matching` | `match` totality *(open)* — "leaning lenient", independently |
+| Core surface summary | whether non-`_` `match` must be exhaustive — "leaning lenient" again |
+
+Two of those were also **wrong**, not merely duplicated: "the one place" was
+contradicted by `Matching` and by `Functions`, both of which name their own
+quiet-empty producer. So the duplication is not only a maintenance cost — it
+hides contradictions, because each copy reads plausibly on its own and nobody
+reads four sections at once.
+
+The same shape produced the other findings: `global` / `unset` described as
+contextual keywords in one passage and as always-claimed in `:kind` and
+`REFERENCE.md`; the external/function uniformity claim stated broadly in one
+place and narrowly in another.
+
+- [ ] **Adopt one authoritative statement per decision, with the rest pointing
+      at it.** A section that owns a construct states the decision; everywhere
+      else links rather than restates. Summaries name the decision and link,
+      instead of paraphrasing its content — paraphrase is where the drift
+      enters.
+- [ ] **Sweep the existing duplicates.** The four sites above agree now, but
+      only because every one was reconciled by hand, a review round at a time —
+      and the last of them proves the point: `Matching` read "*(open)* — leaning
+      lenient" directly above its own note saying the lean was no longer
+      independent, self-contradictory within a single bullet, and it survived
+      three rounds of corrections aimed at exactly that drift before a review
+      round caught it. Other decisions almost certainly carry the same split;
+      the value-keyword question is the obvious next place to look.
+- [ ] **Consider a check — but not a phrasing one.** Matching duplicated wording
+      would miss most of this, because the contradictions are *differently*
+      worded: "contextual" against "always-claimed", broad uniformity against
+      narrow. What a mechanical check can do is flag a decision's **topic**
+      appearing away from its anchor without a link — a list of decision anchors
+      plus the keywords naming each. That surfaces every site discussing a
+      decision so the copies can be read side by side; it cannot tell agreement
+      from contradiction, and it will produce false positives. Both are
+      acceptable, since the failure mode is precisely that nobody reads four
+      sections at once, and all six findings sat at sites a topic check would
+      have listed.
+
+Not urgent, but it compounds: every new design entry adds cross-references into
+the same web, and each correction after that has more sites to miss.
+
 ## Loose ends
 
 Small items rescued from pull requests that were closed as superseded — the bulk
