@@ -4548,7 +4548,9 @@ thing a reader takes on trust.*
         this **revises the settled equality rule** rather than following from
         it. `DESIGN.md`:1349 decides equality across mismatched nonnumeric
         types as *false* — `1 == "1"` is false, deliberately — with
-        `1 == 1.0` the lone widening exception. A flag would be the first
+        `1 == 1.0` the only proposed widening, which is itself **open, not
+        decided** (see the marker in `DESIGN.md` §Arithmetic, under the float entry); nothing in this
+        entry depends on how it lands. A flag would be the first
         type for which `==` can *raise*, which is a real cost and the reason
         to name it: every comparison site becomes fallible, where today only
         arithmetic is.
@@ -8352,9 +8354,11 @@ unguarded, alongside fish and elvish, and carries a `TODO:` naming this entry.
       ("comparison requires two integers or two strings") is honest about a rule
       that no longer matches what `DESIGN.md` §Arithmetic promises. The
       **feature** is the float type itself, which that section specifies in full
-      — promotion on mixed arithmetic, exact cross-type comparison rather than an
-      `i64`→`f64` cast, `1 == 1.0` true, and a `Hash` that agrees. Both docs now
-      carry a not-implemented note so the sections stop reading as behavior.
+      — promotion on mixed arithmetic, and exact cross-type comparison rather
+      than an `i64`→`f64` cast. **Not** `1 == 1.0` with an agreeing `Hash`: that
+      pair is open, not decided (see the float task under §"Icebox"), and `Hash`
+      follows whichever way it lands. Both docs now carry a not-implemented note
+      so the sections stop reading as behavior.
 
 - [ ] **The callable-variable note only reaches an unstaged foreground command.**
       `double = func(x) { … }; double 5` reports ``command not found: double
@@ -10878,11 +10882,17 @@ a one-line edit. Every claim below was checked against the built shell.
         qualifier and the parens are strictly additive. None of the six touches
         what `-` means in a value context, so §"Globbing"'s statement examples
         stand whatever is decided.
-  - [ ] **Implement floats.** The model is decided — see §"Floats" under
+  - [ ] **Implement floats.** Most of the model is settled, but **`1 == 1.0`
+        is open, not decided** — mikelward has said so, and `DESIGN.md` now
+        carries a marker at that paragraph. Nothing may assume the cross-type
+        numeric equality, including §"Beyond M3 — Type-strict equality", which
+        an earlier draft got wrong by reading the section as settled. The rest —
+        see §"Floats" under
         *Arithmetic* in `DESIGN.md`. `f64`; `/` unchanged on two integers, so no
         `//`; widen on mixed arithmetic but **compare exactly**, never through an
-        `i64`→`f64` cast; `1 == 1.0` with `Hash` agreeing, since `:dedup` is a
-        `HashSet<Value>`; no NaN and no infinity, float `/0` and overflow being
+        `i64`→`f64` cast; **not** `1 == 1.0` with `Hash` agreeing — that pair is
+        the open question above, and `Hash` follows whichever way it lands rather
+        than being required in advance; no NaN and no infinity, float `/0` and overflow being
         loud errors as the integer ones already are; shortest round-trip rendering
         with exponent form beyond some large/small magnitude — Python's ±(10¹⁶,
         10⁻⁴) are a reasonable starting point, deliberately **not** settled here;
