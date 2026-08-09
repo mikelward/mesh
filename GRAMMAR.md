@@ -573,11 +573,15 @@ than `global`'s, and the same test governs the lambda form (`func (`, no name).
 position against a float type that does not exist yet; a command called `float`,
 a variable, and `func float()` are all untouched.
 
-A declared type gives the function a **value channel**; one written without a
-type has none (`docs/DESIGN.md` §"Open questions"). `value` is a member of the
-set rather than an escape from it — mesh has values the set deliberately does not
-name (a job, a styled string, an `Instant`), and a pass-through helper over one
-has no honest concrete type.
+The declaration is **read and carried today, and changes nothing about the
+call**: a function written without a type still has its value channel, so
+`func f() { 42 }` followed by `x = f()` still binds `42`. What the type is *for*
+— a `func` that declares none having no value channel — is the narrowing
+`docs/DESIGN.md` §"Open questions" decides and `TODO.md` schedules; this file
+describes the grammar the implementation accepts, so it will say so when that
+lands. `value` is a member of the set rather than an escape from it — mesh has
+values the set deliberately does not name (a job, a styled string, an
+`Instant`), and a pass-through helper over one has no honest concrete type.
 
 Parameters are comma-separated, and the comma is required between two of them
 with no trailing one allowed: `func f(a b)` and `func f(a,)` are both errors.

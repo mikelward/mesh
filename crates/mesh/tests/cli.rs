@@ -19855,6 +19855,43 @@ fn a_syntax_error_is_located_in_the_whole_input_not_the_unit() {
 }
 
 #[test]
+fn a_typed_definitions_bad_name_costs_only_itself_in_a_sourced_file() {
+    // A bad name is a *runtime* name check, not a parse error, so it costs one
+    // definition. Reading the typed header with a fixed offset made
+    // `int func a.b()` a parse error instead — and a parse error rejects the
+    // whole sourced file, taking every valid definition around it down too.
+    // Raised in review as a P2.
+    let dir = fresh_dir("typed_bad_name");
+    // A bare `...` is the same shape: it is a name the parser takes unjudged and
+    // the runtime refuses, so it must cost only itself too. Raised in review as
+    // a P2 after a spread-specific guard declined it for having no subject.
+    for (index, bad) in ["int func a.b() { 1 }", "int func ...() { 1 }"]
+        .into_iter()
+        .enumerate()
+    {
+        let lib = dir.join(format!("lib{index}.mesh"));
+        std::fs::write(
+            &lib,
+            format!("func before() {{ 1 }}\n{bad}\nfunc after() {{ 2 }}\n"),
+        )
+        .unwrap();
+
+        let out = run_with_input(&format!(
+            "source {}\ntype before\ntype after\n",
+            lib.display()
+        ));
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(stdout.contains("before is a function"), "{bad}: {stdout}");
+        assert!(stdout.contains("after is a function"), "{bad}: {stdout}");
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains("cannot be a function name"),
+            "{bad}: {:?}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+}
+
+#[test]
 fn a_sourced_files_lines_are_counted_from_its_own_start() {
     // The line offset belongs to the *input*, not the shell: a sourced file is a
     // fresh input, so stdin's count must not carry into it. Raised in review —
