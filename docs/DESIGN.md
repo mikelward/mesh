@@ -192,8 +192,9 @@ There are four kinds of modifier, and the difference matters:
   string. It takes *any* type rather than a category, and its contract is
   **round-trip, not display**: parsing the result yields **the same value, and of
   the same type**. Both halves are required — equality alone would admit `1.0`
-  written as `1`, since [`1 == 1.0`](#arithmetic), and `1` and `1.0` divide
-  differently. That is
+  written as `1` *if* [`1 == 1.0`](#arithmetic) is chosen, which is **open**, and
+  `1` and `1.0` divide differently either way. The type half carries the rule on
+  its own, so this rationale holds however that opens. That is
   what forces a string to be quoted even when it would read as a bare word (`42`
   vs `'42'`) and keeps `[]` and `[:]` apart. That is what distinguishes it from
   [`puts`](#builtins), which *displays* a collection — one element or `key: value`
@@ -1671,8 +1672,9 @@ set:
 - **Implicit widening.** Rust has none — `1i64 + 1.0f64` does not compile — while
   mesh promotes the integer, because a shell used as a calculator cannot ask for
   casts.
-- **Cross-type comparison.** Rust does not offer it at all, so `1 == 1.0` and
-  `1 < 1.5` are mesh's own and have to be written by hand; that is the one place
+- **Cross-type comparison.** Rust does not offer it at all, so `1 < 1.5` is
+  mesh's own and has to be written by hand — and `1 == 1.0` would be too, *if*
+  that pair is chosen; it is [open](#arithmetic). That is the one place
   hand-rolling is unavoidable, and the exactness rule below is why.
 - **Checked float-to-integer conversion.** Rust's `as` saturates silently, so
   `1e20:int` would answer `i64::MAX`; mesh raises instead, per `:int` below.
@@ -1701,7 +1703,45 @@ That is the same silent wrong answer floats are being added to remove. Python
 compares the two exactly for this reason; JavaScript before BigInt is the
 cautionary tale.
 
-**`1 == 1.0` is true**, and equality stays type-strict against everything else
+**`1 == 1.0` — *open, not decided*.** mikelward has said so explicitly; earlier
+revisions of this paragraph read as settled and were taken at their word by
+later entries, which is the mistake this marker exists to stop. The paragraph
+below records the *case* for it, not a decision, and nothing downstream may
+assume it — in particular whether the numeric equivalence class survives with
+`Integer` and `Float` in it is open with it.
+
+**Type-strict is not free: it takes the ordering with it** (Codex, #472, twice —
+the second time because the first version of this paragraph rested on an
+observation that does not hold). **Nothing here can be observed today**, and the
+paragraph must not read as if it were: there is no float type, so `1.0` lexes as
+the string `'1.0'` and every one of these refuses at the operator rather than
+answering — `1 == 1.0` and `1 < 1.0` both raise (`` cannot compare an int with a
+string ``, `` comparison requires two integers or two strings ``), verified. They
+refuse on the *string*, and say nothing about floats.
+
+The consequence is therefore about the design, not the tree. *If* floats land and
+mixed comparison is **exact** rather than promoted, neither `1 < 1.0` nor
+`1.0 < 1` is less; if `1 == 1.0` is also false, then for that pair none of *less*,
+*greater* or *equal* holds, trichotomy fails, and `<` is no longer the total
+order this section claims below, leaving `<=`, `>=` and sorting without an
+answer. Two ways out, and this marker picks neither: **couple equality to the
+ordering**, so numerically equal is equal and the cross-type pair comes back; or
+keep them apart and **specify a type tie-break** for numerically equal int/float
+pairs, so one sorts consistently before the other. Whoever settles `1 == 1.0`
+settles this in the same pass — it is not a separable follow-up.
+
+Every other place in the docs that leaned on the pair has been made conditional
+with it, after three partial passes each missed some: the [`:repr`
+rationale](#modifiers), the Rust-comparison note under *What Rust gives and what
+it does not*, the `Hash` paragraph below, the defect note in
+[Open questions](#open-questions) — which used to say *the design was never in
+doubt*, now withdrawn — both float entries in `TODO.md`, and the flag-equality
+entry that called the pair "the lone widening exception". `TODO.md`'s
+status-equality entry had in fact already called this pair open, which is the
+contradiction that should have been noticed sooner. The argument, for whoever
+settles it:
+
+**`1 == 1.0` would be true**, and equality stays type-strict against everything else
 (`1 == "1"` **reports**, per
 [Comparison across types](#comparison-across-types) — it was a silent `false`
 when this paragraph was written). The two rules agree rather than conflict: int
@@ -1714,9 +1754,14 @@ widens on mixed arithmetic — Python, Lua, Ruby — compares numerically across
 number types, and an arithmetic `1 == 1.0` answering false is a trap in a
 calculator. The comparison is exact, per the rule above, not a promotion to `f64`.
 
-`Hash` has to agree, since `:dedup` is a `HashSet<Value>` and `[1 1.0]:dedup` must
-collapse to one element: an integral float **that fits `i64`** hashes as that
-integer. One that does not (`1e20`) is no integer's equal anyway, so it hashes as
+`Hash` has to agree — **conditional on the open question above, not a standing
+requirement.** If `1 == 1.0` is chosen, then `:dedup` being a `HashSet<Value>`
+forces `[1 1.0]:dedup` to collapse to one element, by the rule that `Eq` and
+`Hash` must agree; if type-strict equality is chosen instead, the two stay
+distinct and none of the hashing below applies. Marking only the equality open
+while leaving this paragraph imperative would let an implementer ship the
+undecided behavior from here (Codex, #472). Under the cross-type reading: an
+integral float **that fits `i64`** hashes as that integer. One that does not (`1e20`) is no integer's equal anyway, so it hashes as
 a float — collapsing those onto `i64::MAX` would only manufacture collisions. Rust derives
 neither `Hash` nor `Eq` for `f64`, so both are written by hand — which banning NaN
 below is what makes legitimate.
@@ -5481,7 +5526,17 @@ show: a lossless projection into the class.
 
 Membership is what a new type must argue for, and the bar is the projection: a
 type joins the numeric class by having a lossless projection **to a number**, and
-otherwise starts a class of its own. A `Flag` has none — its text form is not a
+otherwise starts a class of its own. **`Float` is the one candidate this rule
+does not decide** — int and float share exactly that projection, so read alone
+the rule places them together, but whether `1 == 1.0` holds is
+[open, not decided](#arithmetic). Take the rule as governing every *other*
+candidate and floats as awaiting that question, not as an instruction to pair
+them (Codex, #472 — the fifth site the open-marker sweep had missed, and the one
+that would have set the answer by implication). Whether the class survives at
+all takes **two** decisions, not this one alone: it disappears only if float
+equality lands type-strict *and* `Status` leaves, which is a separate `TODO.md`
+proposal. Either one alone keeps a class — `Integer` with `Float` if the pair
+compares, `Integer` with `Status` if it does not and `Status` stays. A `Flag` has none — its text form is not a
 projection but a rendering, and `--tag=v2` against `"--tag=v2"` is the very
 distinction the type exists to keep — so it is alone in its class and refuses
 everything, which is exactly what it does today.
@@ -9913,13 +9968,30 @@ remain under-specified.
     `builtin` prefix) is its own pass.
 
   Two **defects** were found while checking this entry, neither created by the
-  decision. `1 == 1.0` is `false` on `main` while the [`:repr`](#modifiers)
-  rationale and §"Floats" both say it is true. The *design* was never in doubt
-  and the comparison entry does not reopen it — it only records the consequence
-  that an integral float then equals the corresponding status, both being in the
-  numeric class. The defect has its own cause: there is no float type yet, so
-  `1.0` lexes as the **string** `'1.0'` and the comparison is a string one.
-  Tracked with the float entry in `TODO.md`. The second one is
+  decision. `1 == 1.0` **raises** on `main` while the [`:repr`](#modifiers)
+  rationale and §"Floats" read as though it were true. (An earlier revision of
+  this sentence said it was `false`, which contradicted the correction three
+  paragraphs below in the same entry — Codex, #472.) An earlier revision of
+  this paragraph went further and said *the design was never in doubt* —
+  **that is withdrawn**: mikelward has since said the cross-type pair is open,
+  not decided, and §"Floats" now carries a marker to that effect. What this
+  entry records is only a *doubly* conditional consequence, and an earlier
+  revision made it hang on the float decision alone (Codex, #472). An integral
+  float equals the corresponding status **only if both** the cross-type float
+  pair is chosen *and* `Status` stays in the numeric class — and option A of
+  `TODO.md` §"Decisions needed" takes `Status` out of it. So under float-yes +
+  A the two are unequal; under float-yes with `Status` retained they are equal;
+  under float-no the question does not arise. The two open decisions have to be
+  implemented together for this to come out consistently. What happens *today* is
+  unrelated to the open question either way, and an earlier revision got it wrong
+  (Codex, #472): there is no float type yet, so `1.0` lexes as the **string**
+  `'1.0'` — but the expression does not then answer `false` as a string
+  comparison. `eval_binary` refuses a cross-type pair at the operator before any
+  comparison runs, so it **raises** `` cannot compare an int with a string ``
+  (verified, and pinned by
+  `cross_type_equality_refuses_at_the_operator_and_stays_total_beneath`). The
+  lexing half of that explanation was right and the outcome half was not. Tracked
+  with the float entry in `TODO.md`. The second one is
   **fixed**: `p():capture` reported
   `value=1 status=0` for a function whose command tail failed while bare `p` left
   `$sh.status` 1, and typing the command tail made the two agree
