@@ -5494,9 +5494,18 @@ and the postfix parses cheaper. Build one, then look at it.
             is not available yet. Adding it later may still invalidate scripts
             written against its absence; that is accepted, so do not design
             around it.
+      - [ ] **The "returns a value, unspecified" escape hatch is required, not
+            optional — and it blocks the narrowing.** Trying the migration
+            proved it: the closed set does not cover the value kinds mesh
+            already has. `func ident(x) { return $x }` in `cli.rs` is handed a
+            **job**, and there is no `job` in the vocabulary, nor a `styled`, an
+            `Instant`, or a `Duration`. Without a hatch the narrowing makes that
+            function unwritable rather than merely unannotated. Decide between
+            widening the vocabulary to every kind (grows forever, puts `job` in a
+            reader's way) and one hatch word (smaller, and the honest thing to
+            say about an identity function) **before** landing the narrowing.
       - [ ] Still open: whether a compound kind is writable at all (`list`, or a
-            list of what), and whether there is a "returns a value, unspecified"
-            escape hatch.
+            list of what).
       - [ ] **User-defined types are not a goal** — the set is closed on purpose.
             Recorded here so the next reader treats it as the boundary that keeps
             this a check rather than a type system, not as a gap to fill.
@@ -5532,6 +5541,25 @@ and the postfix parses cheaper. Build one, then look at it.
       `Status`; the last expression stops being its value. This is what kills the
       `for`-aggregate nobody wrote (`eval_for_passes` / `run_ast_for_passes` in
       `repl.rs`), and it is the breaking half of the change.
+
+      **Blocked on the escape hatch above**, and measured rather than guessed:
+      implemented against the suite it fails **61 of 1108** cli tests — 5.5%,
+      which does bear out the design's claim that the migration lands on the
+      minority — across **156** definitions needing a type. Most are honest and
+      obvious (`func up(s) { $s:upper }` → `str func up(s)`,
+      `func long(s) { $s:len >= 2 }` → `bool func long(s)`,
+      `func carried() { for i in [1 2] { $i + 10 } }` → `list func`, which is the
+      aggregate stopping being incidental and starting to be declared). The ones
+      that are not obvious are the ones that need the hatch. The narrowing and
+      its migration are **one commit** — do not land the break without the fixes.
+
+      One case worth re-deciding rather than annotating:
+      `a_bare_return_carries_the_result_so_far` asserts
+      `func carried() { x = hello; $x; return }` yields `hello`. As a `str func`
+      that keeps working, but a bare `return` in a non-`status` func is exactly
+      what the static check above is meant to flag, so the test is asserting
+      something the language is about to stop meaning. Decide what it should say
+      before mechanically typing it.
 - [ ] **Static check: `return $v` in a func that declares no type.** Local to one
       definition, so no resolver pass — which is the point, per §"Beyond M3 —
       Static checks" below on why mesh cannot have one. The diagnostic names the
