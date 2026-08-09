@@ -545,8 +545,9 @@ binds a variable named `global`.
 ### Definitions
 
 ```ebnf
-definition      = "wrapper"? "func" definition-name parameter-list capture-list? NL* block
+definition      = return-type? "wrapper"? "func" definition-name parameter-list capture-list? NL* block
                 | "alias" alias-name capture-list? "=" NL* alias-command ;
+return-type     = "status" | "int" | "str" | "bool" | "list" | "map" | "value" ;
 definition-name = bare-WORD ;                 # unjudged here; checked when it runs
 alias-name      = definition-name
                 | computed-name ;             # a word holding an interpolation
@@ -561,6 +562,22 @@ parameter       = name                        # required positional
 flag-name       = "--" name ;                 # one token: the dashes abut the name
 block           = "{" statement-list "}" ;
 ```
+
+A **`return-type` is contextual, and outermost.** It is read only where the
+complete header shape follows it — `func NAME (`, or `wrapper func NAME (` — so
+every one of those words stays an ordinary command word and an ordinary name
+elsewhere: `status 5` is the builtin call, `int = 1` an assignment, and
+`func int() { … }` defines a function called `int`. That is `fork`'s rule rather
+than `global`'s, and the same test governs the lambda form (`func (`, no name).
+`float` is recognized in the same position and **refused**, reserving the
+position against a float type that does not exist yet; a command called `float`,
+a variable, and `func float()` are all untouched.
+
+A declared type gives the function a **value channel**; one written without a
+type has none (`docs/DESIGN.md` §"Open questions"). `value` is a member of the
+set rather than an escape from it — mesh has values the set deliberately does not
+name (a job, a styled string, an `Instant`), and a pass-through helper over one
+has no honest concrete type.
 
 Parameters are comma-separated, and the comma is required between two of them
 with no trailing one allowed: `func f(a b)` and `func f(a,)` are both errors.
@@ -763,7 +780,7 @@ wrapped-expression
                 = value-expression ;          # `NL*` *precedes* every binary and
                                               # range operator in here as well
 value-call      = name call-arguments ;
-lambda          = "func" parameter-list capture-list? NL* block ;
+lambda          = return-type? "func" parameter-list capture-list? NL* block ;
 capture-list    = "with" NL* "(" NL* ( capture ( NL* "," NL* capture )* NL* ","? )? NL* ")" ;
 capture         = "$" name ;                  # a read, not a declaration
 modifier-ref    = ":" name ;
