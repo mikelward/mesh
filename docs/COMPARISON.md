@@ -594,7 +594,7 @@ not limited to what the shell shipped.
 
 | | Postfix operator | Vocabulary | Where it works | Yours to extend |
 | --- | --- | --- | --- | --- |
-| bash | none — `${x@U}` is a suffix, one deep | fixed sigil forms, plus nine `@` letters (5.1) | inside `${…}` only | no |
+| bash | none — `${x@U}` is a suffix, one deep | fixed sigil forms, plus the ten `@` letters of 5.2 | inside `${…}` only | no |
 | zsh | `:` + a **letter** | fixed: `h t r e s a A l u q Q x` … | `${…}`, history words, glob qualifiers | no |
 | YSH | `=>` | any function | **expression mode only** | yes |
 | fish | none | the `string` and `path` command families | pipelines and `(…)` | yes — write a function |
@@ -647,8 +647,8 @@ It is the closest prior art by some distance, and it stops at three walls:
 
 bash inherited only the history half (`!$:h`) and never brought the modifiers to
 parameters at all; its answer is the `${x#…}` / `${x%…}` sigil family plus the
-`${x@U}` transformations added in 4.4 and 5.1, and neither can take the other's
-result — or its own — as a subject.
+`${x@U}` transformations, which arrived in 4.4 and have grown to ten operators by
+5.2 — and neither family can take the other's result, or its own, as a subject.
 
 ### YSH's `=>` is the nearest living relative
 
@@ -731,11 +731,14 @@ because it reads as excluding the thing every upward search starts from.
 
 **PowerShell's member enumeration is the cautionary tale, not the model.** Its
 `.` maps over a collection automatically, which is the same convenience as mesh's
-value modifiers — but it decides *per value at run time*: the collection's own
-member wins, and enumeration is the fallback when the collection hasn't got one.
-So `.Count` on a list whose elements each have a `Count` means one thing for a
-`List[string]` and another for an array of custom objects, and a property that
-doesn't exist enumerates into a list of `$null` rather than reporting. mesh
+value modifiers — but *which* of the two readings you get is decided by the
+receiver's type at run time: the collection's own member wins, and enumeration is
+only the fallback when the collection hasn't got one. So `@('abc','de').Length`
+is `2`, the array's own `Length` with the elements' shadowed, while
+`@('abc','de').Trim()` enumerates, because an array has no `Trim`. One syntax,
+and whether it means *the collection's* or *each element's* depends on what the
+receiver type happens to define — so adding a member to a collection type is a
+silent breaking change to every call site that was relying on enumeration. mesh
 cannot land there, because the category is fixed by the **declaration** rather
 than by the value: `func _s:name()` is element-wise and `func ..._xs:name()`
 takes the whole collection, so `:len` is a collection modifier and `:stem` is a
@@ -784,9 +787,11 @@ much they would buy. None is decided; they are tracked in
    which is
    [deliberate](DESIGN.md#modifiers) — it keeps a private one-argument helper
    from silently becoming public vocabulary — but it means a chain stops dead at
-   any function someone wrote before they knew it would be chained. `:map(:base)`
-   already proves the machinery takes a chain link as a value, so an
-   `:apply(f)` / `:then(f)` escape hatch is close by.
+   any function someone wrote before they knew it would be chained. `:map(&up)`
+   and `:map(:base)` already prove the machinery takes a callable as an argument,
+   so an `:apply(&f)` / `:then(&f)` escape hatch is close by — spelled with the
+   `&` that [every other callable argument](REFERENCE.md#functions) takes, since
+   a bare `f` is the string `"f"`.
 2. **`with_suffix`.** pathlib's `.with_suffix('.png')` is the one path operation
    mesh has no single spelling for; the design's answer is `($f:stem).png`, which
    is not implemented and reads worse than the rest of the family.
