@@ -8186,9 +8186,16 @@ unguarded, alongside fish and elvish, and carries a `TODO:` naming this entry.
       mismatch gate must admit the status/int pair explicitly** — one class
       check rather than a phrase comparison — while `Value::eq` supplies the
       answer. Raised by Codex on mikelward/mesh#465 against an earlier draft of
-      these notes that named only `Value::eq`. **`Hash` has to match** the
-      new `eq` or `HashSet<Value>` breaks its own invariant: a `Status` hashes as
-      its code. **Map keys are out of scope** — `Value::Map` is
+      these notes that named only `Value::eq`. **`Hash` does *not* have to change**, and an
+      earlier draft of these notes said it did (Codex, #472). Rust's contract is
+      one-directional — equal values must hash alike; unequal ones **may**
+      collide — so making a status unequal to its code *lapses* an obligation
+      rather than creating one. Today's equality is what forces the two to hash
+      alike; under A nothing does, the colliding pair is resolved by `Eq` the
+      way `HashSet` resolves any collision, and `[status(0) 0]:dedup` keeps both
+      elements with the hash untouched. Re-bucketing statuses is an optional
+      performance tweak, not a correctness requirement — which is why A stays
+      the two edits named above. **Map keys are out of scope** — `Value::Map` is
       `Vec<(String, Value)>` and scalar keys render to text before lookup
       (`[status(5): "a"]` reprs `['5': 'a']`), so a status and its code already
       key one entry without consulting `Value::eq`; do not cite them as a
@@ -8477,6 +8484,165 @@ place and narrowly in another.
 
 Not urgent, but it compounds: every new design entry adds cross-references into
 the same web, and each correction after that has more sites to miss.
+
+## Beyond M3 — Type-strict equality
+
+- [ ] **Equality compares only within a type — a status is never equal to an
+      int.** Directed by mikelward. **Option A of the five weighed under
+      §"Decisions needed", *How loud should a mismatch be?*** — that entry is
+      where the choice is made; this one is the build notes for it. Don't start
+      until it is chosen. This **reverses a decided entry**, so the
+      first commit of the series is the `DESIGN.md` rewrite, not the code:
+      `DESIGN.md` §"Comparison across types" currently declares the status/int
+      pair as the *one* cross-type equality, and its subsection §"Why `Status`
+      compares to an int, and to nothing else" argues it at length from a
+      lossless-projection rule. Both go.
+
+      **What it buys, stated more carefully than an earlier draft did.** `==`
+      already refuses two different types (`1 == "1"` is *cannot compare an int
+      with a string*, `status(0) == "0"` is *cannot compare a status with a
+      string*), with status-against-int carved out as a declared exception.
+      Removing it means a status is compared only with a status.
+
+      **Whether it also abolishes the equivalence classes depends on an open
+      question, and two earlier drafts got this wrong in opposite directions.**
+      The first claimed A makes every type its own class. Codex (#472) objected
+      that `1 == 1.0` is a decided cross-type equality that A would silently
+      reverse, and the second draft accepted that. **Both were wrong**, because
+      `1 == 1.0` is **not decided** — mikelward has said so, and `DESIGN.md`
+      §Arithmetic — where floats are specified — now carries a marker saying the paragraph records a case rather
+      than a decision. So:
+
+      - If float equality lands as **cross-type** (`1 == 1.0` true), the numeric
+        class survives with `Integer` and `Float` in it, and this entry takes
+        **`Status` out of** that class rather than abolishing anything.
+      - If it lands **type-strict** like everything else, then with `Status`
+        gone there is no cross-type pair left and every type really is its own
+        class.
+
+      What this entry claims either way is the narrow part: **a status stops
+      being a number**, and the argument that it *is* one — the code being a
+      lossless projection — is the specific thing being withdrawn. The wider
+      "one sentence, no classes" reading is *contingent* and must not be quoted
+      as a benefit of A on its own. Whoever settles floats settles this too, so
+      the two should be read together.
+
+      **What it costs, verified against the current build** (all eight are true
+      today, and all eight change — the two plain `match` rows are the same miss
+      with and without a catch-all, and they land differently. Seven of the
+      eight are silent; only the first reports):
+
+      ```mesh
+      $sh.status == 0              # true  → refuses: "cannot compare a status with an int"
+      match $sh.status { 0 => … }  # takes the arm → misses; no `_`, so the answer is ""
+      match $sh.status { 0 => … ; _ => … }   # takes the `0` arm → silently redirects to `_`
+      [status(0) 0]:dedup:len      # 1     → 2
+      0 in $sh.pipestatus          # true  → false
+      [status(0)]:has(0)           # true  → false — `in`'s modifier spelling
+      [status(0)] == [0]           # true  → false, and no diagnostic
+      match $sh.status { 0..=255 => … }      # takes the arm → silent miss
+      ```
+
+      **A range arm counts too, and an earlier inventory missed it** (Codex,
+      #472): `match_bindings` evaluates a range to its integer values and does
+      `values.contains(subject)` (`repl.rs`:7725), so it rides the same equality
+      as everything else and `match $sh.status { 0..=255 => … }` — a spelling
+      `DESIGN.md` §Matching confirms works today — becomes a miss. It is listed
+      because a reader auditing for affected *spellings* would not think to look
+      for a range.
+
+      `:has` is `in` written the other way round — `expand::has_value` is a
+      `values.contains(&needle)` over the same equality — so it changes with it
+      and is just as quiet. Listed separately because a reader scanning for
+      affected spellings will not find it under `in` (Codex, #472).
+
+      What you write instead is `$s:code == 0`, or `$s == status(0)`, or
+      `if $s { … }` when success rather than the code is the question — all
+      three work today.
+
+      **Only the first row is loud under A. The rest are the reason this is
+      filed rather than obvious**, and they are exactly what the reversed entry
+      was written to prevent. `==` refuses and the writer is told; every other
+      consumer of the same equality quietly changes answer.
+
+      **That silence is A's *policy*, not a structural limit** — an earlier draft
+      said these consumers had nowhere to put a refusal, and that is false for
+      **every one of them**, with no exception (Codex, #472; "all but one" here
+      was itself a leftover from the draft where `:dedup` was the exception).
+      `match_bindings` returns `Result<Option<…>,
+      Step>` (`repl.rs`:7698), `eval_binary` returns `Result<Value, String>`
+      (:8112), and `expand::has_value` and `apply_modifier` return `Result<_,
+      ExpandError>` (`expand.rs`:2512, :1747) — so an arm, `in`, `:has` and
+      nested `==` all *could* report, and making them do so is precisely what
+      option C is. **`:dedup` is not an exception either**, though two drafts of
+      this paragraph said it was: `apply_modifier` also returns a `Result`, and
+      the `Eq`/`Hash` contract constrains the current `HashSet` *implementation*
+      (`expand.rs`:1881), not the language operation — a fallible O(n) pre-pass
+      can report before the filter runs (Codex, #472; the C analysis under
+      §"Decisions needed" works this through, and this paragraph was still
+      asserting the opposite two screens above it). So **every** silent row is
+      silent by choice. A leaves them that way because it changes `Value::eq`
+      and stops there, which is a decision open to revisiting rather than a wall.
+
+      The two `match` rows are worth keeping apart: without a catch-all the result is the
+      silent `""` this file's exhaustiveness entry is about, and with one it is a
+      silent redirect into a branch the writer did intend for *something* — a
+      different failure, and the reason B does not rescue A. `:dedup` belongs
+      in that tally and an earlier draft left it out (Codex, #472): going from
+      one element to two is as silent as the rest. `$sh.pipestatus` really is a list of
+      statuses (`[status(0), status(0)]`), so `0 in $sh.pipestatus` is a spelling
+      that reads correct, runs, and starts saying `false`.
+
+      **Nested equality is the one that hides inside `==` itself** — found by Codex on
+      #472, and the least visible of the set. The operator's refusal is scoped
+      to the **top-level** operand pair, deliberately (`DESIGN.md`: *"`[1] ==
+      ["1"]` — false, nested, not an error"*), so two lists are two lists, the
+      comparison is admitted, and the recursion reaches the status/int arm in
+      `Value::eq` one level down. `[status(0)] == [0]` is `true` today, and so
+      is the map form `[k: status(0)] == [k: 0]`. Removing that arm flips both
+      to `false` with **no diagnostic anywhere** — the `==` that would have
+      refused never sees the pair. It is also the row that cannot be found by
+      reading: the others have a surface spelling — `==`, an arm, a range arm,
+      `:dedup`, `in`, `:has` — and this one has none, so a reader auditing their
+      own code for affected sites has nothing to look for.
+
+      What this still has to settle:
+
+      - **Whether `match` arms and `in` follow `==` into refusing**, or keep
+        answering "no match" the way `match "x" { 0 => … }` does today. Refusing
+        in an arm aborts the whole `match` at the arm rather than at a value the
+        writer chose, which is why the reversed entry rejected it; leaving it
+        silent is the miss above. Note this is the *same* seam the flag-equality
+        entry under §"Decisions needing review" already records — an arm
+        compares totally where `==` refuses — approached from the other side, so
+        whichever lands first should settle it for both.
+      - **Nothing needs migrating — mesh is unreleased**, so the only question
+        is whether the end state is right, not how anyone gets to it. Recorded
+        because it is the obvious thing to re-propose: a run-time deprecation
+        warning for the silent rows, at two sites so it is neither incomplete
+        nor noisy, with caller-side coalescing so one expression warns once —
+        that whole apparatus was drafted here and cut by mikelward as work for
+        a problem 0.0.0 does not have. Don't rebuild it. Two things survive it,
+        both properties of the end state rather than of a transition:
+
+        - **No static check catches the silent rows.** Catching them means an
+          *incompatible-pattern* diagnostic — an arm whose pattern can never
+          match its subject — and mesh has no static types to prove that with,
+          the same wall §"Beyond M3 — Static checks" hits. So under A a `0` arm
+          against a status is quietly dead code, permanently, not just during
+          some transition. That is the cost to accept or reject.
+        - **Exhaustive `match` does not rescue it** (Codex, #472). A `match`
+          that already ends in `_` passes any exhaustiveness check and still
+          redirects silently, so B does not cover this even in principle.
+      - **What `$sh.status` should be**, given the reflex spelling is now an
+        error. Keeping it a `Status` and teaching `:code` is one answer; the
+        other is that the reflex is common enough to deserve a shorter one.
+      - **The `Hash` half — which turns out not to be a half.** A `Status`
+        currently hashes as its code so `:dedup` agrees with `==`, and an
+        earlier draft called that a mandatory change under A (Codex, #472). It
+        is not: unequal values are permitted to collide, so the hash can stay
+        exactly as it is and `HashSet` will compare the pair and retain both.
+        Nothing is left open here beyond whether to re-bucket for speed.
 
 ## Loose ends
 
