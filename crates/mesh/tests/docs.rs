@@ -54,17 +54,25 @@ fn repo_root() -> PathBuf {
         .to_path_buf()
 }
 
-/// `DESIGN.md` is the one documentation file the sweep skips.
+/// The design documents are the ones the sweep skips.
 ///
-/// It argues the language mesh is *aiming at*, so it deliberately writes syntax
-/// the parser does not accept yet (glob qualifiers, `fork`, heredocs) and quotes
-/// diagnostics as examples of what must fail. Parsing it against today's parser
-/// would report the design's own open front as drift, and the only way to stay
-/// green would be to stop writing down unbuilt syntax — exactly what the file is
-/// for. Every other doc, including the forward-looking `INTRO.md` and
+/// They argue the language mesh is *aiming at*, so they deliberately write
+/// syntax the parser does not accept yet (glob qualifiers, `fork`, heredocs) and
+/// quote diagnostics as examples of what must fail. Parsing them against today's
+/// parser would report the design's own open front as drift, and the only way to
+/// stay green would be to stop writing down unbuilt syntax — exactly what the
+/// files are for. Every other doc, including the forward-looking `INTRO.md` and
 /// `PROMPT.md`, is swept.
+///
+/// `TYPES.md` qualifies on the same ground rather than by being adjacent to it:
+/// it proposes end states for the type system, so its examples are spelled in
+/// syntax no package has built (`status func` / `int func` declarations, say).
+///
+/// This is a **named list, not a pattern**, so a new file under `docs/` is swept
+/// by default and joining the exemption takes an edit here.
 fn is_design_document(path: &Path) -> bool {
-    path.file_name().is_some_and(|name| name == "DESIGN.md")
+    path.file_name()
+        .is_some_and(|name| name == "DESIGN.md" || name == "TYPES.md")
 }
 
 fn documentation_files(root: &Path) -> Vec<PathBuf> {
@@ -427,13 +435,23 @@ mod extraction {
         assert_eq!(found[0].line, 4);
     }
 
-    /// The design document is skipped and its neighbors in `docs/` are not, so
-    /// the exclusion stays one file wide rather than quietly swallowing the
+    /// The design documents are skipped and their neighbors in `docs/` are not,
+    /// so the exclusion stays two files wide rather than quietly swallowing the
     /// directory.
     #[test]
-    fn only_the_design_document_is_excluded() {
+    fn only_the_design_documents_are_excluded() {
         let files = documentation_files(&repo_root());
         assert!(!files.iter().any(|path| is_design_document(path)));
+        for excluded in ["DESIGN.md", "TYPES.md"] {
+            assert!(
+                is_design_document(Path::new(excluded)),
+                "{excluded} should be exempt from the sweep"
+            );
+        }
+        assert!(
+            !is_design_document(Path::new("REFERENCE.md")),
+            "the exemption must stay a named list rather than a pattern"
+        );
         for expected in ["README.md", "INTRO.md", "TOUR.md", "REFERENCE.md"] {
             assert!(
                 files
