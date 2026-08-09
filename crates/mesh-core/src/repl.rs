@@ -12567,13 +12567,16 @@ fn pending_input(text: &str) -> Pending {
     // same strip for the same reason — a malformed typed body would otherwise be
     // dispatched line by line and *run* at top level. The type is written
     // outermost, so it comes off first and `wrapper` second.
-    let trimmed = strip_wrapper_marker(strip_type_marker(text.trim_start()));
-    let func_header = trimmed.strip_prefix("func").is_some_and(|rest| {
-        rest.is_empty() || rest.chars().next().is_some_and(char::is_whitespace)
-    });
+    let untyped = strip_wrapper_marker(text.trim_start());
+    let typed = strip_wrapper_marker(strip_type_marker(text.trim_start()));
+    let is_header = |trimmed: &str| {
+        trimmed.strip_prefix("func").is_some_and(|rest| {
+            rest.is_empty() || rest.chars().next().is_some_and(char::is_whitespace)
+        })
+    };
     // A `func` header is judged by the brace scanner rather than the parser, so
     // that a malformed one is dispatched (and diagnosed) instead of buffering.
-    let by_braces = || {
+    let by_braces = |trimmed: &str| {
         if func_definition_is_open(trimmed) {
             Pending::Other
         } else {
@@ -12582,9 +12585,22 @@ fn pending_input(text: &str) -> Pending {
     };
     match parser::parse(text) {
         Ok(parser::ParseOutcome::IncompleteHeredoc(delimiter)) => Pending::Heredoc(delimiter),
-        Ok(parser::ParseOutcome::Incomplete(_)) if func_header => by_braces(),
+        // **The type marker does not come off here**, only on the error arm
+        // below. An `Incomplete` means the parser understood the line and is
+        // waiting for the rest of it, and a type word cannot change that: the
+        // unstripped `int func f() {` is a command with an open brace, which is
+        // just as incomplete as the definition. Stripping anyway handed a
+        // command-shaped line to a scanner that only knows definitions, and
+        // `int func f arg {` — an ordinary call with an open block — was
+        // declared malformed and dispatched, running the block's lines at top
+        // level. Raised in review as a P1, after an earlier round removed the
+        // raw-text name check that had been masking it.
+        Ok(parser::ParseOutcome::Incomplete(_)) if is_header(untyped) => by_braces(untyped),
         Ok(parser::ParseOutcome::Incomplete(_)) => Pending::Other,
-        Err(_) if func_header => by_braces(),
+        // The parser has given up, so the reader has to decide whether a body is
+        // open — and here the type must come off, or a malformed typed body is
+        // dispatched line by line and *runs* at top level.
+        Err(_) if is_header(typed) => by_braces(typed),
         Ok(parser::ParseOutcome::Complete(_)) | Err(_) => Pending::Complete,
     }
 }
@@ -12604,11 +12620,11 @@ fn pending_input(text: &str) -> Pending {
 fn strip_type_marker(text: &str) -> &str {
     let Some(word) = TYPE_MARKER_WORDS.iter().find(|word| {
         text.strip_prefix(**word)
-            .is_some_and(|tail| tail.starts_with([' ', '\t']))
+            .is_some_and(|tail| tail.starts_with(HEADER_SPACE))
     }) else {
         return text;
     };
-    let after = text[word.len()..].trim_start_matches([' ', '\t']);
+    let after = text[word.len()..].trim_start_matches(HEADER_SPACE);
     if typed_header_follows(after) {
         after
     } else {
@@ -12616,39 +12632,29 @@ fn strip_type_marker(text: &str) -> &str {
     }
 }
 
-/// Does a complete definition header follow — `func NAME(`, or `wrapper func
-/// NAME(`?
+/// What separates the words of a header for these raw scans. `\r` is in it
+/// because the lexer skips it as ordinary whitespace, so `int\rfunc f() {` is a
+/// definition to the parser; a reader that stopped at `' '` and `'\t'` declined
+/// the header and ran its malformed body at top level. `\n` is not: it ends the
+/// line these scans are given.
+const HEADER_SPACE: [char; 3] = [' ', '\t', '\r'];
+
+/// Does a definition header follow — `func …`, or `wrapper func …`?
 ///
-/// The **same shape the parser insists on**, checked here in raw text. Anything
-/// weaker makes the two recognizers disagree: the parser would read
-/// `int func f {` as an ordinary command called `int`, while a reader that
-/// stripped on `func` alone would treat it as an open definition and buffer what
-/// followed into it. The disagreement is masked today — the shell stops on the
-/// syntax error before the difference shows — which is exactly why it is worth
-/// closing rather than leaving for whichever change unmasks it.
+/// **The keyword and nothing else.** Reading the name here too would need the
+/// lexer's rules for quotes, escapes, raw strings and word boundaries, applied
+/// to text the lexer has not tokenized. It is also unnecessary: whatever this
+/// declines is judged by the *parser* instead, which answers the same way with
+/// the type word present or absent — `int func f {` has an unclosed brace
+/// either way, `int func f arg` is a complete command either way.
 fn typed_header_follows(after: &str) -> bool {
     let after = match after.strip_prefix("wrapper") {
-        Some(tail) if tail.starts_with([' ', '\t']) => tail.trim_start_matches([' ', '\t']),
+        Some(tail) if tail.starts_with(HEADER_SPACE) => tail.trim_start_matches(HEADER_SPACE),
         _ => after,
     };
-    let Some(tail) = after.strip_prefix("func") else {
-        return false;
-    };
-    if !tail.starts_with([' ', '\t']) {
-        return false;
-    }
-    // A name, then its signature opener. The parser reads tokens, so whitespace
-    // between the two is invisible to it and `int func f ()` is a definition
-    // there; this reader works on raw text and has to allow the same gap, or the
-    // spelling with a space stops being recognized as a header and its malformed
-    // body runs at top level.
-    let name = tail.trim_start_matches([' ', '\t']);
-    let after_name = name.trim_start_matches(|c: char| !c.is_whitespace() && c != '(');
-    // Nothing consumed means no name — `func (` is a lambda, not a definition.
-    if after_name.len() == name.len() {
-        return false;
-    }
-    after_name.trim_start_matches([' ', '\t']).starts_with('(')
+    after
+        .strip_prefix("func")
+        .is_some_and(|tail| tail.is_empty() || tail.starts_with(HEADER_SPACE))
 }
 
 /// The type words [`strip_type_marker`] knows, kept beside the parser's own set
@@ -12665,14 +12671,14 @@ fn strip_wrapper_marker(text: &str) -> &str {
     let Some(rest) = text.strip_prefix("wrapper") else {
         return text;
     };
-    let after = rest.trim_start_matches([' ', '\t']);
+    let after = rest.trim_start_matches(HEADER_SPACE);
     if after.len() == rest.len() {
         // No separator: this is a longer word, e.g. `wrappers`.
         return text;
     }
     let is_func = after
         .strip_prefix("func")
-        .is_some_and(|tail| tail.is_empty() || tail.starts_with([' ', '\t']));
+        .is_some_and(|tail| tail.is_empty() || tail.starts_with(HEADER_SPACE));
     if is_func { after } else { text }
 }
 
@@ -18021,18 +18027,51 @@ mod tests {
             // Reserved, and still a header: the diagnostic has to be the
             // reserved-word one rather than whatever the body would have done.
             "float func f() {\nputs hi\n",
+            // **Seven spellings of a definition name**, each one a P1 in review
+            // while the strip tried to read the name in raw text: quoted (its
+            // own spaces), an escaped quote, a raw string (no escapes, so the
+            // backslash is literal), an `r` that is only a letter, a raw piece
+            // after a separator, a carriage return the lexer skips as space, and
+            // a nested interpolation holding a quoted string. Not one of them is
+            // read now — the strip asks only whether `func` follows — and they
+            // stay here as the record of what the name scan cost.
+            "int func \"foo bar\"() {\nputs hi\n",
+            "int func \"foo\\\" bar\"() {\nputs hi\n",
+            "int func r\"foo\\\"() {\nputs hi\n",
+            "int func r'foo\\'() {\nputs hi\n",
+            "int func car'pet\\'x'() {\nputs hi\n",
+            "int func a=r\"foo\\\"() {\nputs hi\n",
+            "int func \"foo $(puts \"x y\") bar\"() {\nputs hi\n",
+            "int\rfunc f() {\nputs hi\n",
+            "int\rwrapper\rfunc f(...xs) {\nputs hi\n",
+            "wrapper\rfunc f(...xs) {\nputs hi\n",
         ] {
             assert!(needs_more_input(input), "expected incomplete: {input:?}");
         }
-        // …and only on the parser's *complete* shape. Below it, a type word is
-        // an ordinary command word and has to read exactly like any other one,
-        // which is the invariant worth pinning: `int func f {` is a command
-        // called `int` followed by an unclosed block, so it waits for the `}` —
-        // for the block's sake, not a header's — and does so identically to a
-        // word the reader has never heard of. Raised in review as a P2 on the
-        // grounds that the type was being stripped here; it is not, and this
-        // pins the pair together so a future strip cannot start.
-        for shape in ["func f {\nputs after\n", "func {\nputs after\n", "= 1\n"] {
+        // A type word below a definition still reads as an ordinary command
+        // word, which is the invariant worth pinning: `int func f {` is a
+        // command called `int` followed by an unclosed block, so it waits for
+        // the `}` — for the block's sake, not a header's — and does so
+        // identically to a word the reader has never heard of. Raised in review
+        // as a P2.
+        //
+        // This is also *why* the strip can ask only whether `func` follows. The
+        // worry was that a weaker test would make the two recognizers disagree,
+        // but the disagreement has nowhere to live: below the complete shape the
+        // parser answers the same way for either spelling — an unclosed brace on
+        // both sides here, a complete command on both sides for `int func f arg`
+        // — so checking the name in raw text protected nothing. These cases are
+        // what proves it rather than an argument about it.
+        for shape in [
+            "func f {\nputs after\n",
+            "func {\nputs after\n",
+            "= 1\n",
+            // A command-shaped line with an open block. The parser calls this
+            // incomplete for either spelling, and the type strip must not turn
+            // that into "malformed definition" and dispatch it — doing so ran
+            // the block's lines at top level. Raised in review as a P1.
+            "func f arg {\nputs after\n",
+        ] {
             assert_eq!(
                 needs_more_input(&format!("int {shape}")),
                 needs_more_input(&format!("zzz {shape}")),

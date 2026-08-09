@@ -17,13 +17,42 @@ Delete an entry once you have agreed with it or reversed it.
       available, and resetting a pinned merged branch is the one in-loop action
       autopilot is told to ask about. *Reversible:* the commits split cleanly at
       `bd7545d` if you would rather land the design alone.
-- [ ] **Type words are recognized by shape in the parser, not added to
-      `RESERVED_WORDS`.** `typed_definition_lead` matches `WORD func NAME (`, so
-      `status`/`int`/`str`/`bool`/`list`/`map` keep every other meaning they have
-      — command word, function name, variable. *Alternative:* listing them as
-      `Claim::Contextual`, which would also put them in `help`'s coverage and
-      `whence`'s keyword answer, claiming a vocabulary the language does not
-      otherwise have. *Reversible:* the table is the one place that would change.
+- [ ] **Type words stay contextual — they are *not* becoming reserved words.**
+      Raised directly by the repo owner ("make them reserved words if it's useful
+      for simplicity") and decided here on the "if". `typed_definition_lead`
+      matches `WORD func NAME (` by shape, so `status` / `int` / `str` / `bool` /
+      `list` / `map` keep every other meaning they have — command word, function
+      name, variable.
+
+      **What reserving would buy, measured after the fact rather than guessed.**
+      When the question was asked it looked like a large win: reservation makes
+      the lead-in a one-token peek and deletes the whole name lookahead. By the
+      time it was answered that win had already been taken a different way — the
+      reader's raw-text name scan is gone (`c67d909`), and the parser's
+      `definition_name_then_lparen` is about thirty lines that share
+      `name_piece` with `definition_name` and have been correct since they
+      started doing so. So the remaining purchase is ~30 lines of tested code.
+
+      **What it would cost:** `status 5` stops working, and `status(N)` is a live
+      builtin; `int = 1` stops being an assignment; `func int(...xs)` — in the
+      suite today — stops being a definition; a command or function named `list`
+      or `map` stops resolving. That is a language break in the most ordinary
+      words in the vocabulary, bought with thirty lines nobody outside the
+      compiler reads.
+
+      **The argument that actually settles it:** the complexity this was meant to
+      cure is in the *reader*, not the parser, and reservation does nothing for
+      the reader. `pending_input` runs on raw text that failed to tokenize; it
+      can no more consult a keyword table than it can consult the lexer. Seven
+      P1s came out of that scan and none of them would have been prevented by
+      reserving a word.
+
+      *Alternative if you disagree:* list them as `Claim::Contextual`, which also
+      puts them in `help`'s coverage and `whence`'s keyword answer — a vocabulary
+      the language does not otherwise have. *Reversible:* `typed_definition_lead`
+      and the `RESERVED_WORDS` table are the only places that change, and the
+      migration cost is whatever scripts have used those words as names by then,
+      which grows the longer this sits.
 - [ ] **`float` is reserved only in the type position.** `float func f()` is
       refused; a command called `float`, a variable, and `func float() { … }` all
       still work. *Alternative:* claiming the word outright, which is a breaking

@@ -4174,16 +4174,13 @@ impl Parser<'_> {
         // paren it never meant to write.
         //
         // A modifier declaration's name arrives as several tokens (`_s`, `:`,
-        // `shorten`), so the fixed offset declines rather than matching, and
-        // `int func _s:foo()` reads as a command. That is the same deferral the
-        // narrowing makes for modifiers, which produce a value by construction;
-        // `TODO.md` carries both halves together.
-        let leads =
-            (self.word_at(1, "func") && self.word_text_at(2).is_some() && self.lparen_at(3))
-                || (self.word_at(1, "wrapper")
-                    && self.word_at(2, "func")
-                    && self.word_text_at(3).is_some()
-                    && self.lparen_at(4));
+        // `shorten`), and scanning to the paren takes them the way
+        // `definition_name` does, so `str func _s:shout()` declares a typed
+        // modifier rather than reading as a command.
+        let leads = (self.word_at(1, "func") && self.definition_name_then_lparen(2))
+            || (self.word_at(1, "wrapper")
+                && self.word_at(2, "func")
+                && self.definition_name_then_lparen(3));
         if !leads {
             return Ok(None);
         }
@@ -7366,6 +7363,61 @@ impl Parser<'_> {
     fn word(&self, expected: &str) -> bool {
         matches!(self.peek().map(|t| &t.value), Some(TokenKind::Word(word)) if word.is_bare_text(expected))
     }
+    /// Does a definition **name** start `offset` ahead and run to a `(`?
+    ///
+    /// A name is taken unjudged here exactly as `definition_name` takes it, so
+    /// the spellings the lexer splits — `a.b`, `a:b`, `a[0]` — arrive as several
+    /// tokens and still count as one name. Scanning to the paren rather than
+    /// checking a fixed offset is what keeps a *typed* bad name costing the same
+    /// as an untyped one: `int func a.b()` reaches the runtime "cannot be a
+    /// function name" diagnostic, where declining here made it a parse error —
+    /// and a parse error in a sourced file rejects **every** definition in that
+    /// file rather than only the one that is wrong.
+    ///
+    /// The paren is still required, so `int func f arg` stays an ordinary command.
+    fn definition_name_then_lparen(&self, offset: usize) -> bool {
+        // Every piece, **including the first**, goes through the same
+        // [`name_piece`] table `definition_name` reads the name with, rather than
+        // a second opinion about what a name looks like. Restating it is what
+        // this helper kept getting wrong: a `Dot`-led candidate (`.foo`) is a
+        // name `definition_name` deliberately accepts so the *runtime* check can
+        // name the problem, and declining it here turns that into a parse error —
+        // which in a sourced file takes every valid definition with it. The `...`
+        // that opens a whole-collection modifier subject is an ordinary piece to
+        // that table too, so `..._xs:whole` and a bare `...` both come through it
+        // rather than through a special case that handled only the first.
+        let Some(first) = self.tokens.get(self.position + offset) else {
+            return false;
+        };
+        if name_piece(&first.value, false).is_none() {
+            return false;
+        }
+        let mut at = offset + 1;
+        let mut end = first.span.end;
+        // Adjacency is the whole of what makes several tokens one name — the
+        // lexer splits `a.b` from source that had no spaces in it — so a spaced
+        // `int func a . status(7)` is an ordinary call, not a definition. It also
+        // bounds the scan without a cap: the first token that does not touch ends
+        // the name.
+        while let Some(token) = self
+            .tokens
+            .get(self.position + at)
+            .filter(|token| token.span.start == end)
+        {
+            if name_piece(&token.value, false).is_none() {
+                break;
+            }
+            end = token.span.end;
+            at += 1;
+        }
+        // Whitespace between the finished name and its `(` is invisible to the
+        // parser, so it is allowed; only the name's own pieces must touch.
+        matches!(
+            self.tokens.get(self.position + at).map(|t| &t.value),
+            Some(TokenKind::LParen)
+        )
+    }
+
     /// Is the token `offset` ahead a `(`? The signature opener a definition
     /// header is recognized by, so a lookahead can insist on the *complete*
     /// shape rather than guessing from a prefix of it.
@@ -8225,6 +8277,58 @@ mod tests {
                 "{source} should stay a command"
             );
         }
+    }
+
+    #[test]
+    fn a_typed_definition_takes_a_name_the_lexer_split() {
+        // The name is read unjudged, exactly as `definition_name` reads it, so a
+        // spelling the lexer splits still counts as one name. Declining here
+        // would turn `int func a.b()` into a *parse* error, and a parse error in
+        // a sourced file rejects every definition in that file rather than the
+        // one that is wrong — where the untyped spelling costs only itself.
+        // Raised in review as a P2.
+        for source in [
+            "int func a.b() { 1 }",
+            "str func _s:shout() { \"x\" }",
+            "int wrapper func a.b(...xs) { 1 }",
+            // A whole-collection modifier subject opens with `...`, which
+            // `modifier_subject` reads and this scan has to follow. Raised in
+            // review as a P2.
+            "value func ..._xs:whole() { return $_xs }",
+            // …and a bare `...` is a name that table takes too, which a
+            // spread-specific guard requiring a subject after it declined.
+            // Raised in review as a P2.
+            "int func ...() { 1 }",
+            // `definition_name` accepts a punctuation-led candidate so the
+            // *runtime* check can name it; declining here made it a parse error.
+            // Raised in review as a P2.
+            "int func .foo() { 1 }",
+        ] {
+            let tree = complete(source);
+            assert!(
+                matches!(tree.statements[0].and_or.first, Executable::Function { .. }),
+                "{source} should reach the definition, and its name check"
+            );
+        }
+
+        // No length bound: a name is as long as its pieces keep touching, and
+        // capping the scan would put a long one back to a parse error — the very
+        // thing this scan exists to avoid. Raised in review as a P2.
+        let long = complete("int func a.b.c.d.e.f.g.h.i() { 1 }");
+        assert!(matches!(
+            long.statements[0].and_or.first,
+            Executable::Function { .. }
+        ));
+
+        // Adjacency is the whole of what makes the pieces one name — the lexer
+        // splits `a.b` from source that had no spaces in it. Spaced, this is an
+        // ordinary call passing `func`, `a`, `.` and the `status(7)` value, and
+        // reading it as a definition would hijack a working line. Also P2.
+        let spaced = complete("int func a . status(7)");
+        assert!(
+            matches!(spaced.statements[0].and_or.first, Executable::Pipeline(_)),
+            "spaced name pieces are arguments, not a definition"
+        );
     }
 
     #[test]
