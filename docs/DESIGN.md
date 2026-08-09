@@ -5344,7 +5344,13 @@ compare a string with a string".
 stylistic. `Value`'s equality is what [`:dedup`](#modifiers) (a hash set), `in`,
 and [`match`](#matching-match) literal
 arms are built on, and each of those can only accept a bool — a fallible equality
-would have nothing to hand them. (Map keys are *not* a fourth case: a map's keys
+would have nothing to hand them. **That describes `Value::eq` as it stands, not a
+law about mesh** (Codex, #472): the *enclosing* operations are all fallible —
+`eval_binary` returns a `Result`, and so do the modifier and `match` paths — so a
+propagated refusal has somewhere to go if the language decides it wants one. That
+is the open option recorded in `TODO.md` §"Decisions needed", *How loud should a
+mismatch be?* (option C), and this paragraph is the reason the refusal is scoped
+the way it is **today** rather than an argument against changing it. (Map keys are *not* a fourth case: a map's keys
 are **text**, so they never consult `Value::eq` at all — see the note below.) So
 the refusal is scoped to the **top-level
 operand pair of `==` / `!=`**, and everything beneath it stays total:
