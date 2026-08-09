@@ -7131,6 +7131,19 @@ the same web, and each correction after that has more sites to miss.
 Small items rescued from pull requests that were closed as superseded — the bulk
 of each PR had landed by another route, but these pieces had not.
 
+- [ ] **Narrow the doc-sweep exemption now that part of `TYPES.md` is real
+      mesh.** `crates/mesh/tests/docs.rs` exempts `DESIGN.md` and `TYPES.md`
+      from the doc-example parse sweep, on the ground that both write syntax no
+      package has built. That was right for `TYPES.md` when every example was
+      hypothetical, and it is now too coarse: §5's result half has shipped, so
+      its declaration examples are ordinary mesh the parser would accept or
+      reject. The exemption is what let `string func path-string()` sit in a
+      fenced block after the vocabulary had settled on `str` — a spelling the
+      parser rejects, in the line a reader is most likely to copy. Codex caught
+      it; the sweep could have. Doing it properly means splitting the file's
+      examples by which package they assume rather than exempting the file, so
+      it is a change to the test, not to the document.
+
 - [ ] **A channel-2 error is loud on stderr and silent in the exit code.**
       Found re-checking `docs/INTRO.md`'s "absence is loud" claims against the
       built shell. Every strict/soft pair there holds — `$xs[99]` names the
@@ -8551,6 +8564,73 @@ a one-line edit. Every claim below was checked against the built shell.
   pass-through as a footgun.
 
 ## Decisions needed
+
+- [ ] **The type system as a whole — see [`docs/TYPES.md`](docs/TYPES.md).**
+      Raised by mikelward: `match`, `==` and the value types have taken a
+      disproportionate share of the design effort, and each entry settling one
+      needs another entry to scope the last. `TYPES.md` argues that is
+      structural — mesh answers "is this value acceptable here?" with **six**
+      relations (operator equality, total equality, condition, presence, status
+      projection, order), so seventeen types cost a 102-cell table nobody
+      maintains — and lays out three end states: repair in place, **one relation
+      each** (one total equality, ten classes, a nonzero status as the only
+      failure, `~` defined as a one-arm `match`), and a shell-native collapse
+      that drops `bool` or `status`.
+
+      It subsumes several entries below and in `DESIGN.md` §"Open questions"
+      rather than replacing them: the `return`-of-a-non-bool status question,
+      the reopened `if`/`match` totality coupling, the `proc`/`func` split, the
+      float/lexicographic ordering defect, and both flag-equality scoping
+      entries above.
+
+      **On `proc` / `func` — decided and building, so this part is history
+      rather than a choice:** `DESIGN.md` records "no second keyword; a `func`
+      may declare a return type, and one that declares none has no value
+      channel", and the parser, `type`, `help` and the lambda path are built.
+      The shipped spellings are `str` and `value`, not the `string` and `any`
+      this entry argued in. What remains open here is the *rest* of the menu —
+      B, C, and the §5 consequences nobody has built: the slot checks, a return
+      type per builtin, and the migration diagnostic. The argument, as it
+      stood: the
+      declaration carries a **return type** (`status func`, `int func`), with a
+      bare `func` meaning `status func` — but an un-annotated **lambda**
+      staying *unchecked*, since a lambda's mode is set by its consumer
+      (`:map` wants a value, `:each` does not) and no single default is right
+      for both. That is a strict superset of the split
+      — `status func` *is* `proc` without a second keyword — and it adds a
+      printable type for `help`, a *checked* value channel, and hook slots that
+      name the type they take — `status func` for the effect-only hooks, and
+      `value func` for a prompt segment, which is *produces a value* rather than
+      *produces a string*, since a segment may render as a string, a list, a
+      keyed sub-map or a structural piece and naming one would reject the rest. The prefix follows the existing `wrapper func`
+      marker and is **decided and built**, with the type outermost
+      (`status wrapper func`). `DESIGN.md` rejects `func f() -> int` outright,
+      and `func f(): int` for colliding with `:int`; the bare postfix
+      `func f() int` stays a fallback only if the prefix reads badly in use. Scope is drawn at **return types
+      only** — no parameter types, no parameterization, no unions — which holds
+      because a nonzero status being the only failure removes the need for
+      `string | false`. The line forces one addition: a top type — shipped as
+      `value`, `any` having been weighed and rejected — for the
+      functions whose result *is* a parameter (`value func id(x)`), which have no
+      other spelling once parameter types are off the table.
+
+      **The remaining judgment call**, now three-way rather than binary: does
+      *option-ness* need to survive a round trip through a variable? Argument
+      parsing does not need it (quoting is visible in the source) and neither
+      does the external boundary, in either direction — a flag renders as its
+      text going out, and nothing coming in carries a mark, since `$sh.args` is
+      built from the process arguments as plain strings. Only storage written
+      in mesh source does: `x = --force` (the case `vars.rs` uses to explain
+      the variant), `args = [--force out.txt]`, and `wrapper func`
+      forwarding. The lean is a **marked
+      string**: keep the `--force` / `"--force"` distinction, and **delete the
+      payload typing without replacing it** — the payload becomes text, and a
+      body that wants a number writes `$n:int`. Nothing in a signature types it
+      instead: a valued flag declares a default expression, not a type, and the
+      proposal's scope line rules out parameter types. That also changes the
+      settled `:flag` behavior above, where `"--n=2":flag` holds the integer
+      `2`. Note B1 already pays most of what `Flag` used to cost, since a
+      separate class without the refusal is one table row.
 
 - [ ] **Should a `"…"` string require braces to introduce an interpolation?**
       Raised by mikelward as "the interpolation syntax is ugly and special-casey",
