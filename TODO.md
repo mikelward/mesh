@@ -5613,6 +5613,17 @@ and the postfix parses cheaper. Build one, then look at it.
       since a line reading `status` there would advertise a value channel the
       function has not got. Reached through `f --help`.)* Still to do: `type` /
       `whence` reporting it alongside the signature.
+- [ ] **A malformed multiline *lambda* body runs at top level.** Found in review
+      of the typed-header work and **preexisting** — `x = func() { puts "\z"`
+      followed by `puts LEAKED` prints `LEAKED` on `origin/main`, and the typed
+      spelling (`x = str func() { …`) behaves identically, so this is not
+      something the declaration introduced. `pending_input` quarantines a
+      malformed body by recognizing a *named* `func` header and brace-scanning it;
+      a lambda has no name, so nothing recognizes it and each body line is
+      dispatched as a top-level command. Fixing it means the reader treating an
+      unterminated lambda as an open construct the way it treats a definition,
+      which reaches every lambda rather than only typed ones — which is why it is
+      filed here rather than folded into the return-type branch.
 - [ ] **Make `:repr` print a function.** Today it refuses one outright —
       `NoLiteral::Function`, "a function has no literal form" (`vars.rs`) — for
       both typed and untyped functions, so the obvious way to ask a *value* what

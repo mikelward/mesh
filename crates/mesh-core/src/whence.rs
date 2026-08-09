@@ -437,7 +437,15 @@ fn signature(name: &str, def: &FuncDef) -> String {
     // A wrapper is reported as it was written: how it treats a `--flag` is the
     // part of its contract a caller most needs to know.
     let lead = if def.wrapper { "wrapper func" } else { "func" };
-    format!("{lead} {name}({})", params.join(", "))
+    // Reported as written too, and outermost, because that is where it is
+    // written — `type f` answering `func f()` for an `int func f()` would
+    // reconstruct a *different* definition. A func declaring none prints none:
+    // the absence is what says there is no value channel.
+    let declared = def
+        .return_type
+        .map(|kind| format!("{} ", kind.as_str()))
+        .unwrap_or_default();
+    format!("{declared}{lead} {name}({})", params.join(", "))
 }
 
 /// Every executable `name` names on `PATH`, in `PATH` order, so the first is the
@@ -694,7 +702,7 @@ fn first_path_entry_name() -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::parser::Param;
+    use crate::parser::{Param, ReturnType, Source};
     use std::os::unix::ffi::OsStringExt;
 
     fn body() -> crate::parser::Source {
@@ -783,6 +791,33 @@ mod tests {
         assert_eq!(
             rendered("deploy", &found, false),
             "deploy is a function\n    func deploy(target, --force, ...hosts)\n"
+        );
+    }
+
+    #[test]
+    fn a_declared_return_type_is_part_of_the_reported_signature() {
+        // `type f` reconstructs the definition, so leaving the declaration out
+        // would print a *different* one — and the value channel is the part a
+        // caller most needs before writing `x = f()`.
+        let mut funcs = Funcs::new();
+        funcs.define(
+            "answer".to_owned(),
+            FuncDef {
+                params: Vec::new(),
+                body: Source {
+                    statements: Vec::new(),
+                    span: 0..0,
+                },
+                captures: Vec::new(),
+                wrapper: false,
+                subject: None,
+                return_type: Some(ReturnType::Int),
+            },
+        );
+        let found = look_up("answer", &funcs, &Vars::new());
+        assert_eq!(
+            rendered("answer", &found, false),
+            "answer is a function\n    int func answer()\n"
         );
     }
 

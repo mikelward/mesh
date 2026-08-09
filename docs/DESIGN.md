@@ -6668,15 +6668,22 @@ to avoid" rather than promising the latter as done.
   case is about deleting an accident, the other about letting the receiver state
   its requirement.
 
-  **Spelling — open, leaning the prefix `int func f()`.** A word before `func` is
+  **Spelling — the prefix `int func f()`, and it is what is built.** A word before `func` is
   already how a definition takes a marker (`wrapper func`, `fork func`), so the
   prefix arrives in a slot the grammar has, and `parser.rs` already reads exactly
   that shape — `self.word("wrapper") && self.word_at(1, "func")`. The postfix
   `func f() int` is Go's form and mesh's declaration is already Go's minus the
-  type. Two arguments were considered and rejected: `func f(): int` collides with
-  `:int`, which everywhere else in the language *converts* a string to an integer
-  rather than declaring anything, and `func f() -> int` spends punctuation on a
-  form neither Go nor any shell uses.
+  type, and it stays the fallback if the prefix reads badly in use. Two arguments
+  were considered and rejected: `func f(): int` collides with `:int`, which
+  everywhere else in the language *converts* a string to an integer rather than
+  declaring anything, and `func f() -> int` spends punctuation on a form neither
+  Go nor any shell uses.
+
+  **The ordering is settled with it: the type is outermost** — `int wrapper func
+  f()`, reading as "an int-returning wrapper func". `GRAMMAR.md` carries the
+  production, since that file is the grammar the implementation accepts today and
+  a spelling the parser takes has to be written there rather than left here as a
+  leaning.
 
   The prefix costs one thing the postfix does not, and it should be settled with
   the spelling rather than discovered later: **every type name becomes a
