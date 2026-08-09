@@ -17576,6 +17576,23 @@ fn help_names_a_declared_return_type() {
 }
 
 #[test]
+fn a_continued_line_reads_the_same_piped_as_in_a_script() {
+    // A `\`-newline joins two physical lines, so a reader that dispatches the
+    // first one on its own gives the same text two meanings. `int \` then
+    // `func f() { 1 }` defined an *untyped* func through stdin while a script
+    // defined `int func f()`. Raised in review as a P2.
+    let dir = fresh_dir("continued_header");
+    let script = dir.join("cont.mesh");
+    std::fs::write(&script, "int \\\nfunc f() { 1 }\ntype f\n").unwrap();
+
+    let piped = run_with_input("int \\\nfunc f() { 1 }\ntype f\n");
+    let from_file = run_script_with_stdin(&script, &dir, b"");
+    let piped_out = String::from_utf8_lossy(&piped.stdout);
+    assert!(piped_out.contains("int func f()"), "{piped_out:?}");
+    assert_eq!(piped_out, String::from_utf8_lossy(&from_file.stdout));
+}
+
+#[test]
 fn an_evaluated_lambda_keeps_the_return_type_it_declared() {
     // A lambda's declaration has to survive *evaluation*, not just parsing: a
     // hook slot receives the value, and by then the tree is gone. The unit test

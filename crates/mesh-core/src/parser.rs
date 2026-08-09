@@ -1264,7 +1264,7 @@ pub enum BinaryOp {
 
 /// Produce tokens without performing structural parsing.
 pub fn tokenize(source: &str) -> Result<Vec<Token>, ParseError> {
-    Lexer::new(source).run()
+    Lexer::new(source).run().map(|(tokens, _)| tokens)
 }
 
 /// Parse a buffered input unit. An open delimiter or trailing operator returns
@@ -1275,8 +1275,21 @@ pub fn parse(source: &str) -> Result<ParseOutcome, ParseError> {
     // buffer-rather-than-fail reading an open brace gets from the arm below.
     // Without this the line-at-a-time reader rejects `cat << END` on sight,
     // which is every interactive and piped use of a heredoc.
-    let tokens = match tokenize(source) {
-        Ok(tokens) => tokens,
+    let tokens = match Lexer::new(source).run() {
+        Ok((tokens, dangling_continuation)) => {
+            // A `\`-newline with nothing after it joins this line to one that has
+            // not arrived. Incomplete for the same reason an open brace is, and
+            // reported here rather than derived by whoever is reading: the lexer
+            // is what knows a trailing backslash is a continuation and not a
+            // literal, an escape, or string content.
+            if dangling_continuation {
+                return Ok(ParseOutcome::Incomplete(Box::new(ParseError {
+                    kind: ParseErrorKind::UnexpectedEnd,
+                    span: source.len()..source.len(),
+                })));
+            }
+            tokens
+        }
         Err(ParseError {
             kind: ParseErrorKind::UnterminatedHeredoc(delimiter),
             ..
@@ -1549,6 +1562,11 @@ struct Lexer<'a> {
     /// counters share [`MAX_DEPTH`] rather than each getting their own: the frames
     /// sit on one stack, so it is the total that has to be bounded.
     capture_depth: usize,
+    /// The input ended on a `\`-newline with nothing after it. The continuation
+    /// joins two physical lines, so one dangling at the end means the logical
+    /// line is unfinished — the reader has to wait for the line it joins to,
+    /// exactly as it waits for an unclosed brace.
+    dangling_continuation: bool,
 }
 
 impl<'a> Lexer<'a> {
@@ -1557,11 +1575,14 @@ impl<'a> Lexer<'a> {
             source,
             position: 0,
             capture_depth: 0,
+            dangling_continuation: false,
         }
     }
 
-    fn run(mut self) -> Result<Vec<Token>, ParseError> {
-        Ok(self.lex(None)?.0)
+    /// Tokens, and whether the input ended mid-continuation.
+    fn run(mut self) -> Result<(Vec<Token>, bool), ParseError> {
+        let tokens = self.lex(None)?.0;
+        Ok((tokens, self.dangling_continuation))
     }
 
     /// Lex the body of a `$( … )` whose `$(` sits just before `self.position`,
@@ -1598,6 +1619,10 @@ impl<'a> Lexer<'a> {
             }
             if c == '\\' && self.source[self.position..].starts_with("\\\n") {
                 self.position += 2;
+                // Only the last one counts: a continuation with text after it
+                // has already been joined, so it clears the flag a previous one
+                // may have set.
+                self.dangling_continuation = self.position >= self.source.len();
                 continue;
             }
             if c == '#' {
@@ -2107,6 +2132,7 @@ fn capture_in_string(
         source,
         position: dollar + 2,
         capture_depth: depth,
+        dangling_continuation: false,
     }
     .capture_body()?;
     // The inner parse starts where the lexer left off rather than at zero, so a
@@ -2245,6 +2271,7 @@ fn braced_expression_in_string(
         source,
         position: dollar + 2,
         capture_depth: depth,
+        dangling_continuation: false,
     }
     .braced_body()?;
     let mut parser = Parser {
