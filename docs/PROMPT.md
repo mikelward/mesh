@@ -39,7 +39,7 @@ $sh.postexec.record-time = func(cmd, status, elapsed) { global _cmd_time = $elap
 # you add them (maps preserve insertion order).
 
 # how the last command went: an error in red, or a slow time in yellow (else nothing)
-$sh.prompt.status = func() {
+$sh.prompt.status = any func() {
   if not $sh.status       { style("✗ ${sh.status}", fg: red) }
   else if $_cmd_time > 1s { style("took $_cmd_time", fg: yellow) }
 }
@@ -48,18 +48,18 @@ $sh.prompt.rule = rule                                   # a full-width rule
 
 # where you are — one line: user@host, the path in blue, the git branch in green
 $sh.prompt.head = [
-  who:  func() { "${env.USER}@${sh.host}" },
-  path: func() { style(pwd(), fg: blue) },
-  git:  func() { style("$(git branch --show-current)", fg: green) },   # empty off a repo → hidden
+  who:  str func() { "${env.USER}@${sh.host}" },
+  path: any func() { style(pwd(), fg: blue) },
+  git:  any func() { style("$(git branch --show-current)", fg: green) },   # empty off a repo → hidden
 ]
 
 # the current commit: short hash + subject line (nothing outside a repo)
-$sh.prompt.commit = func() { "$(git log -1 --format='%h %s' 2>/dev/null)" }
+$sh.prompt.commit = str func() { "$(git log -1 --format='%h %s' 2>/dev/null)" }
 
 # background jobs, read straight from the live job table
-$sh.prompt.jobs = func() { $sh.jobs:values:map(func(job) { "%${job.id} ${job.cmd}" }):join("  ") }
+$sh.prompt.jobs = str func() { $sh.jobs:values:map(str func(job) { "%${job.id} ${job.cmd}" }):join("  ") }
 
-$sh.prompt.char = func() { "❯ " }
+$sh.prompt.char = str func() { "❯ " }
 ```
 
 ## Why this is nice
@@ -67,6 +67,12 @@ $sh.prompt.char = func() { "❯ " }
 - **Your prompt is named pieces, not one big string.** Restyle one, reorder them,
   or drop one — `unset $sh.prompt.commit` — without touching the rest. Re-sourcing
   your config replaces pieces by name instead of duplicating them.
+- **A segment declares its return type**, which is what opens its value channel:
+  a typeless `func() { … }` contributes a `status`, not text. `str` where the
+  segment is a plain string, `any` where it is a *styled value* — `style(…)`
+  yields its own kind, so `str` would be a lie. The effect hooks above
+  (`$sh.postexec.record-time`) stay typeless on purpose: they have no value to
+  give.
 - **Color is data, not escape codes.** `style("main", fg: green)` — no
   `\e[32m…\e[0m` to hand-balance. The shell knows the real text width, and can even
   recolor a piece later.
@@ -118,7 +124,7 @@ So the missing primitive is a **fact map**, computed once per prompt and read by
 as many segments as care:
 
 ```mesh
-$sh.prompt.git = func() {
+$sh.prompt.git = any func() {
   if $sh.vcs:len == 0 { return "" }                            # not in a working copy
   dirt   = if $sh.vcs.dirty      { "*" }                 else { "" }
   ahead  = if $sh.vcs.ahead > 0  { "↑${sh.vcs.ahead}" }  else { "" }

@@ -968,12 +968,13 @@ mesh$ <strong>check /nope || puts missing</strong>
 missing
 </pre>
 
-`return` leaves early, and what it carries is a **value**, not a status — it is
-what a `check()` call hands back. The status that comes with a value is a view of
-it: only `false` and a nonzero status fail, since every other value *is* a result
-and producing one is success. So `return 1` succeeds carrying the number `1`; it is
-not bash's `return 1`. When you mean the status, say so — `return status 1`, or the
-verb that names one, **`fail`**:
+`return` leaves early, and what it carries is a **value**, not a status. Taking that
+value from a call is a separate matter — it needs the function to declare a return
+type, which `check` here does not; **Calling a function for a value** below covers
+that. The status that comes with a value is a view of it: only `false` and a nonzero
+status fail, since every other value *is* a result and producing one is success. So
+`return 1` succeeds carrying the number `1`; it is not bash's `return 1`. When you
+mean the status, say so — `return status 1`, or the verb that names one, **`fail`**:
 
 <pre>
 mesh$ <strong>func check(x) { test -e $x || fail; puts "$x is here" }</strong>
@@ -1012,15 +1013,27 @@ asks `ls` for its help rather than printing mesh's.
 ## Calling a function for a value
 
 Attach the parentheses and you get the function's **value** rather than its
-status: the last expression of the body, or whatever `return` carries. The same
-default as the status side — the body's last thing is the answer — so `return` is
-for leaving early, not for handing a value back:
+status — provided the function declares what type that value is. The declaration
+is what opens the value channel; the body's last expression is then the answer,
+or whatever `return` carries, so `return` is for leaving early rather than for
+handing a value back:
+
+<pre>
+mesh$ <strong>int func double(n) { $n * 2 }</strong>
+mesh$ <strong>x = double(21)</strong>
+mesh$ <strong>puts $x</strong>
+42
+</pre>
+
+Leave the type off and the parentheses still work, but what comes back is a
+status rather than the body's value — a function without a declared type has no
+value channel to draw from:
 
 <pre>
 mesh$ <strong>func double(n) { $n * 2 }</strong>
 mesh$ <strong>x = double(21)</strong>
-mesh$ <strong>puts $x</strong>
-42
+mesh$ <strong>puts $x:repr</strong>
+status(0)
 </pre>
 
 Arguments there are expressions, and `key: value` binds the same parameter the
@@ -1031,7 +1044,7 @@ When you want every channel at once, `:capture` runs the call and hands back a
 record of `.value`, `.out`, `.err`, and `.status`:
 
 <pre>
-mesh$ <strong>func build() { puts compiling; return ok }</strong>
+mesh$ <strong>str func build() { puts compiling; return ok }</strong>
 mesh$ <strong>r = build():capture</strong>
 mesh$ <strong>puts "$r.value $r.status"</strong>
 ok 0
@@ -1046,8 +1059,8 @@ and `:each` take one and apply it to every element of a list:
 
 <pre>
 mesh$ <strong>xs = [1 2 3 4]</strong>
-mesh$ <strong>doubled = $xs:map(func(x) { $x * 2 })</strong>
-mesh$ <strong>evens = $xs:filter(func(x) { $x % 2 == 0 })</strong>
+mesh$ <strong>doubled = $xs:map(int func(x) { $x * 2 })</strong>
+mesh$ <strong>evens = $xs:filter(bool func(x) { $x % 2 == 0 })</strong>
 mesh$ <strong>puts ...$doubled</strong>
 2 4 6 8
 mesh$ <strong>puts ...$evens</strong>
@@ -1056,14 +1069,14 @@ mesh$ <strong>puts ...$evens</strong>
 
 A bare `:modifier` is itself a callable, so a mapper that only forwards to one
 can be written directly — `$paths:map(:base)` says what
-`$paths:map(func(p) { $p:base })` says. `:filter` insists on a real boolean, and
+`$paths:map(str func(p) { $p:base })` says. `:filter` insists on a real boolean, and
 `:each` runs for effect and yields nothing.
 
 Bind a lambda and call it through the variable — the `$` is required, since a
 bare `double(5)` looks for a *declared* function:
 
 <pre>
-mesh$ <strong>double = func(x) { $x * 2 }</strong>
+mesh$ <strong>double = int func(x) { $x * 2 }</strong>
 mesh$ <strong>puts $double(5)</strong>
 10
 </pre>

@@ -15,13 +15,13 @@
 # Keep this small. It is parsed at every interactive shell start.
 
 # The current directory, with `$HOME` written back as `~`.
-func mesh-title-where() {
+str func mesh-title-where() {
     here = $(pwd):tilde
     $here
 }
 
 # `user@host`, dropping either half when the session cannot name it.
-func mesh-title-who() {
+str func mesh-title-who() {
     user = $env:get("USER", "")
     host = $sh.host
     if $user == "" { return $host }

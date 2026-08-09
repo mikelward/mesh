@@ -41,6 +41,7 @@ use crate::funcs::{FuncDef, Funcs};
 use crate::hooks::Hook;
 use crate::hooks::HookEvent;
 use crate::options::{Opt, Options};
+use crate::parser::ReturnType;
 use crate::vars::{self, Decoration, RegexValue, Style, StyledValue, Value, Vars};
 use crate::{environ, exec, expand, parser, whence};
 
@@ -5283,6 +5284,7 @@ fn call_function_value(
         params,
         captured,
         body,
+        function.return_type(),
         arguments,
         true,
         last,
@@ -5864,16 +5866,19 @@ fn run_declared_modifier(
     in_function: bool,
     shell: &mut Shell,
 ) -> Result<Value, Step> {
-    let Some((subject_param, params, body, captured)) = shell.funcs.modifier(name).map(|def| {
-        (
-            def.subject
-                .clone()
-                .expect("a declared modifier carries its subject"),
-            def.params.clone(),
-            def.body.clone(),
-            def.captures.clone(),
-        )
-    }) else {
+    let Some((subject_param, params, body, captured, declared)) =
+        shell.funcs.modifier(name).map(|def| {
+            (
+                def.subject
+                    .clone()
+                    .expect("a declared modifier carries its subject"),
+                def.params.clone(),
+                def.body.clone(),
+                def.captures.clone(),
+                def.return_type,
+            )
+        })
+    else {
         return runtime_error(parser::unknown_modifier_message(name));
     };
     let label = format!(":{name}");
@@ -5932,6 +5937,7 @@ fn run_declared_modifier(
                 &params,
                 &captured,
                 &body,
+                declared,
                 &scanned,
                 shell,
             );
@@ -5960,6 +5966,7 @@ fn run_declared_modifier(
             &params,
             &captured,
             &body,
+            declared,
             &scanned,
             shell,
         )?);
@@ -5982,6 +5989,7 @@ fn run_modifier_body<'p>(
     params: &'p [parser::Param],
     captured: &[(String, Value)],
     body: &parser::Source,
+    declared: Option<ReturnType>,
     scanned: &ScannedArguments<'p>,
     shell: &mut Shell,
 ) -> Result<Value, Step> {
@@ -5993,6 +6001,7 @@ fn run_modifier_body<'p>(
     let (positionals, switches_on, flag_values) = scanned.clone();
     run_call_body_for_value(
         body,
+        declared,
         caller_result,
         caller_produced,
         |shell| {
@@ -6262,7 +6271,7 @@ fn eval_modifier_with_arguments(
                             call_callable_for_value(&label, &callable, element.clone(), shell)?;
                         // A **boolean**, not a truthy value. mesh's truthiness is the
                         // shell's — an integer is true when it is *zero* — so reading
-                        // a predicate loosely would make `:filter(func(x) { $x })`
+                        // a predicate loosely would make `:filter(int func(x) { $x })`
                         // keep the zeros, and `:filter(:dir)` keep everything, since
                         // a dirname is always a non-empty string. `DESIGN.md` raises
                         // exactly that footgun as an open question and leans loud; a
@@ -7641,12 +7650,15 @@ fn eval_if_expr(
         // As in `run_ast_if`: no truth value, so no branch runs.
         return Ok(control_placeholder());
     };
+    // Each branch reports its own tail, so nothing is set here: the `if` answers
+    // with whichever body ran, and the condition's status is not that answer.
     if code == 0 {
         eval_value_body(&node.then_body, 0, in_function, shell)
     } else {
         match &node.else_branch {
             Some(parser::ElseBranch::If(next)) => eval_if_expr(next, code, in_function, shell),
             Some(parser::ElseBranch::Block(body)) => eval_value_body(body, 0, in_function, shell),
+            // No branch ran, so there is no value to yield.
             None => Ok(Value::String(String::new())),
         }
     }
@@ -7696,6 +7708,7 @@ fn eval_match_expr(
             parser::MatchBody::Block(body) => eval_value_body(body, 0, in_function, shell),
         };
     }
+    // No arm matched, so nothing answered: the published status stands.
     Ok(Value::String(String::new()))
 }
 
@@ -7773,12 +7786,13 @@ fn eval_value_body(
         && let [parser::CommandItem::Word(word)] = items.as_slice()
         && !bare_word_names_a_command(&word.value)
     {
-        return eval_expr(
+        let value = eval_expr(
             &parser::Expr::Scalar(word.clone()),
             last,
             in_function,
             shell,
         );
+        return value;
     }
     // No capture. A block is not a `$(…)`: its commands stream to wherever stdout
     // goes, in value position exactly as in statement position, and its value is
@@ -7817,6 +7831,9 @@ fn eval_for_expr(
     let saved = shell.vars.save_names(&pattern_names(bindings));
     let outcome = eval_for_passes(bindings, values, body, in_function, shell);
     shell.vars.restore_names(saved);
+    // A loop *builds* its list rather than adopting an iteration's value — the
+    // same list `return (for …)` hands back. A body with no value channel never
+    // gets here; see `run_status_body` for why its `for` answers with a status.
     outcome
 }
 
@@ -7888,6 +7905,8 @@ fn eval_body(
                             shell.settle_error();
                             eval_expr(expression, last, in_function, shell)
                         }
+                        // A skipped tail answers for nothing, so an earlier
+                        // statement's result still stands.
                         Ok(false) if errored => Err(Step::Error(last)),
                         Ok(false) if recorded => Ok(shell.result.clone()),
                         Ok(false) => Ok(Value::String(String::new())),
@@ -7904,6 +7923,8 @@ fn eval_body(
                 }
                 // Unguarded, so these always run: an earlier statement's failure is
                 // out of reach from here.
+                // A compound yields its *selected branch's* value, which is why
+                // these delegate rather than being judged from out here.
                 parser::Executable::If(node) => {
                     shell.settle_error();
                     return eval_if_expr(node, last, in_function, shell);
@@ -10488,7 +10509,7 @@ fn run_expanded(mut argv: Argv, last: u8, shell: &mut Shell) -> Step {
 
 /// What `command not found` adds when the name **is** bound, to a callable.
 ///
-/// `double = func(x) { $x * 2 }` then `double(5)` is one `$` from working, and
+/// `double = int func(x) { $x * 2 }` then `double(5)` is one `$` from working, and
 /// `type double` already says so — reporting a bare not-found sends the reader
 /// looking for a program that was never the point. The parens are the tell:
 /// nobody writes `double(5)` meaning a program.
@@ -11470,10 +11491,14 @@ fn reference_resolves(name: &str, shell: &Shell) -> bool {
 /// list, and the value-call builtins read their own arguments — so there is
 /// nothing to hand them. A lambda wrapper expresses it exactly and works today,
 /// which is what the message points at rather than leaving the reader to find it.
+///
+/// The wrapper declares `any`: a typeless lambda has no value channel, so the
+/// suggestion would hand back a status per element instead of what `name` returns.
+/// `any` because the wrapper forwards whatever the callee produces.
 fn not_applicable_per_element(name: &str) -> String {
     format!(
         "&{name}: a value call cannot be applied per element; wrap it \
-         (`func(x) {{ {name}($x) }}`)"
+         (`any func(x) {{ {name}($x) }}`)"
     )
 }
 
@@ -11490,12 +11515,13 @@ fn call_func_for_value(
     in_function: bool,
     shell: &mut Shell,
 ) -> Result<Value, Step> {
-    let Some((params, body, captured, wrapper)) = shell.funcs.get(name).map(|def| {
+    let Some((params, body, captured, wrapper, declared)) = shell.funcs.get(name).map(|def| {
         (
             def.params.clone(),
             def.body.clone(),
             def.captures.clone(),
             def.wrapper,
+            def.return_type,
         )
     }) else {
         unreachable!("call_func_for_value is only reached for a declared function");
@@ -11509,6 +11535,7 @@ fn call_func_for_value(
         &params,
         &captured,
         &body,
+        declared,
         arguments,
         !wrapper,
         last,
@@ -11529,6 +11556,7 @@ fn call_signature_for_value(
     params: &[parser::Param],
     captured: &[(String, Value)],
     body: &parser::Source,
+    declared: Option<ReturnType>,
     arguments: &[parser::Argument],
     flags_enabled: bool,
     last: u8,
@@ -11585,6 +11613,7 @@ fn call_signature_for_value(
 
     run_call_body_for_value(
         body,
+        declared,
         caller_result,
         caller_produced,
         |shell| {
@@ -11610,6 +11639,14 @@ fn bind_captured(captured: &[(String, Value)], shell: &mut Shell) {
     }
 }
 
+/// Whether a call with this declaration answers with a `Status` rather than a
+/// value: no declaration at all, or `status` written out. They are one case, not
+/// two — `status func` is the typeless function said out loud — so the two must
+/// never be spelled separately at a call site.
+fn yields_status(declared: Option<ReturnType>) -> bool {
+    matches!(declared, None | Some(ReturnType::Status))
+}
+
 /// The **callee half** of a value-mode call: a fresh scope, the binding, the body,
 /// and the outcome mapped to a value — with the caller's loop state and result put
 /// back on every path out.
@@ -11621,8 +11658,41 @@ fn bind_captured(captured: &[(String, Value)], shell: &mut Shell) {
 /// value and no syntax at all. Both then have to isolate loop state, reset the
 /// result, and normalize `return` identically, and the way to guarantee that is
 /// for there to be one of it.
+/// Run a **status-yielding** callee's body the way command position runs it.
+///
+/// A func that declares no type has no value channel, so what the body produced
+/// last is not its result — its status is, "exactly as in command position"
+/// (`docs/DESIGN.md` §"Functions"). `status func` is that same function said out
+/// loud, so it comes here too.
+///
+/// This runs `run_source`, which *is* command position's body runner, so the two
+/// agree by construction rather than by a second rule kept in step by hand. Six
+/// review rounds went into that second rule — the caller's status leaked in, then
+/// a hard-coded `0` split `{ false }` from `{ return false }`, then three
+/// successively narrower "did anything record?" windows, each with a case inside
+/// it. The last one is why no window works: `[false() 42]` runs a command
+/// arbitrarily deep inside a tail value, so "was a status recorded while
+/// producing the tail" can never mean "the tail is a status". Deriving a status
+/// from a value was the mistake; a body with no value channel should not compute
+/// one.
+///
+/// The one shape where this differs from projecting the tail value is a bare
+/// trailing `for`: it *builds* a list, but as a statement its status is the last
+/// command's, so `func f() { for i in [1 2] { /bin/false } }` answers `status(1)`
+/// like every other spelling of that body. `list func` is how the aggregate is
+/// asked for.
+fn run_status_body(body: &parser::Source, shell: &mut Shell) -> Result<Value, Step> {
+    match run_source(body, 0, true, shell) {
+        Step::Continue(code) => Ok(Value::Status(code)),
+        // `return`, `exit`, an evaluation error: all unwind exactly as they do
+        // for a typed callee, and the caller settles them.
+        other => Err(other),
+    }
+}
+
 fn run_call_body_for_value(
     body: &parser::Source,
+    declared: Option<ReturnType>,
     caller_result: Value,
     caller_produced: Produced,
     bind: impl FnOnce(&mut Shell) -> Result<(), Step>,
@@ -11638,10 +11708,16 @@ fn run_call_body_for_value(
     let outcome = match bind(shell) {
         Ok(()) => {
             // A default body may itself have produced a result; that belongs to
-            // the setup, so the body starts from nothing too.
+            // the setup, so the body starts from nothing too, or
+            // `func f(x = $(/bin/false)) {}` would answer with a default's
+            // failure it classifies as setup one line down.
             shell.result = Value::String(String::new());
             shell.produced = Produced::Status;
-            eval_body(body, 0, true, shell)
+            if yields_status(declared) {
+                run_status_body(body, shell)
+            } else {
+                eval_body(body, 0, true, shell)
+            }
         }
         Err(step) => Err(step),
     };
@@ -11669,6 +11745,10 @@ fn run_call_body_for_value(
         Err(step @ Step::Exit(_)) => Err(step),
         // The diagnostic is already on stderr, so fail quietly with its status.
         _ if escaped => Err(Step::Error(1)),
+        // A `return N` ends the call with that status, exactly as it does in
+        // command position — `run_status_body` never sees it, since it unwinds
+        // past `run_source`.
+        Err(Step::Return(_, code)) if yields_status(declared) => Ok(Value::Status(code)),
         Ok(value) => Ok(value),
         // An explicit `return val` yields its value; a runtime step unwinds.
         Err(Step::Return(value, _)) => Ok(value),
@@ -11711,11 +11791,14 @@ fn call_callable_for_value(
         // nothing — but the value system no longer has a way to catch it, which is
         // the lost diagnostic the status decision accepts rather than a new
         // improvement (`DESIGN.md` §"Open questions").
-        let Some((params, body, captured)) = shell
-            .funcs
-            .get(referenced)
-            .map(|def| (def.params.clone(), def.body.clone(), def.captures.clone()))
-        else {
+        let Some((params, body, captured, declared)) = shell.funcs.get(referenced).map(|def| {
+            (
+                def.params.clone(),
+                def.body.clone(),
+                def.captures.clone(),
+                def.return_type,
+            )
+        }) else {
             if builtins::is_value_call(referenced)
                 || builtins::is_callable_builtin(referenced)
                 || entry_filter(referenced).is_some()
@@ -11747,6 +11830,7 @@ fn call_callable_for_value(
         let caller_produced = shell.produced;
         return run_call_body_for_value(
             &body,
+            declared,
             caller_result,
             caller_produced,
             |shell| {
@@ -11766,6 +11850,7 @@ fn call_callable_for_value(
     let caller_produced = shell.produced;
     run_call_body_for_value(
         body,
+        function.return_type(),
         caller_result,
         caller_produced,
         |shell| {
@@ -12662,7 +12747,7 @@ fn typed_header_follows(after: &str) -> bool {
 /// stay quarantined so its diagnostic is the reserved-word one rather than
 /// whatever its body would have done at top level.
 const TYPE_MARKER_WORDS: &[&str] = &[
-    "status", "int", "str", "bool", "list", "map", "value", "float",
+    "status", "int", "str", "bool", "list", "map", "any", "float",
 ];
 
 fn strip_wrapper_marker(text: &str) -> &str {

@@ -861,7 +861,7 @@ and the rest. **None of them is dead.** There are three call forms, not two, and
 the third reaches every one of them:
 
 ```
-func while() { return OK }; x = while()        # value call — OK
+str func while() { return OK }; x = while()    # value call — OK
 func if(_x) { puts OK }; n = "if"; $n arg     # expanded name — OK
 ```
 
@@ -1143,7 +1143,7 @@ $line:replaceall(re($pat), $new) # pattern arrives as a string → re()
   `${1}` / `${name}` currently stand in for syntax that splices
   the numbered / named group of *this match* (a replacement-local scope, not an
   outer variable — bare `$1` stays reserved, mesh having no positional `$1`). For a
-  **computed** replacement, `NEW` may be a **lambda** taking the match — `:replaceall(/(\d+)/, func(_m) { $_m:int + 1 })` — the callback form, consistent with `:map` / `:filter` / `:each`.
+  **computed** replacement, `NEW` may be a **lambda** taking the match — `:replaceall(/(\d+)/, int func(_m) { $_m:int + 1 })` — the callback form, consistent with `:map` / `:filter` / `:each`.
 
 *(Open sub-questions: the exact backref spelling (`${1}` vs `$1` inside the
 replacement string), and whether a first-only variant is ever needed — it would be a
@@ -1464,7 +1464,7 @@ files = glob($p)          # or bind the list and reuse it
 ```
 
 Because `glob()` is eager, deferring it needs no special lazy type — just wrap it in a
-thunk: `later = func() { glob("*.txt") }` stores the *call*, and each `$later()` re-globs
+thunk: `later = list func() { glob("*.txt") }` stores the *call*, and each `$later()` re-globs
 against the **current** filesystem (fresh every time, which is what "lazy" is usually
 for).
 
@@ -3773,11 +3773,11 @@ name, reusing its whole signature grammar (defaults, `--flags`, `...rest`) — a
 they are value-called the same way:
 
 ```
-double = func(x) { $x * 2 }       # a function value bound to a variable
+double = int func(x) { $x * 2 }   # a function value bound to a variable
 y = $double(5)                    # value-call it through the variable
 
-evens = $xs:filter(func(x) { $x % 2 == 0 })
-stems = $files:map(func(f) { $f:stem })    # :map / :filter / :each take a lambda
+evens = $xs:filter(bool func(x) { $x % 2 == 0 })
+stems = $files:map(str func(f) { $f:stem })    # :map / :filter / :each take a lambda
 ```
 
 `func(params) { … }` (over an Elvish-style `{|params| …}`) keeps **one parameter
@@ -3788,8 +3788,8 @@ can't express.
 
 A **bare modifier reference is itself a callable value**, so where a predicate or
 mapper is wanted you can hand a modifier directly instead of wrapping it in a
-lambda: `$files:filter(:exec)` *is* `$files:filter(func(f) { $f:exec })`, and
-`$paths:map(:stem)` *is* `$paths:map(func(p) { $p:stem })`. A `:mod` in argument
+lambda: `$files:filter(:exec)` *is* `$files:filter(bool func(f) { $f:exec })`, and
+`$paths:map(:stem)` *is* `$paths:map(str func(p) { $p:stem })`. A `:mod` in argument
 position denotes "the function that applies `:mod`"; the lambda form remains for
 anything a single modifier can't say.
 
@@ -3820,7 +3820,7 @@ command position alone, and `&` is one more spelling that is not it.
 ```
 $xs:map(&up)                    # the func `up`, as a value
 $sh.preprompt.git = &git-info   # the same reference, in a hook slot
-double = func(_x) { $_x * 2 }
+double = int func(_x) { $_x * 2 }
 $double(5)                      # a lambda lives in the *variable* namespace: `$`, not `&`
 ```
 
@@ -3916,15 +3916,15 @@ func f() { _n = 41
 ```
 
 That makes lambdas and [`_`-prefixed locals](#variables-and-assignment) mutually
-unusable in exactly the place a lambda earns its keep — `$xs:filter(func(_p) { $_p:ext
+unusable in exactly the place a lambda earns its keep — `$xs:filter(bool func(_p) { $_p:ext
 == $_want })` cannot reach the `_want` bound on the line above it. The same text works
 at top level and fails inside a function, which is the sharpest statement of the bug.
 
 The fix is a **capture list**, written after the parameters:
 
 ```
-func pick(_want) {
-  return $_xs:filter(func(_p) with ($_want) { $_p:ext == $_want }) }
+list func pick(_want) {
+  return $_xs:filter(bool func(_p) with ($_want) { $_p:ext == $_want }) }
 ```
 
 `with ($_want)` is evaluated **where the lambda is written**, in the frame that can see
@@ -5204,7 +5204,7 @@ $sh.jobs
 
 $sh.jobs:len              # 2   — this is `publish-jobs`, now one word in a prompt segment
 $sh.jobs[2].state          # stopped
-$sh.jobs:values:filter(func(j) { $j.state == running })
+$sh.jobs:values:filter(bool func(j) { $j.state == running })
 ```
 
 `state` is `running` / `stopped` / `done`; `status` fills in when a job finishes
@@ -6131,7 +6131,7 @@ $sh.prompt.status = &status-info               # a line — the status-info segm
 $sh.prompt.rule   = &rule                      # a full-width line on its own
 $sh.prompt.line1  = [&host-info &dir-info &auth-info]   # ONE line: host (red) dir (blue) auth (yellow), each its own color
 $sh.prompt.jobs   = &job-info                  # its own line — skipped when empty
-$sh.prompt.char   = func() { "> " }            # a func literal is fine too
+$sh.prompt.char   = str func() { "> " }        # a func literal is fine too
 
 # `fill` is the inline right-align / trailing-bar piece, when you want it:
 $sh.prompt.line1  = [&host-info &dir-info &fill &clock-info]   # host dir on the left, clock flush-right
@@ -6142,12 +6142,16 @@ $sh.prompt.line1     = [host: &host-info, dir: &dir-info, auth: &auth-info]
 $sh.prompt.line1.dir = &my-dir-info            # swap ONE piece by name
 unset $sh.prompt.line1.auth                    # drop the auth warning
 
-func host-info() { style("$(hostname)", fg: red) }     # `style` (not styled); comma-separated args; parens on the func
-func dir-info()  { if inside-project() { "$(vcs prompt-info)" } else { style(tilde-pwd(), fg: blue) } }
-func auth-info() { if ssh-id-missing() { style("SSH", fg: yellow) } }   # no else → "" → omitted
+any func host-info() { style("$(hostname)", fg: red) }   # `style` (not styled); comma-separated args; parens on the func
+any func dir-info()  { if inside-project() { "$(vcs prompt-info)" } else { style(tilde-pwd(), fg: blue) } }
+any func auth-info() { if ssh-id-missing() { style("SSH", fg: yellow) } }   # no else → "" → omitted
 ```
 
-(Segments use `if` *expressions* to pick a string — not `and`/`or`, which combine
+(A segment **declares a return type**, because it is read for its value — a
+typeless one contributes a `status`. These declare `any` rather than `str`
+because `style(…)` yields a *styled value*, its own kind and not a string, so
+`str` would be the dishonest marker; `char` is a plain string and says `str`.
+Segments use `if` *expressions* to pick a string — not `and`/`or`, which combine
 bools, not values — and the `auth` segment leans on the decided
 no-`else`-yields-`""` rule so "not applicable" is just an empty contribution.
 There are no `nl1` / `nl2` separator keys: lines come from the map's shape, and
@@ -6523,7 +6527,7 @@ to avoid" rather than promising the latter as done.
 - **Partial application — open, and deliberately unanswered.** `&name` names a
   function but cannot pre-supply any of its arguments, so every higher-order slot
   that wants an existing function with one choice already made takes a lambda
-  wrapper instead (`$xs:map(func(_x) { pad($_x, width: 8) })`). The leading spelling
+  wrapper instead (`$xs:map(str func(_x) { pad($_x, width: 8) })`). The leading spelling
   if mesh ever grows one is **`&f(key: value)`** — the reference sigil kept, so it
   is still a *value* rather than a call, with arguments bound by **keyword** only,
   which sidesteps "which positional did you mean" and matches how a flag parameter
@@ -6751,10 +6755,18 @@ to avoid" rather than promising the latter as done.
   | Check | Where | Needs |
   | --- | --- | --- |
   | `return $v` in a func declaring no type | parse | the declaration and the body — nothing else |
-  | `return` bare, or a body whose tail is a command, in a func declaring a type **a `Status` does not satisfy** | parse | the same; a command's result is a `Status(n)` and a bare `return` carries the last status, so both are right for a declared `status` and wrong only for `int`, `str`, and the rest |
+  | a body whose tail is a command, in a func declaring a type **a `Status` does not satisfy** | parse | the same; a command's result is a `Status(n)`, so it is right for a declared `status` and wrong only for `int`, `str`, and the rest |
   | `return "hi"` against a declared `int` | parse | the same, *and only where the operand is a literal* |
   | `x = f()` where `f` declares no type | run | the callee — see the resolver limit above |
   | a typeless lambda assigned to a value-taking hook slot | dispatch | the slot's declared kind |
+
+  **A bare `return` was on that list and came off it.** The check would have read
+  "a bare `return` in a func declaring a non-`status` type", and it rejects
+  `str func f() { x = hello; $x; return }` — where the result so far *is* a `str`
+  and the function is correct. A bare `return` carries the result so far with the
+  last status, so whether it satisfies the declared type depends on what the body
+  produced before it, which no syntactic check can see. It is off the list because
+  it sits outside the boundary, not because it wants a cleverer version.
 
   **The boundary is the important part, and it is not a type checker.** mesh has
   no typed variables and no typed parameters — `GRAMMAR.md` §Definitions has
@@ -6803,7 +6815,7 @@ to avoid" rather than promising the latter as done.
   (declare a type, or stop taking the value). Per the table above that check is a
   runtime one.
 
-  **The vocabulary is `status`, `int`, `str`, `bool`, `list`, `map`, `value`, and
+  **The vocabulary is `status`, `int`, `str`, `bool`, `list`, `map`, `any`, and
   `float` is reserved.** Short forms throughout: `int` is already the language's word
   (`:int` parses one), so `str` follows it and `string` would be the odd one out
   beside it. **`float` is reserved now and not implemented** — `f64` exists as a
@@ -6817,17 +6829,26 @@ to avoid" rather than promising the latter as done.
   Adding the type later may still invalidate scripts written against its absence,
   and that is accepted.
 
-  **`value` is a member of the set, not an escape from it** *(decided; trying the
+  **`any` is a member of the set, not an escape from it** *(decided; trying the
   migration is what settled it)*. The closed set names the kinds a reader writes,
   and mesh has values it deliberately does not name there — a job, a styled
   string, an `Instant`, a `Duration`. Working the narrowing through the test suite
   turned up `func ident(x) { return $x }` handed a **job**, which no concrete
   spelling fits: what it returns is whatever it was given, so `job func ident(x)`
-  would be wrong the moment a string arrived. `value` says the true thing —
-  *there is a value channel, of unstated kind* — in the design's own vocabulary.
-  The alternative considered was widening the set to every kind, which grows it
-  forever and still leaves identity unspellable; `any` was the other spelling
-  weighed, and reads as a claim about a type system this deliberately is not.
+  would be wrong the moment a string arrived. `any` says the true thing —
+  *there is a value channel, of unstated kind*. The alternative considered was
+  widening the set to every kind, which grows it forever and still leaves
+  identity unspellable.
+
+  **The spelling was `value` first, and it did not survive contact.** `value` is
+  the design's own word for the channel, which is what recommended it — but it is
+  also already `return`'s **channel word**, so `return value func() { … }` read
+  the marker as the channel and handed back an *untyped* lambda, silently, while
+  `return str func() { … }` was fine. It failed in the position that matters most
+  for the hook slots this feature exists to serve. `any` has no such clash, and
+  the objection to it — that it reads as a claim about a type system this
+  deliberately is not — is a smaller cost than a spelling that cannot be written
+  where it is most needed.
 
   **A closed set is the point, not a limitation to be lifted. User-defined types
   are not a goal.** The set above covers the kinds mesh values actually come in,
@@ -7113,11 +7134,14 @@ to avoid" rather than promising the latter as done.
   [Matching](#matching-match) records that a `match` with no arm hit yields `""`
   too — "like a no-`else` `if`" — with totality for non-`_`-exhaustive matches
   left *(open)*, coupled to the question here rather than carrying a lean of its own.
-  [Functions](#functions) adds a third: a function with **no expression to
-  yield** — an empty body, or a bare `return` *before anything ran* — results in
-  `""` with status `0`, "the same 'nothing produced, nothing failed' answer a
-  no-`else` `if` gives." A bare `return` after something has run is not a case:
-  it carries the result so far, so `func f() { 42; return }` answers `42`.
+  [Functions](#functions) adds a third: a function *that declares a return type*
+  with **no expression to yield** — an empty body, or a bare `return` *before
+  anything ran* — results in `""` with status `0`, "the same 'nothing produced,
+  nothing failed' answer a no-`else` `if` gives." (A typeless `func` has no value
+  channel at all under the [return-type decision](#open-questions), so it hands
+  no empty to anything downstream; the examples here declare a type for that
+  reason.) A bare `return` after something has run is not a case: it carries the
+  result so far, so `int func f() { 42; return }` answers `42`.
 
   **Two of the three are one question; the third is not, and the difference is
   what the rule should key on.** The `if` and the `match` produce their empty on a
@@ -7140,10 +7164,10 @@ to avoid" rather than promising the latter as done.
   The function producer is a different animal, and it splits in two. An **empty
   body** is visible at the definition rather than hiding on an unwritten branch,
   so it is already the *asking* half of the
-  [strict/soft pairs](#error-handling) — `func f() { }` is a stub, not a missed
-  case. A **bare `return` before anything ran** is less clear-cut: the author
+  [strict/soft pairs](#error-handling) — `str func f() { }` is a stub, not a
+  missed case. A **bare `return` before anything ran** is less clear-cut: the author
   wrote the exit, but "the result so far" is implicit, so the *path* is theirs
-  while the *value* on it is not. `func f(_c) { if $_c { return }; 1 }` answers
+  while the *value* on it is not. `int func f(_c) { if $_c { return }; 1 }` answers
   `""` on one path and `1` on the other, and nothing in the source says the first
   was intended.
 
@@ -7176,7 +7200,7 @@ to avoid" rather than promising the latter as done.
   The concrete casualty is in [`INTRO.md`](INTRO.md), and it is load-bearing:
 
   ```
-  $sh.prompt.auth = func() { if not ssh-id-loaded() { style("SSH", fg: yellow) } }
+  $sh.prompt.auth = any func() { if not ssh-id-loaded() { style("SSH", fg: yellow) } }
   ```
 
   The prompt design *depends* on a lone `if` yielding nothing — that is how a
@@ -7334,7 +7358,7 @@ remain under-specified.
     [capture record](#calling-for-a-value-and-lambdas) reports `.value` and
     `.status` *together*, and `capture_call` derives that status through the same
     `status_of` (`crates/mesh-core/src/repl.rs`), so restoring the arm changes
-    records that keep their value: `func f() { return 3 }; f():capture` reports
+    records that keep their value: `int func f() { return 3 }; f():capture` reports
     `value=3 status=0` today and would report `value=3 status=3`. Any restoration
     has to say what a capture record means for an int — the one place the two
     channels are read side by side, where a derived status is most visibly
@@ -7745,7 +7769,7 @@ remain under-specified.
   by. What follows is simply the list of places that have to move, and the places
   worth re-reading afterwards to confirm the result is coherent.
 
-  `return` itself is unaffected: `func f() { return 3 }; f():capture` reports
+  `return` itself is unaffected: `int func f() { return 3 }; f():capture` reports
   `value=3 status=0` before and after — the same *code*, though `.status` holds
   it as a `Status` per the typing below — and a sourced `return 3` still leaves `0`
   — `return status 3` there is new reach rather than a change. Everything that
@@ -7944,10 +7968,11 @@ remain under-specified.
 
   Two adjacent questions from the same report, both answered against `main`:
 
-  - **`match f() { … }` works and needs nothing.** It matches on the **value** —
-    `func f() { return 7 }; match f() { 7 => … }` takes the `7` arm. `match` is a
-    value construct, so it reads the value channel, which is right under either
-    model. (`switch` is not a mesh keyword; `match` was
+  - **`match f() { … }` works and needs nothing of `match` itself.** It matches
+    on the **value** — `int func f() { return 7 }; match f() { 7 => … }` takes the
+    `7` arm. `match` is a value construct, so it reads the value channel, which is
+    right under either model. What it needs is a callee that *has* one: a typeless
+    `f` yields a `Status`, so `match f()` matches on `status(0)` and falls to `_`. (`switch` is not a mesh keyword; `match` was
     [decided](#matching-match) and `switch` explicitly declined.)
   - **`match f { … }` is a trap.** A bare word in expression position is a
     [string literal](#variables-and-assignment), so the subject is the string
@@ -7992,7 +8017,7 @@ remain under-specified.
   must write the branch out:
 
   ```mesh
-  func is-ssh-valid() {
+  bool func is-ssh-valid() {
       if quiet ssh-add -L { return true }
       return false
   }
@@ -8088,7 +8113,7 @@ remain under-specified.
   | Implicit terminator when the command declares no options — **applied to every command**, `func` included | `puts --force` prints, `func f(a)` takes `f --force` as a positional, the question disappears with no new spelling, and every form then behaves as `wrapper func` already does. | It is the refusal, deleted. Wherever the rule fires today it fires because nothing there can match the flag, which is exactly the set this would silence: `func f(a)` called as `f --frce` reports `unknown flag` now and would bind `a = --frce` instead. That is the guess between *pass this option* and *pass this text* that the rule exists not to make, and the caller who meant an option learns about it downstream rather than at the call. |
   | Implicit terminator for **builtins only** | Smaller blast radius; the option-less builtins are the shapes people actually forward into. And by fact 2 the language already tolerates a non-refusing form — `wrapper func` — so a second one is not the precedent it looks like. | A plain `func` with no such parameter would go on refusing, so the two disagree on identical-looking calls. Weaker than it first reads, given `wrapper func`, but the difference is that `wrapper` is *written* at the definition: you can see which reading you get. A builtins-only rule is invisible at the call. |
   | Diagnostic only | Cheapest, and it decides nothing. The message already names `puts -- --force`; it could name the forwarding spelling too, since a caller who hit this from inside a wrapper needs `puts -- ...$rest` rather than the scalar escape. | Changes how fast the cost is learned, not what it is. And the improvement has to be **unconditional**, which is a weaker message than a targeted one: by the time the refusal runs, a spread-delivered flag is indistinguishable from a written one — `expand::Written` is `Data`/`Flag`/`Terminator` with no provenance, and `Argv` keeps only the words and those marks, so nothing records that an element arrived via `...$rest`. Naming the forwarding form only when it applies would mean carrying a spread-origin bit through expansion, which is real work for a message. |
-  | **Spread of an expression** at a command boundary, `...$r:map(func(e) { "$e" })` | The conversion itself already exists, for a list of strings and flags: quoting is the scalar half (`x = --force; puts "$x"` prints `--force`, one of the three ways `docs/REFERENCE.md` lists) and `:map` distributes it — `x = $r:map(func(e) { "$e" }); puts ...$x` prints `a --force b`, leaving plain strings unchanged. What the direct form needs is not a flag feature at all: it is the spread variant on `CommandItem::Value`, the *same* gap `puts ...$x:split(":")` and `ls ...glob($p)` sat behind. That is built, which spends this candidate's best argument — it does not pay for itself elsewhere, because the two entries it would have closed as a side effect are closed. What survives is that it is compatible — it accepts programs that were errors and retires nothing — and that `...$r:map(func(e) { "$e" })` parses, so the spelling can be judged on its own merits. | Correspondingly not the small change the "just a spelling" reading suggests — it is the general spread-of-expression feature, with a parser change behind it. And for *this* question it is not even a substitute, let alone a shorter one. Quoting each element replaces it with a string, so the forwarded list arrives stripped of every type it carried, and a **collection** does not survive at all: for `s("a", [1 2], "b")`, `puts -- ...$r` renders the list where `$r:map(func(e) { "$e" })` fails with `$e: list value needs \`...\` in command arguments`. So it converts flags at the cost of everything else a rest list can hold, where the terminator preserves all of it — and it is written per call site, and longer than the `--`. Judge it on its own merits: the two entries it would have closed are closed without it. Not a use of `:flag`, which runs the other way and is the identity on a flag. |
+  | **Spread of an expression** at a command boundary, `...$r:map(str func(e) { "$e" })` | The conversion itself already exists, for a list of strings and flags: quoting is the scalar half (`x = --force; puts "$x"` prints `--force`, one of the three ways `docs/REFERENCE.md` lists) and `:map` distributes it — `x = $r:map(str func(e) { "$e" }); puts ...$x` prints `a --force b`, leaving plain strings unchanged. What the direct form needs is not a flag feature at all: it is the spread variant on `CommandItem::Value`, the *same* gap `puts ...$x:split(":")` and `ls ...glob($p)` sat behind. That is built, which spends this candidate's best argument — it does not pay for itself elsewhere, because the two entries it would have closed as a side effect are closed. What survives is that it is compatible — it accepts programs that were errors and retires nothing — and that `...$r:map(str func(e) { "$e" })` parses, so the spelling can be judged on its own merits. | Correspondingly not the small change the "just a spelling" reading suggests — it is the general spread-of-expression feature, with a parser change behind it. And for *this* question it is not even a substitute, let alone a shorter one. Quoting each element replaces it with a string, so the forwarded list arrives stripped of every type it carried, and a **collection** does not survive at all: for `s("a", [1 2], "b")`, `puts -- ...$r` renders the list where `$r:map(str func(e) { "$e" })` fails with `$e: list value needs \`...\` in command arguments`. So it converts flags at the cost of everything else a rest list can hold, where the terminator preserves all of it — and it is written per call site, and longer than the `--`. Judge it on its own merits: the two entries it would have closed are closed without it. Not a use of `:flag`, which runs the other way and is the identity on a flag. |
 
   Leaning: **keep the terminator and improve the diagnostic**, which is one
   candidate plus the null one — and the compatibility argument reaches only

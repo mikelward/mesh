@@ -547,7 +547,7 @@ binds a variable named `global`.
 ```ebnf
 definition      = return-type? "wrapper"? "func" definition-name parameter-list capture-list? NL* block
                 | "alias" alias-name capture-list? "=" NL* alias-command ;
-return-type     = "status" | "int" | "str" | "bool" | "list" | "map" | "value" ;
+return-type     = "status" | "int" | "str" | "bool" | "list" | "map" | "any" ;
 definition-name = bare-WORD ;                 # unjudged here; checked when it runs
 alias-name      = definition-name
                 | computed-name ;             # a word holding an interpolation
@@ -573,13 +573,18 @@ than `global`'s, and the same test governs the lambda form (`func (`, no name).
 position against a float type that does not exist yet; a command called `float`,
 a variable, and `func float()` are all untouched.
 
-The declaration is **read and carried today, and changes nothing about the
-call**: a function written without a type still has its value channel, so
-`func f() { 42 }` followed by `x = f()` still binds `42`. What the type is *for*
-— a `func` that declares none having no value channel — is the narrowing
-`docs/DESIGN.md` §"Open questions" decides and `TODO.md` schedules; this file
-describes the grammar the implementation accepts, so it will say so when that
-lands. `value` is a member of the set rather than an escape from it — mesh has
+**A `func` that declares no type has no value channel**: `func f() { 42 }`
+followed by `x = f()` binds a `Status`, not `42`, and only `int func f() { 42 }`
+binds the value. **Which** status is one rule: the one that
+body leaves in **command position**. `x = f()` binds exactly what `$sh.status`
+reads after a bare `f`, for every body — so `{ false }` yields `status(1)` like
+`{ return false }`, `{ [false() 42] }` yields `status(0)` because a command run
+*while building* a value is not the statement's status either, and
+`{ for i in [1 2] { /bin/false } }` yields `status(1)`, the loop's last command,
+rather than the list it built. A body with no value channel is not asked for a
+value at all: it runs the way the statement `f` runs it, so the two cannot
+disagree. `status func` is that same function said out loud, and yields the
+same. `any` is a member of the set rather than an escape from it — mesh has
 values the set deliberately does not name (a job, a styled string, an
 `Instant`), and a pass-through helper over one has no honest concrete type.
 
@@ -813,7 +818,7 @@ name left off and reuses the same parameter and block grammar.
 
 A `modifier-ref` — a bare `:name` in expression position — denotes the
 one-argument function that applies that modifier, so `$paths:map(:stem)` says
-what `$paths:map(func(p) { $p:stem })` says. Only there: a command word
+what `$paths:map(str func(p) { $p:stem })` says. Only there: a command word
 beginning with `:` stays literal text, and the colon of a map key or a named
 argument is unaffected. The attached call form `:name(…)` also starts a value,
 so it can open a condition or a statement.
