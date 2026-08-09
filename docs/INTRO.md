@@ -5,10 +5,11 @@ have in your fingers (`$()`, `&&`/`||`, `~`, pipes, redirection), with the sharp
 edges removed and several things made more ergonomic and consistent.
 Pipes still carry **bytes** — every external program and coreutil works exactly as
 elsewhere — but *inside* the shell you get **real values**: lists, maps, and
-type-directed operations, with no word-splitting footguns. Those values are
-transformed by a **postfix call chain** — `$path:base:stem:upper` — which is the
-first thing below, and the piece of mesh with the least prior art in any other
-shell.
+type-directed operations, with no word-splitting footguns. That is what the first
+two sections below are about — table stakes, but the ground everything else
+stands on. What sits on top of it is the **postfix call chain** —
+`$path:base:stem:upper`, the third section — the piece of mesh with the least
+prior art in any other shell.
 
 Interactive use sets the priorities, and the same language is what you save to a
 file: the features that make a line safe to type — nothing splits, absence is
@@ -31,7 +32,86 @@ old way, shown for contrast.
 
 ---
 
+## Values don't split behind your back
+
+Assign a value with `=` and read it back with `$name`:
+
+<pre>
+<strong>photo='My Photo.jpg'</strong>
+<strong>mv $photo album/</strong>          # one argument — "My Photo.jpg", space and all
+</pre>
+
+A value is always exactly one value. The space in `$photo` can't split it into two
+arguments, and an unquoted `$photo` is never re-matched against filenames — so
+there's no quoting to remember and nothing splits behind your back.
+
+Maps are ordered, string-keyed values rather than flattened command words. The
+same literal supports defaults followed by overrides, with later values winning
+without disturbing key order:
+
+<pre>
+<strong>defaults = [host: localhost, port: 8080]</strong>
+<strong>config = [...$defaults, port: 9090]</strong>
+<strong>puts $config.host $config.port</strong>
+localhost 9090
+</pre>
+
+Use `$config.key` for identifier keys and `${config[$name]}` for a computed key.
+`:keys`, `:values`, and `:len` inspect a map without inventing a lossy string
+representation for the whole value. (`subject:name` is a call applied to the
+value on its left — the third section below is about that shape; take the ones
+used here on their names for now.)
+
+`$env.PATH` is a **list**, not a colon-string, so the `IFS=:` juggling
+disappears.
+To **prepend** (bash's `PATH="/opt/bin:$PATH"` — new dir wins), say so; `:dedup`
+drops any later duplicate, keeping the first:
+
+<pre>
+# bash — prepend /opt/bin
+export PATH="/opt/bin:$PATH"
+
+# mesh — add at the front, then dedup (keep-first)
+<strong>$env.PATH = $env.PATH:prepend(/opt/bin):dedup</strong>
+</pre>
+
+`:prepend` and `:append` return a new list rather than writing one, which is why
+they chain like that — and why the result has to be assigned back;
+`[/opt/bin ...$env.PATH]:dedup` builds the same list the long way. To **append**
+instead (existing entries win), `$env.PATH = $env.PATH:append(/opt/bin)`, or the
+mutating `$env.PATH += /opt/bin`. Each adds one entry; `:extend` takes a list and
+adds its elements.
+
+## Split + destructure replaces `read` / `cut` / `IFS`
+
+Splitting a line into fields is *split then destructure* — no monolithic `read`,
+no `IFS` juggling:
+
+<pre>
+# bash
+IFS=: read -r user pass uid gid home shell &lt;&lt;&lt;"$line"
+
+# mesh
+<strong>[user pass uid gid home shell] = $line:split(":")</strong>
+<strong>[_ _ uid] = $line:split(":")</strong>        # _ discards fields you don't want
+</pre>
+
+Regex captures come back as a list, so there's no `[[ =~ ]]`-then-`$BASH_REMATCH`
+dance:
+
+<pre>
+# bash
+[[ $s =~ (.*)\ (.*) ]] &amp;&amp; one=${BASH_REMATCH[1]} two=${BASH_REMATCH[2]}
+
+# mesh — bind the groups directly; or test-and-bind in one line
+<strong>[one two] = $s:match(/(.*) (.*)/)</strong>
+<strong>if [key val] = $line:match(/(\w+): (.*)/) { ... }</strong>
+</pre>
+
 ## `:` is a postfix call, and calls chain
+
+The `:dedup` and `:split` above are not special forms — the colon is a call, and
+that one rule is what the rest of this section is.
 
 A bash parameter expansion can only operate on a *variable name*. `${p##*/}` is a
 basename and `${f%.*}` strips the last extension, but `${${p##*/}%.*}` is a
@@ -99,80 +179,6 @@ cryptic letters; YSH has the general chain (`x => f()`) but only inside an
 expression; fish and nushell have the vocabulary but reach it through a pipeline.
 [`COMPARISON.md`](COMPARISON.md#transforming-a-value) is the full survey,
 including what mesh could still borrow.
-
-## Values don't split behind your back
-
-Assign a value with `=` and read it back with `$name`:
-
-<pre>
-<strong>photo='My Photo.jpg'</strong>
-<strong>mv $photo album/</strong>          # one argument — "My Photo.jpg", space and all
-</pre>
-
-A value is always exactly one value. The space in `$photo` can't split it into two
-arguments, and an unquoted `$photo` is never re-matched against filenames — so
-there's no quoting to remember and nothing splits behind your back.
-
-Maps are ordered, string-keyed values rather than flattened command words. The
-same literal supports defaults followed by overrides, with later values winning
-without disturbing key order:
-
-<pre>
-<strong>defaults = [host: localhost, port: 8080]</strong>
-<strong>config = [...$defaults, port: 9090]</strong>
-<strong>puts $config.host $config.port</strong>
-localhost 9090
-</pre>
-
-Use `$config.key` for identifier keys and `${config[$name]}` for a computed key.
-`:keys`, `:values`, and `:len` inspect a map without inventing a lossy string
-representation for the whole value.
-
-`$env.PATH` is a **list**, not a colon-string, so the `IFS=:` juggling
-disappears.
-To **prepend** (bash's `PATH="/opt/bin:$PATH"` — new dir wins), say so; `:dedup`
-drops any later duplicate, keeping the first:
-
-<pre>
-# bash — prepend /opt/bin
-export PATH="/opt/bin:$PATH"
-
-# mesh — add at the front, then dedup (keep-first)
-<strong>$env.PATH = $env.PATH:prepend(/opt/bin):dedup</strong>
-</pre>
-
-`:prepend` and `:append` return a new list rather than writing one, which is why
-they chain like that — and why the result has to be assigned back;
-`[/opt/bin ...$env.PATH]:dedup` builds the same list the long way. To **append**
-instead (existing entries win), `$env.PATH = $env.PATH:append(/opt/bin)`, or the
-mutating `$env.PATH += /opt/bin`. Each adds one entry; `:extend` takes a list and
-adds its elements.
-
-## Split + destructure replaces `read` / `cut` / `IFS`
-
-Splitting a line into fields is *split then destructure* — no monolithic `read`,
-no `IFS` juggling:
-
-<pre>
-# bash
-IFS=: read -r user pass uid gid home shell &lt;&lt;&lt;"$line"
-
-# mesh
-<strong>[user pass uid gid home shell] = $line:split(":")</strong>
-<strong>[_ _ uid] = $line:split(":")</strong>        # _ discards fields you don't want
-</pre>
-
-Regex captures come back as a list, so there's no `[[ =~ ]]`-then-`$BASH_REMATCH`
-dance:
-
-<pre>
-# bash
-[[ $s =~ (.*)\ (.*) ]] &amp;&amp; one=${BASH_REMATCH[1]} two=${BASH_REMATCH[2]}
-
-# mesh — bind the groups directly; or test-and-bind in one line
-<strong>[one two] = $s:match(/(.*) (.*)/)</strong>
-<strong>if [key val] = $line:match(/(\w+): (.*)/) { ... }</strong>
-</pre>
 
 ## `match` and `~` replace `case` and `[[ … ]]`
 
