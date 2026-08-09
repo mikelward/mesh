@@ -6744,7 +6744,7 @@ to avoid" rather than promising the latter as done.
   | Check | Where | Needs |
   | --- | --- | --- |
   | `return $v` in a func declaring no type | parse | the declaration and the body — nothing else |
-  | `return` bare, or a body whose tail is a command, in a func declaring a type | parse | the same; a command's result is a `Status(n)`, never an `int` |
+  | `return` bare, or a body whose tail is a command, in a func declaring a type **a `Status` does not satisfy** | parse | the same; a command's result is a `Status(n)` and a bare `return` carries the last status, so both are right for a declared `status` and wrong only for `int`, `str`, and the rest |
   | `return "hi"` against a declared `int` | parse | the same, *and only where the operand is a literal* |
   | `x = f()` where `f` declares no type | run | the callee — see the resolver limit above |
   | a typeless lambda assigned to a value-taking hook slot | dispatch | the slot's declared kind |
@@ -6815,10 +6815,19 @@ to avoid" rather than promising the latter as done.
 
   **Open sub-questions this decision creates and does not settle:**
 
-  - **Compound kinds and an escape hatch.** Whether `list` can say a list of
-    *what*, and whether there is a spelling for "returns a value, unspecified".
-    The prefix spelling needs the set closed before it can parse; the postfix does
-    not.
+  - **Compound kinds and an escape hatch — the hatch is not optional, which
+    trying the migration settled.** Whether `list` can say a list of *what* is
+    still open. The escape hatch is not: **the closed set does not cover the value
+    kinds mesh already has.** Working the narrowing through the test suite turned
+    up `func ident(x) { return $x }` handed a **job** — and there is no `job` in
+    the vocabulary, nor a `styled`, an `Instant`, or a `Duration`. A pass-through
+    helper over any of them has no declarable type, so without a "returns a value,
+    unspecified" spelling the narrowing makes working code unwritable rather than
+    merely unannotated. Two ways out, and they are not the same: widen the
+    vocabulary to every kind (which grows it forever, and puts `job` in a
+    reader's way), or add the hatch (one word, and the honest thing to say about
+    an identity function anyway). The second is smaller and truer; either way this
+    has to be decided *before* the narrowing lands, not after.
   - **Whether parameters follow.** A declared return with undeclared arguments is
     an asymmetry a reader will notice immediately. It is the obvious next step and
     a much larger one — it is where "channel checking" would have to become type
