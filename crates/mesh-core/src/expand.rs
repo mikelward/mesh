@@ -75,8 +75,8 @@ pub enum Modifier {
     /// The fixed-separator split modifiers — `:lines`, `:nulls`, `:tabs`. Each is
     /// `:split(SEP)` with the separator spelled by the name, terminator semantics
     /// and all, so the three cannot drift from the general form or each other.
-    /// `:lines` is the explicit spelling of a capture's **default** split, not a
-    /// second pass over it.
+    /// `:lines` splits a capture's **raw** bytes, replacing the trailing-newline
+    /// trim a bare capture applies rather than running as a second pass over it.
     Lines,
     Nulls,
     Tabs,
@@ -2244,8 +2244,8 @@ fn split_named(value: Value, name: &str, separator: &str) -> Result<Value, Expan
 }
 
 /// Split `text` on `separator` with **terminator** semantics, the one place that
-/// rule lives: every split modifier and the default capture split come through
-/// here, so they cannot come to disagree about a trailing blank.
+/// rule lives: every split modifier comes through here, so they cannot come to
+/// disagree about a trailing blank.
 pub(crate) fn split_text(text: &str, separator: &str) -> Value {
     let mut fields: Vec<Value> = text
         .split(separator)

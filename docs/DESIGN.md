@@ -142,9 +142,9 @@ real pull. Two things decided against it. First, it taxes the common case: scala
 captures outnumber list-wanting ones several times over in this repo's own docs,
 and a list neither interpolates into `"…"` nor reaches an external command
 un-spread, so `cd $(…)` and `"$(…)"` would both need ceremony. Second, and
-decisively, the loop that motivated it is **no longer the silent failure it was**:
-a `for` over a value that is not a list is [refused](#loops-for-while-loop) and
-names `:lines`. Once the quiet wrong answer is loud, the argument for an implicit
+decisively, the loop that motivates it is **not a silent failure here**: a `for`
+over a value that is not a list is [refused](#loops-for-while-loop) and names
+`:lines`. With the quiet wrong answer loud, the argument for an implicit
 split is only ergonomic — and it is outweighed by the ergonomics of the case that
 is actually more common.
 
@@ -162,16 +162,15 @@ readable keyword. This is the zsh history-modifier idea (`:h :t :r :e`) but with
 There are four kinds of modifier, and the difference matters:
 
 - **Split modifiers** (`:lines :words :nulls :tabs :split`) turn a command
-  substitution's **raw byte capture** into a list. They *replace* the default
-  capture's trim and run against the raw bytes — they never run *after* it. Each
-  applies to a `$(…)` capture, producing the list. They apply equally to a
-  **plain string value** (`$line:split(":")`, `gets():words`) — there the string's
-  own bytes are the input and there is no default split to override; the `$(…)`
-  capture is just the most common source. The odd one out is **`:raw`**,
-  which lives in the same capture-modifier family but is the *no-split* member:
-  it yields the raw bytes as **one string**, not a list (it is what turns the
-  default newline-splitting off). So every split modifier produces a list
-  *except* `:raw`, whose whole job is to hand back a single byte-string.
+  substitution's **raw byte capture** into a list. They *replace* the bare
+  capture's trailing-newline trim and run against the raw bytes — they never run
+  *after* it. Each applies to a `$(…)` capture, producing the list. They apply
+  equally to a **plain string value** (`$line:split(":")`, `gets():words`) —
+  there the string's own bytes are the input and there is no trim to replace;
+  the `$(…)` capture is just the most common source. The odd one out is
+  **`:raw`**, which lives in the same capture-modifier family but is the
+  *no-split* member: it replaces the trim with nothing at all, handing back the
+  raw bytes as **one string** rather than a list.
 - **Value modifiers** (path and string — `:stem`, `:dir`, `:stripend`, …) transform
   a value, and **map over a list** automatically (applied to each element).
 - **Collection modifiers** (`:len :first :last :rest :init :keys :values
@@ -255,7 +254,7 @@ All four kinds:
 byte capture, replacing the trim that a bare capture would have applied:
 
 ```
-$(cmd):lines        # split raw bytes on newlines (explicit form of the default)
+$(cmd):lines        # split raw bytes on newlines (the line-loop case)
 $(cmd):words        # split on whitespace runs (opt-in; the old IFS behavior)
 $(cmd):nulls        # split on NUL *only* (find -print0 / xargs -0; newline-safe)
 $(cmd):tabs         # split on tab   (TSV)
@@ -267,13 +266,14 @@ The delimiter is a **terminator, not a separator**: **trailing empty fields are
 dropped** — any run of delimiters at the very end contributes nothing. So
 `find -print0` (which ends every path, including the last, with NUL) yields
 exactly the paths — `a\0b\0` → `[a b]` — and a stray blank line at the end of
-output never becomes a phantom element. This generalizes the default newline
-split's trailing trim. **Interior** empty fields are *kept* (`a\0\0b\0` →
+output never becomes a phantom element. It is the same rule the bare capture's
+trailing-newline trim follows. **Interior** empty fields are *kept* (`a\0\0b\0` →
 `[a "" b]`), so structure in the middle survives; an **empty capture** — or one
 that is nothing but delimiters — is the empty list `[]`. `:words` is the
 exception that ignores whitespace entirely — leading, trailing, and runs — so it
 never yields empty elements (the classic IFS word-split). `:raw` does not split
-at all (it is the [no-split capture member](#modifiers), one byte-string).
+at all (it is the [no-split capture member](#modifiers) — one byte-string, with
+its trailing newline intact).
 
 *(Implementation status.* The whole family is built: `:split(SEP)`, `:words`,
 `:lines`, `:nulls`, `:tabs` and `:raw` — the fixed-separator members carrying the
@@ -2638,10 +2638,9 @@ multi-word command rather than a lone scalar.
 
 ### Arrays (lists)
 
-The list is mesh's core value — command substitutions already produce lists
-(see [Command substitution](#command-substitution)) and value modifiers already
-map over them. This section pins down the *literal*, *indexing*, and *slicing*
-surface.
+The list is mesh's core value — a [split capture](#command-substitution) produces
+one and value modifiers map over it. This section pins down the *literal*,
+*indexing*, and *slicing* surface.
 
 ```
 xs = [a b c d]            # literal: space-separated, like nushell / elvish
@@ -3033,16 +3032,12 @@ whitespace, and `$file` (a string) stays one argv entry under every option
 below. "Does a **string** split?" is closed — no, permanently. "Does a **list**
 flatten?" is a separate question that the first one does not answer.
 
-**The live costs.** The `...` requirement is not free, though it costs less than
-it once did. When [command substitution](#command-substitution) newline-split by
-default, every capture reaching argv owed a spread — `wc -l ...$(ls)` — which was
-a large surface for a rule whose stated justification (the separator guess) turns
-out not to apply at argv. A capture is now **one string**, so the plain `cd $(…)`
-case pays nothing and the cost falls only on captures that are *deliberately*
-split: `wc -l ...$(ls):lines`, `grep foo ...$(find . -name '*.rs'):lines`. That is
-still the common list-producing idiom, and it still pays a token per use — but the
-line already says it wants a list, which is the part that makes the spread read as
-redundant.
+**The live costs.** The `...` requirement is not free. A
+[capture](#command-substitution) is **one string**, so the plain `cd $(…)` case
+pays nothing and the cost falls only on captures that are *deliberately* split:
+`wc -l ...$(ls):lines`, `grep foo ...$(find . -name '*.rs'):lines`. That is the
+common list-producing idiom, and it pays a token per use — but the line already
+says it wants a list, which is the part that makes the spread read as redundant.
 
 The options, cheapest-to-change first:
 
@@ -3058,9 +3053,8 @@ check by reading, and C is a known wart in the one language that shipped it. D i
 the interesting one precisely because it is *not* about lists at all — it is
 about whether a split `$(…)`-in-argument-position should keep bash's shape while
 keeping mesh's safety, and it needs the binding question answered before it is a
-real candidate. A capture becoming one string weakened D's case on its own: the
-ergonomic cost it buys back is now confined to captures the author already chose
-to split, so A costs less than it did when this was first weighed.
+real candidate. The ergonomic cost D buys back is confined to captures the author
+already chose to split, which is what keeps A cheap.
 
 *(TODO — **a `:flat` modifier**, which is wanted under **every** option above and
 is a gap today: [`:join`](#modifiers) already promises "there is no implicit deep
@@ -6392,15 +6386,14 @@ to avoid" rather than promising the latter as done.
   `config.fish` purely to keep a result (e.g. an empty `projectroot`) a *string*
   rather than an empty list that breaks the next comparison. mesh makes splitting
   **explicit and stable**, and makes the **list-vs-scalar choice part of the
-  capture** rather than a post-hoc rescue: `$(cmd)` is a list (default newline
-  split, opt-in `:words` / `:nulls` / `:tabs` / `:split`, a defined
-  [trailing-empty-field rule](#modifiers)), and `"$(cmd)"` is one string — quoting,
-  not a rescue pipeline, is how you ask for a scalar, with `$(cmd):raw` the
-  variant that also keeps the trailing newline. You ask for the shape you want up
-  front, so a value is never auto-split against your intent and then un-split with
-  `string collect`. The empty cases are each clean and stated
-  ([Modifiers](#modifiers)): an empty list capture is `[]`, and an empty scalar
-  capture is `""` — [no null](#variables-and-assignment) either way, so neither
+  capture** rather than a post-hoc rescue: `$(cmd)` is [one
+  string](#command-substitution) and a list is what you ask for by spelling the
+  split (`:lines` / `:words` / `:nulls` / `:tabs` / `:split`, with a defined
+  [trailing-empty-field rule](#modifiers)); `$(cmd):raw` is the variant that also
+  keeps the trailing newline. Nothing split the scalar in the first place, so
+  there is nothing for a `string collect` to undo. The empty cases are each clean
+  and stated ([Modifiers](#modifiers)): an empty capture is `""` and an empty
+  split is `[]` — [no null](#variables-and-assignment) either way, so neither
   needs a guard.
 - **Non-POSIX breaks muscle memory.** fish dropped `$(...)`, `&&` / `||` (for
   years), `export`, and more, so familiar reflexes stop working. mesh keeps the
