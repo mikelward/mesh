@@ -5,7 +5,10 @@ have in your fingers (`$()`, `&&`/`||`, `~`, pipes, redirection), with the sharp
 edges removed and several things made more ergonomic and consistent.
 Pipes still carry **bytes** — every external program and coreutil works exactly as
 elsewhere — but *inside* the shell you get **real values**: lists, maps, and
-type-directed operations, with no word-splitting footguns.
+type-directed operations, with no word-splitting footguns. Those values are
+transformed by a **postfix call chain** — `$path:base:stem:upper` — which is the
+first thing below, and the piece of mesh with the least prior art in any other
+shell.
 
 Interactive use sets the priorities, and the same language is what you save to a
 file: the features that make a line safe to type — nothing splits, absence is
@@ -27,6 +30,75 @@ In the examples, the mesh you'd type is in **bold**; the `# bash` lines are the
 old way, shown for contrast.
 
 ---
+
+## `:` is a postfix call, and calls chain
+
+A bash parameter expansion can only operate on a *variable name*. `${p##*/}` is a
+basename and `${f%.*}` strips the last extension, but `${${p##*/}%.*}` is a
+`bad substitution` — there's nowhere to put the first result — so a two-step
+transform costs two statements and a variable you never wanted:
+
+<pre>
+# bash
+file=${path##*/}
+stem=${file%.*}
+
+# mesh
+<strong>stem = $path:base:stem</strong>
+</pre>
+
+`subject:name` applies `name` to `subject`, and the result is the subject of
+whatever comes next. That is the whole rule, so the chain has no depth limit and
+never needs a temporary. The vocabulary is **words** rather than zsh's `:h` /
+`:t` / `:r` letters, and every value modifier maps over a list on its own — which
+turns a lot of `basename` / `dirname` / `cut` / `sed` pipelines into a word:
+
+<pre>
+# bash
+name=$(basename "$f" .tar.gz)
+dir=$(dirname "$f")
+
+# mesh
+<strong>name=$f:bare</strong>      # every extension; :stem the last only, :base:stripend('.tar.gz') just that suffix
+<strong>dir=$f:dir</strong>
+</pre>
+
+<pre>
+# "the executable files in this dir, deduped" — bash needs a loop + test -x
+mesh:  <strong>$files:filter(:exec)</strong>
+
+# join a list back into a colon-string (a whole shell function, in the config this
+# is ported from, collapses to one modifier)
+<strong>$env.PATH:join(":")</strong>
+</pre>
+
+It is a **call**, not a fixed table of operators, so the vocabulary is yours to
+add to. The subject sits left of the colon in the declaration, exactly where the
+call site puts it:
+
+<pre>
+<strong>func _s:shout()  { return "$_s!" }</strong>        # $x:shout
+<strong>func _s:wrap(_c) { return "$_c$_s$_c" }</strong>   # $x:wrap("*")
+<strong>func ..._xs:oxford(_conj) { … }</strong>           # a ... subject takes the whole list at once
+</pre>
+
+A plain subject receives one element, so `$xs:shout` on `[a b]` gives
+`[a! b!]`; a `...` subject receives the list whole. The built-ins split the same
+way — `:stem` maps, `:len` and `:join` consume the collection. And the chain is
+an ordinary word, so it works
+in argument position — where a shell actually spends its day:
+
+<pre>
+<strong>cp $f:base $dest/</strong>
+<strong>if $f:ext == gz { … }</strong>
+<strong>for d in $env.PATH:dedup { … }</strong>
+</pre>
+
+That last part is the unusual one. zsh has the operator but a closed set of
+cryptic letters; YSH has the general chain (`x => f()`) but only inside an
+expression; fish and nushell have the vocabulary but reach it through a pipeline.
+[`COMPARISON.md`](COMPARISON.md#transforming-a-value) is the full survey,
+including what mesh could still borrow.
 
 ## Values don't split behind your back
 
@@ -75,30 +147,6 @@ they chain like that — and why the result has to be assigned back;
 instead (existing entries win), `$env.PATH = $env.PATH:append(/opt/bin)`, or the
 mutating `$env.PATH += /opt/bin`. Each adds one entry; `:extend` takes a list and
 adds its elements.
-
-## Modifiers instead of subshell-and-sed gymnastics
-
-A `:`-modifier transforms a value, and maps over a list automatically — so a lot of
-`basename`/`dirname`/`cut`/`sed` pipelines become a word:
-
-<pre>
-# bash
-name=$(basename "$f" .tar.gz)
-dir=$(dirname "$f")
-
-# mesh
-<strong>name=$f:bare</strong>      # every extension; :stem the last only, :base:stripend('.tar.gz') just that suffix
-<strong>dir=$f:dir</strong>
-</pre>
-
-<pre>
-# "the executable files in this dir, deduped" — bash needs a loop + test -x
-mesh:  <strong>$files:filter(:exec)</strong>
-
-# join a list back into a colon-string (a whole shell function, in the config this
-# is ported from, collapses to one modifier)
-<strong>$env.PATH:join(":")</strong>
-</pre>
 
 ## Split + destructure replaces `read` / `cut` / `IFS`
 

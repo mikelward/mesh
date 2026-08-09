@@ -5876,6 +5876,42 @@ spelling.)
         ground; `docs/DESIGN.md` §"Destructuring" defers **map destructuring**
         separately and neither answers the other.
 
+## Beyond M3 — Borrow candidates for the `:` chain
+
+Turned up by the prior-art survey written into
+`docs/COMPARISON.md` §"Transforming a value". Each is a design question, not
+queued work — the survey found them, it did not decide them.
+
+- [ ] **A way to postfix-apply a function that was not declared as a modifier.**
+      Raku spells it `.&f`, D and Nim get it free from UFCS, Hack and the JS
+      proposal get it from a topic token that lets the subject land in any
+      argument slot. mesh requires `func _s:name()`, which is deliberate — it stops
+      a private one-argument helper from becoming public vocabulary by accident —
+      but the cost is that a chain stops dead at any function written before anyone
+      knew it would be chained, including every function in a library mesh does not
+      own. `$xs:map(:base)` already passes a chain link as a value, so the machinery
+      for an `:apply(f)` / `:then(f)` escape hatch is mostly present. The question is
+      whether the escape hatch re-opens the accident the declaration was there to
+      prevent, or whether writing `:apply` at the call site is enough of a
+      declaration.
+- [ ] **`:withext` — pathlib's `with_suffix`.** Replacing an extension is the one
+      path operation with no single spelling. `docs/DESIGN.md` §Modifiers answers it
+      with `($f:stem).png`, which (a) is not implemented — `echo ($f:stem).png`
+      reports `member access .png requires a map` — and (b) reads worse than every
+      other member of the path family. Either build the parenthesized form or add
+      the modifier; leaving both undone is the current state.
+- [ ] **Record whether the path vocabulary was the right shape at all.** nushell's
+      `path parse` returns a record with every component at once, so there is one
+      command to learn instead of ten modifiers, and `get stem` is an ordinary field
+      access. mesh's bet is that `$p:stem:upper` beats
+      `($p | path parse).stem | str upcase` often enough to pay for the vocabulary.
+      That is defensible and currently unwritten anywhere except the comparison
+      page; it belongs in `docs/DESIGN.md` as a considered alternative.
+- [ ] **A short-circuiting link, Clojure's `some->` or Swift's `?.`.** Most likely a
+      considered no — absence is loud, and `:get(k, default)` is the opt-in — but a
+      chain is exactly where a missing intermediate hurts most, and no decision is
+      recorded either way.
+
 ## Beyond M3 — Function references (`&name`)
 
 Decided in design discussion; see `docs/DESIGN.md` §"Calling for a value, and
