@@ -44,6 +44,7 @@ this page compares designs, and mesh's is still being built.
 | Unquoted empty `$x` | **vanishes** | **vanishes** | one empty arg | one empty arg | one empty arg | one empty arg | one empty value |
 | Lists | bolted-on | native | native | native | native | native | native |
 | List → argv | `"${a[@]}"` | implicit | `@a` | implicit | `...$a` | `$@a` | `...$a` |
+| Chained value transform | none — `${…}` takes a name, not a value | `${p:t:r}` | `=> f()`, expression mode | `path`/`string` pipeline | `$p:base:stem`, anywhere | nested call | pipeline |
 | Pipe payload | bytes | bytes | bytes | bytes | bytes | bytes + values | **structured** |
 | Coreutils | first-class | first-class | first-class | first-class | first-class | first-class | second-class |
 | Unset variable | `""` | `""` | error (at run time) | `""` | error (at run time) | **compile error** | **parse error** |
@@ -559,6 +560,247 @@ $ ysh -c 'var a = ["one", "two"]; write -- $a'
 fatal: Word eval got a List, which can't be stringified (OILS-ERR-203)
 ```
 
+## Transforming a value
+
+Every shell answers the same small question — *given a path, give me the stem* —
+and it is where the seven are furthest apart.
+
+bash has the pieces and no way to join them. `${p##*/}` is a basename and
+`${f%.*}` strips the last extension, but what a `${…}` operates on has to be a
+**variable name** — `${${p##*/}%.*}` is a `bad substitution`, because there is no
+receiver slot an expansion can sit in. (Nesting into the *operand* is fine:
+`${x:-${y%.*}}` works. It is the half that does not help.) So a two-step
+transform is two statements and a variable you did not want:
+
+```bash
+file=${path##*/}
+stem=${file%.*}
+```
+
+mesh writes the same two steps as two links of one chain, and the intermediate
+never gets a name:
+
+```mesh
+stem = $path:base:stem
+```
+
+**That missing receiver slot is the whole origin of mesh's `:`.** What it grew into is
+more general than paths: `subject:name` applies `name` to `subject`, the result
+becomes the subject of whatever follows, and the vocabulary is open —
+[`func _s:name()`](REFERENCE.md#declaring-a-modifier) adds to it — so a chain is
+not limited to what the shell shipped.
+
+### The seven, side by side
+
+| | Postfix operator | Vocabulary | Where it works | Yours to extend |
+| --- | --- | --- | --- | --- |
+| bash | none — `${x@U}` is a suffix, one deep | fixed sigil forms, plus nine `@` letters (5.1) | inside `${…}` only | no |
+| zsh | `:` + a **letter** | fixed: `h t r e s a A l u q Q x` … | `${…}`, history words, glob qualifiers | no |
+| YSH | `=>` | any function | **expression mode only** | yes |
+| fish | none | the `string` and `path` command families | pipelines and `(…)` | yes — write a function |
+| **mesh** | **`:` + a word** | built-ins, plus yours | **anywhere a value is read**, argv included | yes — `func _s:name()` |
+| elvish | none — `:` is the *module* separator (`path:base`) | module functions | prefix calls, nested or piped | yes |
+| nushell | none | the `str` and `path` command families | pipelines | yes |
+
+The same job — basename, then strip the last extension — in each:
+
+```zsh
+${p:t:r}                                      # zsh: two chained modifiers, one expansion
+```
+```fish
+path basename $p | path change-extension ''   # fish: a pipeline of two builtins
+```
+```nu
+$p | path parse | get stem                    # nushell: one parse to a record, then a field
+```
+```elvish
+var b = (path:base $p); str:trim-suffix $b (path:ext $b)   # elvish: no stem function
+```
+```mesh
+$p:base:stem                                  # mesh
+```
+
+### zsh is the ancestor, and it shows the ceiling
+
+csh invented the colon modifier, zsh chained it and carried it onto parameter
+expansion, and vim borrowed the same letters wholesale —
+`fnamemodify(p, ':t:r:r')` and `expand('%:p:h')` are csh's `:t`, `:r` and `:h`
+still in service decades later. mesh's [`Modifiers`](DESIGN.md#modifiers) section
+says outright that this is the idea it is taking.
+
+It is the closest prior art by some distance, and it stops at three walls:
+
+1. **The letters are a closed set.** `:h :t :r :e :s :a :A :l :u :q :Q :x` and a
+   handful more, and what you want next is not among them. There is no
+   `${p:stem}` and no way to add one, so anything past the list is back to `sed`
+   in a subshell — the exact complaint behind
+   [fish #4002](https://github.com/fish-shell/fish-shell/issues/4002), which
+   mesh's modifier system is the direct answer to.
+2. **They are cryptic by construction.** One letter cannot carry a meaning, so
+   `:r` (remove the extension) and `:e` (keep only the extension) are a pair you
+   look up every time. mesh keeps the operator and spends the characters on the
+   name: `:stem`, `:ext`, `:dir`, `:base`, `:bare`, `:ancestors`.
+3. **They are not values.** A zsh modifier applies to an expansion, a history
+   word, or a glob qualifier — it is part of the expansion grammar rather than
+   an operator over values, so there is no `$(cmd):lines` and no
+   `$xs:map(:base)`.
+
+bash inherited only the history half (`!$:h`) and never brought the modifiers to
+parameters at all; its answer is the `${x#…}` / `${x%…}` sigil family plus the
+`${x@U}` transformations added in 4.4 and 5.1, and neither can take the other's
+result — or its own — as a subject.
+
+### YSH's `=>` is the nearest living relative
+
+YSH is the only other shell here with a general postfix call. The fat arrow
+chains free functions left to right, and the thin arrow calls mutating methods:
+
+```ysh
+var trimmed = line.trim() => upper()
+call mylist->pop()
+```
+
+That is the same idea mesh's `:` is, arrived at independently, and the design
+converges on the same reasons: functions read better applied left to right, and
+a chain beats a temporary. Two differences are worth naming, and only one of
+them favors mesh.
+
+**`=>` lives in expression mode.** YSH's [two modes](#syntax) mean the chain is
+available where you have already entered an expression — after `var`, or inside
+`(…)` — and reaching it from command position costs a wrapper (`echo $[x =>
+upper()]`). mesh has one mode, so a chain is an ordinary word:
+
+```mesh
+cp $f:base $dest/
+if $f:ext == gz { … }
+for d in $env.PATH:dedup { … }
+```
+
+Argument position is where a shell spends its day, and as far as this page's
+survey found **no other Unix shell puts a postfix call chain there** — fish and
+nushell need a pipeline or a `(…)`, elvish needs a nested call, YSH needs
+expression mode. PowerShell manages it, because `$f.BaseName.ToUpper()` is an
+ordinary .NET member access and PowerShell's argument mode accepts one; that is
+the closest anything comes, and it is not a Unix shell.
+
+**`=>` costs nothing in the word grammar, and `:` costs something.** Two
+characters with whitespace around them can never be mistaken for text. mesh's
+one character has to be taken away from bare words: `ubuntu:latest` is now a
+modifier chain and needs quoting, which is one of
+[the two extra quoting rules](#what-mesh-gives-up) mesh admits to. That trade was
+made knowingly — the reservation is of the *shape* (`:` followed by a bare
+identifier), so `key:2`, `key:/path`, `$host:$port` and `http://x` are all
+untouched — but YSH's operator genuinely pays less for the same expressiveness,
+and this page should say so rather than count the terseness as free.
+
+### Outside the shell
+
+The idea is old and widely re-derived; almost every piece of mesh's version has
+precedent somewhere.
+
+| Where | Spelling | What it contributes |
+| --- | --- | --- |
+| csh / tcsh / zsh / vim | `$p:h:t`, `%:p:h` | colon, postfix, chains — the direct ancestor |
+| GNU make | `$(SRCS:.c=.o)` | a colon postfix transform on a variable; one rewrite rule, no chaining |
+| cmd.exe | `%~dpn1` | letters again, and no way to chain |
+| PostgreSQL | `x::text::int` | a colon postfix operator that *does* chain — for casts only |
+| PowerShell | `$p.BaseName.ToUpper()` | real methods, and `.` auto-maps over a collection |
+| Python | `Path(p).stem`, `.suffixes`, `.parents`, `.as_uri()` | where mesh's path vocabulary comes from, near name for name |
+| D / Nim | `x.f(y)` ≡ `f(x, y)` | UFCS: *every* free function is already a postfix call |
+| Raku | `.uc.trim`, `.&myfunc`, `x ==> f()` | three spellings of the idea in one language |
+| Elixir / Gleam / R | `x \|> f() \|> g()` | the pipe as a language operator; the subject becomes the **first** argument (Gleam and R add a `_` placeholder to move it) |
+| F# / OCaml | `x \|> f a` | the same operator, but partial application makes the subject the **last** argument |
+| Clojure | `(-> x f g)`, `->>`, `some->` | threading, with separate operators for first-argument, last-argument, and nil-short-circuit |
+| Hack | `x \|> f($$)` | a **topic token**, so the subject can land anywhere in the call |
+| JS proposal | `x \|> f(%)` | the Hack form, Stage 2; the token itself (`%`, `^`, …) is still unsettled |
+| Jinja (Nunjucks, Twig) | `{{ p \| basename \| default('vi') }}` | a word, parens only when there are arguments — mesh's exact call shape |
+| Liquid, Go templates | `{{ p \| default: 'vi' }}`, `{{ .Path \| printf "%s" }}` | the same left-to-right filter chain; arguments after a `:` or a space, not in parens |
+| jq | `.a \| ascii_upcase` | |
+| Wolfram | `x // f // g` | postfix application as a plain binary operator |
+| Factor / Forth | `x f g` | concatenative: postfix is the only order there is |
+
+Three of those are worth more than a row.
+
+**Python's `pathlib` is the vocabulary mesh copied**, and the correspondence is
+close enough to be a check on the naming: `:stem`/`.stem`, `:base`/`.name`,
+`:ext`/`.suffix`, `:exts`/`.suffixes`, `:dir`/`.parent`, `:real`/`.resolve()`,
+`:url`/`.as_uri()`. The one deliberate divergence is
+[`:ancestors`](DESIGN.md#modifiers) against `.parents`: pathlib's excludes the
+path itself, mesh's includes it, and mesh rejected the name `.parents` precisely
+because it reads as excluding the thing every upward search starts from.
+
+**PowerShell's member enumeration is the cautionary tale, not the model.** Its
+`.` maps over a collection automatically, which is the same convenience as mesh's
+value modifiers — but it decides *per value at run time*: the collection's own
+member wins, and enumeration is the fallback when the collection hasn't got one.
+So `.Count` on a list whose elements each have a `Count` means one thing for a
+`List[string]` and another for an array of custom objects, and a property that
+doesn't exist enumerates into a list of `$null` rather than reporting. mesh
+cannot land there, because the category is fixed by the **declaration** rather
+than by the value: `func _s:name()` is element-wise and `func ..._xs:name()`
+takes the whole collection, so `:len` is a collection modifier and `:stem` is a
+value modifier no matter what either one is handed.
+
+**Hack's topic token is the feature mesh does not have.** Every pipe operator has
+to answer *where does the subject go*, and the answers do not agree: Elixir says
+first, F# says last (by partial application, not by decree), Clojure ships `->`
+and `->>` as two operators rather than choose, and Hack's `x |> f($$)` names a
+slot so the subject can land anywhere. TC39 has spent years on which shape to
+adopt; the Hack form is at Stage 2 with even the placeholder token unsettled.
+mesh sidesteps the question by fixing the subject at the *declaration* — left of
+the colon, where the call site puts it — the way a Kotlin extension function or a
+Rust method does. That is the right default and it is not free: see the borrow
+candidates below.
+
+### What is actually new here
+
+Every ingredient has prior art. The combination does not, as far as this survey
+found:
+
+- a **postfix call chain** — YSH, and nobody else among Unix shells;
+- **in ordinary command-argument position** — mesh alone among them, PowerShell
+  aside;
+- spelled with a **word, not a letter** — mesh alone among the colon shells;
+- **open to user declaration** — YSH, fish, elvish and nushell have this for
+  their own shapes; the colon shells do not;
+- **auto-mapping over a list, with the element-wise/whole-collection split fixed
+  at declaration** — mesh alone; PowerShell has the mapping without the split;
+- and **modifiers as values**, so `$xs:map(:base)` hands one chain link to
+  another.
+
+The last piece is the one that turns a modifier system into a function-call
+syntax rather than a fixed operator table, and it is what makes "postfix call
+chain" the honest description of `:` rather than a grander name for zsh's `:h`.
+
+### Borrow candidates
+
+Four things this survey turned up that mesh does not have, in rough order of how
+much they would buy. None is decided; they are tracked in
+[`TODO.md`](../TODO.md).
+
+1. **A way to postfix-apply a function that was not declared as a modifier.**
+   Raku's `.&f`, D and Nim's UFCS, and Hack's `$$` all let an existing function
+   join a chain without being written for one. mesh requires `func _s:name()`,
+   which is
+   [deliberate](DESIGN.md#modifiers) — it keeps a private one-argument helper
+   from silently becoming public vocabulary — but it means a chain stops dead at
+   any function someone wrote before they knew it would be chained. `:map(:base)`
+   already proves the machinery takes a chain link as a value, so an
+   `:apply(f)` / `:then(f)` escape hatch is close by.
+2. **`with_suffix`.** pathlib's `.with_suffix('.png')` is the one path operation
+   mesh has no single spelling for; the design's answer is `($f:stem).png`, which
+   is not implemented and reads worse than the rest of the family.
+3. **`path parse` as an alternative to a vocabulary.** nushell gives you every
+   path component at once as a record — one command to learn instead of ten
+   modifiers. mesh's bet is that `$p:stem:upper` beats
+   `($p | path parse).stem | str upcase` often enough to justify the vocabulary,
+   which is a defensible call and worth writing down as one.
+4. **A short-circuiting link**, Clojure's `some->` or Swift's `?.`. mesh's
+   position is that absence is loud (see [`INTRO.md`](INTRO.md)) and
+   `:get(k, default)` is the opt-in, so this is most likely a considered no —
+   but the chain is exactly where a missing intermediate hurts most, and nothing
+   currently records the decision.
+
 ## Globbing
 
 | | bash | zsh | YSH | fish | mesh | elvish | nushell |
@@ -727,7 +969,9 @@ Two mesh choices that have no counterpart in the other six:
   so absolute paths need no wrapper — `$p ~ /usr/bin` is a path, `$p ~ /error/`
   is a regex, decided by word shape.
 - **Modifiers chain**: `$m.rows[1].name:stem:upper` reads left to right, where
-  bash has `${x%%…}` sigil soup and nushell reaches for a pipeline.
+  bash has `${x%%…}` sigil soup and nushell reaches for a pipeline. YSH has the
+  same operator as `=>` but only inside an expression — see
+  [Transforming a value](#transforming-a-value).
 
 ## Implementation
 
