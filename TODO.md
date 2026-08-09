@@ -5667,9 +5667,19 @@ entry records what each costs.
       x = func() { puts "\z"     ⏎ puts LEAKED
       ```
 
-      `func f() { puts "\z"` is the only one that quarantines, and the typed
-      spelling behaves identically to the untyped one throughout, so none of this
-      came from the declaration.
+      **A continued header leaks too**, and this one reaches `func` itself:
+
+      ```
+      func \ ⏎ f() { puts "\z"              ⏎ puts LEAKED
+      wrapper \ ⏎ func f(...xs) { puts "\z" ⏎ puts LEAKED
+      int \ ⏎ func f() { puts "\z"          ⏎ puts LEAKED
+      ```
+
+      A `\`-newline joins two physical lines, and the recognizer reads the first
+      one — so the header it is looking for is not there to be found. Verified on
+      `origin/main` for the untyped spelling, which is what places it here rather
+      than with the declaration: the typed form behaves identically to the
+      untyped one in every one of these.
 
       The cause is the shape of the mechanism, not a gap in it. `pending_input`
       quarantines a malformed body by **recognizing a named `func` header** in
@@ -5689,6 +5699,17 @@ entry records what each costs.
       and its signature-grammar-in-raw-text helpers (`body_open_offset`,
       `signature_close`, `params_valid`, `header_awaits_body`) come out with it;
       `parse`'s own `Incomplete` / `Err` split already answers the rest.
+
+      **Correcting the size of that, since the estimate above was wrong.** It
+      assumed the lexer already knows the depth when it fails. It knows the depth
+      *so far*: a hard error stops the scan, so `func f() { puts "\z" }` — a
+      **closed** body — reports one open brace, and buffering it would wait for a
+      `}` that has already arrived. Answering correctly needs the lexer to
+      **recover** from a hard lexical error and keep scanning to the end, holding
+      the first error and finishing its delimiter tracking with its own quote,
+      comment and raw-string rules still applied. That is a change to the lexer's
+      error model, not a flag on it, which is why this is its own PR rather than
+      something to bolt onto a return-type branch.
 
       **Do it when the next finding lands, not on a schedule.** The reader's
       header machinery has now taken eight review findings across two functions —
