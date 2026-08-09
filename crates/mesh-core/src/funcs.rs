@@ -169,6 +169,13 @@ mod tests {
     use crate::completion::CompletionSpec;
     use crate::parser::Source;
 
+    fn typed_def(params: Vec<Param>, declared: Option<ReturnType>) -> FuncDef {
+        FuncDef {
+            return_type: declared,
+            ..def(params, false)
+        }
+    }
+
     fn def(params: Vec<Param>, wrapper: bool) -> FuncDef {
         FuncDef {
             params,
@@ -188,6 +195,36 @@ mod tests {
             name: name.into(),
             kind,
         }
+    }
+
+    #[test]
+    fn help_names_a_declared_return_and_stays_silent_without_one() {
+        // The result is part of the signature a caller reads — the whole point of
+        // declaring it is that `help` answers "what does this return?" without
+        // anyone opening the body.
+        let typed = typed_def(vec![param("a", ParamKind::Required)], Some(ReturnType::Int));
+        assert!(
+            typed.help("f").contains("Returns: int"),
+            "{}",
+            typed.help("f")
+        );
+
+        let hatch = typed_def(Vec::new(), Some(ReturnType::Value));
+        assert!(
+            hatch.help("f").contains("Returns: value"),
+            "{}",
+            hatch.help("f")
+        );
+
+        // And **no** line without a declaration: absence is what says there is no
+        // value channel, so printing `status` here would advertise one the
+        // function has not got.
+        let untyped = typed_def(vec![param("a", ParamKind::Required)], None);
+        assert!(
+            !untyped.help("f").contains("Returns"),
+            "{}",
+            untyped.help("f")
+        );
     }
 
     #[test]

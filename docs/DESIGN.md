@@ -6796,14 +6796,31 @@ to avoid" rather than promising the latter as done.
   (declare a type, or stop taking the value). Per the table above that check is a
   runtime one.
 
-  **The vocabulary is `status`, `int`, `str`, `bool`, `list`, `map`, and `float`
-  is reserved.** Short forms throughout: `int` is already the language's word
+  **The vocabulary is `status`, `int`, `str`, `bool`, `list`, `map`, `value`, and
+  `float` is reserved.** Short forms throughout: `int` is already the language's word
   (`:int` parses one), so `str` follows it and `string` would be the odd one out
   beside it. **`float` is reserved now and not implemented** — `f64` exists as a
   value ([Arithmetic](#arithmetic)), but declaring one is later work, and claiming
-  the word today is what keeps that a *feature* rather than a break: a script may
-  not use `float` for anything else in the meantime. Adding the type later may
-  still invalidate scripts written against its absence, and that is accepted.
+  the word today is what keeps that a *feature* rather than a break. The
+  reservation is **contextual, exactly as the types themselves are**: `float func
+  f()` is refused with a diagnostic saying the word is spoken for, while a command
+  called `float`, a variable of that name, and `func float() { … }` all keep
+  working — reserving the *position*, not the word, since claiming the word
+  outright would be a breaking change today for a type that does not exist yet.
+  Adding the type later may still invalidate scripts written against its absence,
+  and that is accepted.
+
+  **`value` is a member of the set, not an escape from it** *(decided; trying the
+  migration is what settled it)*. The closed set names the kinds a reader writes,
+  and mesh has values it deliberately does not name there — a job, a styled
+  string, an `Instant`, a `Duration`. Working the narrowing through the test suite
+  turned up `func ident(x) { return $x }` handed a **job**, which no concrete
+  spelling fits: what it returns is whatever it was given, so `job func ident(x)`
+  would be wrong the moment a string arrived. `value` says the true thing —
+  *there is a value channel, of unstated kind* — in the design's own vocabulary.
+  The alternative considered was widening the set to every kind, which grows it
+  forever and still leaves identity unspellable; `any` was the other spelling
+  weighed, and reads as a claim about a type system this deliberately is not.
 
   **A closed set is the point, not a limitation to be lifted. User-defined types
   are not a goal.** The set above covers the kinds mesh values actually come in,
@@ -6815,19 +6832,9 @@ to avoid" rather than promising the latter as done.
 
   **Open sub-questions this decision creates and does not settle:**
 
-  - **Compound kinds and an escape hatch — the hatch is not optional, which
-    trying the migration settled.** Whether `list` can say a list of *what* is
-    still open. The escape hatch is not: **the closed set does not cover the value
-    kinds mesh already has.** Working the narrowing through the test suite turned
-    up `func ident(x) { return $x }` handed a **job** — and there is no `job` in
-    the vocabulary, nor a `styled`, an `Instant`, or a `Duration`. A pass-through
-    helper over any of them has no declarable type, so without a "returns a value,
-    unspecified" spelling the narrowing makes working code unwritable rather than
-    merely unannotated. Two ways out, and they are not the same: widen the
-    vocabulary to every kind (which grows it forever, and puts `job` in a
-    reader's way), or add the hatch (one word, and the honest thing to say about
-    an identity function anyway). The second is smaller and truer; either way this
-    has to be decided *before* the narrowing lands, not after.
+  - **Compound kinds** — whether `list` can say a list of *what* — remain open.
+    The prefix spelling needs the set closed before it can parse; the postfix does
+    not.
   - **Whether parameters follow.** A declared return with undeclared arguments is
     an asymmetry a reader will notice immediately. It is the obvious next step and
     a much larger one — it is where "channel checking" would have to become type

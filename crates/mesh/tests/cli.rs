@@ -17556,6 +17556,26 @@ fn a_value_call_evaluates_arguments_in_the_callers_scope() {
 }
 
 #[test]
+fn help_names_a_declared_return_type() {
+    // `help` answering "what does this return?" without anyone opening the body
+    // is the point of declaring it, and this is the path a user actually takes.
+    let typed = run_with_input("int func add(a, b) { $a + $b }\nadd --help\n");
+    assert!(
+        String::from_utf8_lossy(&typed.stdout).contains("Returns: int"),
+        "{:?}",
+        String::from_utf8_lossy(&typed.stdout)
+    );
+    // And no such line without a declaration — absence says there is no value
+    // channel, so naming one here would advertise what the func has not got.
+    let untyped = run_with_input("func add(a, b) { $a + $b }\nadd --help\n");
+    assert!(
+        !String::from_utf8_lossy(&untyped.stdout).contains("Returns"),
+        "{:?}",
+        String::from_utf8_lossy(&untyped.stdout)
+    );
+}
+
+#[test]
 fn a_bare_return_carries_the_result_so_far() {
     // `return` on its own exits early carrying the body's result *so far*, not a
     // freshly minted status: a value the body produced, the status of a command

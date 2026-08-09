@@ -12652,7 +12652,9 @@ fn typed_header_follows(after: &str) -> bool {
 /// recognizes it in the same position — a malformed `float func f() {` has to
 /// stay quarantined so its diagnostic is the reserved-word one rather than
 /// whatever its body would have done at top level.
-const TYPE_MARKER_WORDS: &[&str] = &["status", "int", "str", "bool", "list", "map", "float"];
+const TYPE_MARKER_WORDS: &[&str] = &[
+    "status", "int", "str", "bool", "list", "map", "value", "float",
+];
 
 fn strip_wrapper_marker(text: &str) -> &str {
     let Some(rest) = text.strip_prefix("wrapper") else {
