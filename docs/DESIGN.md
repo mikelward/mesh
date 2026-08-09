@@ -4489,6 +4489,586 @@ Rules:
   reporting `` `:value` is a built-in modifier and cannot be redeclared `` the day
   this lands. That is the general cost of adding to the modifier vocabulary, not
   something specific to these two — recorded so the choice is made knowing it.
+- **A constructor pattern that binds — `status(n)`** *(the shape is settled;
+  what remains open is how many constructors it covers)*. Raised by mikelward,
+  asking whether this runs today:
+
+  ```mesh
+  func f() { return status 1 }
+
+  match f() {
+    status(0) => "ok"
+    status(n) => "error $n"     # ← this is the part that does not exist
+    _         => "not a status"
+  }
+  ```
+
+  **Half of it ships.** A `status(0)` arm takes its arm, a bare `0` arm does too
+  (the [status/int equality](#comparison-across-types)), and a `1..=255` range arm
+  works. A **string** subject falls through past a `status(0)` arm to `_`, since a
+  status compares with a status or an int and refuses a string — but note that is
+  a claim about a `status(0)` arm on its own, *not* about the program above: there
+  the string reaches `status(n)` and raises the constructor error below before `_`
+  can run, and an **int `0`** subject takes the `status(0)` arm rather than falling
+  through at all (see the compatibility note further down). **The code is what
+  decides, not the type:** an int `1` misses `status(0)` because the codes differ,
+  then reaches `status(n)` and raises exactly as the string does, so only a
+  subject whose code equals an arm's is swallowed by that arm. All verified; an
+  earlier draft summarized the fallthrough as if the displayed match had it, and
+  the draft correcting that one wrote the int case for every integer rather than
+  for `0` alone (Codex, #472). What does not exist is the **binder**. An arm pattern is parsed as an
+  ordinary expression (`match_pattern`, `parser.rs`:4658), so `status(n)` calls the
+  constructor with the *string* `"n"` and reports `` the code must be an integer,
+  not a string `` — and it reports it whether or not `n` is bound, since the
+  pattern never expands the word at all. `status($n)` does run, but that is a
+  literal comparison against `$n`'s value, not a capture.
+
+  **This is not a new rule; it is the rule above applied to a third slot.** The
+  flag-pattern entry already settles that *a bare word is a literal in a
+  whole-value position and a binder in a sub-pattern position*, which is why
+  `[start arg]` binds both elements and `--tag=main` binds a payload while a
+  top-level `main` arm stays a string. The operand of a constructor call is a
+  sub-pattern position by that same reading, so `status(n)` binding is what the
+  sentence already predicts — the gap is that nothing implements it there.
+
+  The rest of the flag entry transfers intact, which is what makes this cheap:
+
+  - **The binder takes only the slot's *string* case**, so `status(0)` stays the
+    integer literal it is today and only a bare non-numeric word becomes a binder.
+    That is what keeps `status(0)` a code test rather than a binder, under the
+    rule below.
+  - **`$n` and quoting are the escapes** — `status($n)` and `status("n")` are
+    literal comparisons, exactly as `--tag="main"` is.
+  - **`status(_)` is the discard form**, for when *being* a status is the whole
+    question — the one thing a bare `_` arm cannot ask, since it swallows strings
+    and lists too. It needs the variant test below; an earlier draft asserted it
+    while assuming equality elsewhere in the same list, which does not cohere
+    (Codex, #472).
+
+  **All three spellings work, under one rule — and an earlier draft of this entry
+  wrongly said they conflicted.** That draft treated *"an arm is an evaluated
+  expression compared with `Value::eq`"* as a fixed constraint and derived a fork
+  from it: `status(0)` wanting equality, `status(_)` wanting a variant test, the
+  two unavailable at once. But that constraint is the thing being changed, not a
+  law. A `status(…)` arm is recognizable **syntactically**, so it can be given
+  pattern semantics while every other arm stays an evaluated expression. The rule:
+
+  > **`status(P)` matches when the subject is a `Value::Status` and its code
+  > matches `P` by the ordinary pattern rules.**
+
+  All three fall out of it, and so does more:
+
+  ```mesh
+  status(0)              # code matches the literal 0
+  status(n)              # `n` binds the code — a binder in a sub-pattern position
+  status(_)              # `_` discards; the arm asks only "is this a status"
+  status(1..=255)        # a range — falls out of the rule, but *not* free: see below
+  status($n)             # a substitution — free only with the unwrap rule below
+  status(status(1))      # a nested constructor — same rule, same reason
+  status(n) if $n > 100  # a guard, free
+  ```
+
+  **A status-valued payload needs one clause of its own** (Codex, #472, twice —
+  the second time to say the clause was written too narrowly): the payload
+  comparison **unwraps a status**, so a payload that *is* a status compares
+  codes. Without that clause it is not free at all. `status_value`
+  (`repl.rs`:5645) carries an explicit identity arm for a status payload, with
+  a comment naming `status($sh.status)` as the case it exists for, and it works
+  today — verified: `n = status(1); match status(1) { status($n) => … }` hits.
+  Under the rule as stated the pattern would match the subject's *code*, an
+  integer, against `$n`, a status — and if [type-strict
+  equality](#comparison-across-types) is chosen those are unequal, so the arm
+  would start missing silently. Unwrapping keeps the behavior the constructor
+  already deliberately provides, and keeps this rule independent of that
+  separate decision rather than quietly depending on it.
+
+  **The clause is about the payload's *value*, not the spelling `$n`**, and an
+  earlier draft wrote it for substitutions alone. A **nested constructor** is
+  status-valued the same way and works today for the same reason — verified:
+  `match status(1) { status(status(1)) => … }` hits, and `status(status(2))`
+  misses, so it is a code comparison rather than an accident. Left to the
+  recursive reading, the inner `status(1)` would be a *pattern* whose variant
+  test runs against the outer subject's code — an integer, never a status — so
+  the arm could not match at all, turning a working spelling into a dead one.
+  Hence: **a payload expression that evaluates to a status is unwrapped to its
+  code, whatever produced it.** In payload position the variant reading is
+  useless anyway, since the slot holds an int by construction, so nothing is
+  lost by resolving the ambiguity this way.
+
+  **Binding is what forces the reading, and that is the honest version of the
+  fork.** Under equality a pattern has to *evaluate to a value* to compare
+  against, so there is nothing to bind from — `status(n)` is not merely awkward
+  there, it is impossible. Wanting the binder at all already commits to the
+  variant test, after which `status(_)` costs nothing extra and `status(0)` keeps
+  working. There is no version of this feature where equality gives you the
+  binder, so there is no trade to weigh.
+
+  **The first of three changes, and this one is a fix rather than a cost.** An
+  *int* subject stops taking a `status(…)` arm. Today it does, so whenever the codes coincide
+  the constructor arm swallows the int and the literal arm below it is dead:
+
+  ```mesh
+  for x in [status(1) 1] {
+    match $x { status(1) => … ; 1 => … ; _ => … }
+  }
+  # today:  status(1) → the status(1) arm
+  #         1         → the status(1) arm as well, so the `1` arm is unreachable
+  ```
+
+  Under the rule above both arms do what they say. mikelward's call on the
+  change: *"that sounds like a good thing."*
+
+  **This is a constructed case, not the document's own example, and an earlier
+  draft claimed it was** (Codex, #472). The collections example under
+  [Comparison across types](#comparison-across-types) is `[status(2) 1]` against
+  the same arms, and the codes there deliberately *differ*: `status(2)` misses the
+  `status(1)` arm and lands on `_`, the int takes the `1` arm, and it runs
+  correctly today. The rule above leaves it running exactly as it does now — a
+  variant test on `status(1)` rejects the int for a second reason, not a
+  different outcome. So this rule neither repairs that passage nor undercuts the
+  argument built on it; what it fixes is the *coincident-code* case above, which
+  that example was written to sidestep.
+
+  **The everyday spelling is untouched.** `match $sh.status { 0 => … }` is a
+  *literal* arm, not a constructor pattern, so it still compares by equality and
+  still matches — verified. This rule reaches only the `status(…)` shape.
+
+  **The second change runs the other way — an invalid operand stops raising, and
+  how far that goes depends on the loudness choice** (Codex, #472, twice: once
+  for the change, once for the condition on it). Today an arm is an evaluated
+  expression, so `status($n)` runs the constructor *before* any comparison and a
+  bad operand raises whatever the subject is: with `n = "x"`, both
+  `match status(1) { status($n) => … ; _ => … }` and the same arm over a string
+  subject report `` the code must be an integer, not a string `` — verified.
+  Under the rule above `$n` becomes a payload *pattern* compared against the
+  subject's code, and the two subjects then part company:
+
+  - A **wrong-variant** subject skips the arm **unconditionally**. The variant
+    test fails first, so the payload is never compared and the invalid operand
+    is never looked at. That is an error becoming a miss under every option.
+  - A **same-variant** subject depends on the mismatch-loudness decision in
+    `TODO.md` §"Decisions needed", and the six options split four/two. Under
+    **A, B, D or F** a string pattern against an int code is an ordinary
+    mismatch, so the arm quietly misses and `_` takes it — an error becoming a
+    miss here too. D belongs with them because it is A and B, and neither
+    propagates a mismatch into arm dispatch. Under **C or E** it does not: those
+    propagate the cross-type refusal into every consumer of the equality, *an arm
+    included*, so the payload comparison aborts and the program stays loud — a
+    different message at a different point, but not quiet.
+
+  **An *out-of-range* operand is a third case, and it goes quiet under every
+  option** (Codex, #472). `status(256)` and `status(-1)` raise
+  `` status must be between 0 and 255 `` today, from the same constructor call
+  that the rule replaces with a pattern — verified against a same-variant
+  subject. Under the rule they become ordinary ints compared against an int
+  code, so they simply never match. **C and E cannot rescue this one**: they
+  propagate a *cross-type* refusal, and `256` against a code is int-against-int,
+  perfectly well-typed and merely unequal. So unlike the type-mismatch case
+  above this is unconditional — six options, one outcome, an error becoming a
+  silent miss.
+
+  **It is the payload's *value* that is out of range, not its spelling** — the
+  same generalization the unwrap clause needed, and missed here for the same
+  reason (Codex, #472). `n = 256; match status(1) { status($n) => … }` raises
+  today, and so does a computed `status((100 + 200))` — both verified. Any
+  payload expression that evaluates to an out-of-range int is in this case.
+
+  The cheap alternative, if that is judged too quiet: keep the range check for a
+  **literal** payload pattern, where it is decidable without running anything —
+  `status(256)` is a pattern that cannot match any status, so rejecting it
+  outright is the same service an unreachable-arm warning would do. Note what
+  that does **not** buy: it leaves `status($n)` and every computed payload
+  exactly as quiet as before, since their range can only be known by evaluating
+  them, so it recovers the spelling most likely to be a typo rather than the
+  case as a whole. It is also a clause on top of "the payload slot is just a
+  pattern", which is why it is recorded as an option rather than folded into the
+  rule.
+
+  **A *range* payload is a third unconditional case, and the only one where an
+  error becomes a **hit*** (Codex, #472). `status(1..=2)` does not raise for a
+  reason about the subject at all: the arm evaluates the range to a **list** and
+  the constructor reports `` the code must be an integer, not a list `` — verified
+  against all three subjects, a same-variant one inside the range, a same-variant
+  one outside it, and a wrong-variant one. Under the rule the range becomes an
+  ordinary payload pattern, so `status(1)` **starts matching** and `status(3)`
+  quietly misses. That makes the spelling listed as "a range, free" above the most
+  expensive of the set rather than the cheapest: free to *specify* — it falls
+  out of "the payload slot is just a pattern" with no extra clause — and not free
+  at all to *adopt*, since every `status(<range>)` arm in existence today is a
+  raise.
+
+  The hit half is worth separating from the rest of this cost. Everywhere else
+  the change turns a raise into a silent miss, which loses a diagnostic; here it
+  turns a raise into a **taken arm**, so a body that has never run in any program
+  starts running. Nothing in the six options touches it either, for the same
+  reason the out-of-range case escapes them: they govern how a comparison fails,
+  and this one now succeeds.
+
+  **A *structural* payload is a fourth case, and it is what shows the list was
+  the wrong shape for this** (Codex, #472). `status([n])` raises today for every
+  subject — verified against a status and against a string, both reporting
+  `` the code must be an integer, not a list `` — while a bare `[n]` arm binds a
+  list subject and quietly misses an int (`match 7 { [n] => … }` misses, verified).
+  So under the rule the list pattern is applied to the integer code and misses on
+  **shape**. C and E do not rescue it and widening them would not be a small
+  change: they propagate the equality operator's *cross-type* refusal, and a list
+  pattern against an int never reaches that comparison — it fails the destructure
+  first. Making this loud means a rule about pattern *shape* against a subject,
+  which is a different mechanism from anything the six options describe.
+
+  **The right way to state this is a rule, not an inventory.** Every one of these
+  cases is the same fact: *a payload expression whose value the constructor does
+  not accept raises today, because the constructor is a constructor.* What it
+  accepts is an **in-range integer or a status** — the second by the deliberate
+  identity arm the unwrap clause above is about, so `status($n)` with a
+  status-valued `$n` hits rather than raising (verified). An earlier draft wrote
+  this as "not an integer" and so claimed a change to the one case this design
+  explicitly preserves (Codex, #472). Under the rule the
+  slot stops being an argument and becomes a pattern, so each such spelling stops
+  raising and starts doing whatever its pattern kind does — and the pattern kind
+  decides the outcome, which is why they differ:
+
+  | Payload | Today | Under the rule |
+  |---|---|---|
+  | wrong-variant subject (any payload) | operand evaluated, may raise | arm skipped before the payload is looked at |
+  | out-of-range int — `status(256)` | raises | quiet miss |
+  | range — `status(1..=2)` | raises (a list) | **hit** inside the range, quiet miss outside |
+  | structural — `status([n])` | raises (a list) | quiet miss on shape |
+  | same-variant type mismatch — `status("x")` | **raises** | quiet miss under A/B/D/F, an abort under C/E |
+  | status-valued — `status($n)`, `$n` a status | hits, by the identity arm | hits, by the unwrap clause — unchanged |
+
+  Only the `status("x")` row depends on the loudness choice. The rest are
+  unconditional, because the six options govern how a *comparison* fails and so
+  never reach a payload that is skipped, succeeds, or fails to destructure — and
+  the last row is not a change at all, listed so the one case this design
+  deliberately preserves is visible beside the ones it alters.
+
+  So the compatibility cost is real and belongs beside the int-subject change.
+  Calling the whole of it *error-to-miss* was the framing that hid the range
+  case, and enumerating cases is what hid the structural one — this entry has now
+  been corrected three times by someone naming a payload spelling the list did
+  not have, which is the signal that the list was never the right object. An
+  earlier draft asserted the cost outright, which contradicted option C's own
+  promise one file over; the draft correcting *that* wrote the conditional half
+  as if it were the only half; and the draft correcting *that* presented three
+  instances as though they were exhaustive.
+
+  Generalizing has its own failure, though, and this table shipped with two of
+  them: stated as one rule it read *"not an integer"*, dropping the status the
+  constructor accepts, and its `status("x")` row said *quiet miss* where the
+  three paragraphs above it correctly say the operand is evaluated and **raises**
+  (both Codex, #472). The enumeration was incomplete; the generalization was
+  wrong about cases the enumeration had right. The fix for a list that keeps
+  growing is a rule, but a rule has to be checked against every instance the list
+  already held.
+
+  **That forces the rule to say when the payload is evaluated, and the answer is
+  *after* the variant test.** The invalid operand is one place the order shows:
+  over a wrong-variant subject, variant-first skips the arm without ever looking
+  at the payload, where payload-first still raises.
+  Variant-first is what the rest of this entry assumes — a constructor pattern is
+  a type test that then constrains the payload — and it is what makes `status(_)`
+  cost nothing beyond the test itself. Written down because leaving it implicit
+  leaves two readings that disagree on a running program.
+
+  **That makes a third change, and it is not about invalid operands at all: a
+  payload expression can have ordinary effects, and the skip discards them**
+  (Codex, #472). The invalid operand is the visible corner of a general case —
+  whatever the payload *does*, a wrong-variant subject stops doing it. Verified
+  against a build, with a payload that is valid and in range:
+
+      func p() {
+        echo "p ran"
+        return status 1
+      }
+
+      match status(1) { status(p()) => "hit" ; _ => "miss" }   # p ran — hit
+      match "x"       { status(p()) => "hit" ; _ => "miss" }   # p ran — miss
+      match 7         { status(p()) => "hit" ; _ => "miss" }   # p ran — miss
+
+  All three print `p ran` today. Under the rule the last two skip the arm at the
+  variant test, so the output stops — as would any state the call mutated. The
+  `7` row is the one to read, because its **answer does not change**: `miss`
+  before and `miss` after, and the only difference is a line the program no
+  longer prints. So this is a different kind of change from any of the three
+  parts of the cost above — nothing was raising, nothing goes quiet, no arm is
+  gained, an effect simply stops happening — and it is unconditional across all
+  six loudness options, which
+  govern how a *comparison* fails and never reach an evaluation that no longer
+  occurs. It shares the second change's *mechanism* — the same wrong-variant
+  skip, as the same-variant row shows by still evaluating the payload — while
+  being a separate cost to weigh, which is why it is counted here rather than
+  folded into the invalid-operand thread above.
+
+  The alternative, if that is judged too costly: restrict a payload pattern to
+  effect-free forms. Note what it takes — mesh cannot decide effect-freedom
+  semantically, since any call may print or mutate, so the restriction has to be
+  syntactic, and **a first draft of it drew the line in the wrong place** (Codex,
+  #472). "Substitutions in" is not safe: a **declared** modifier is the one thing
+  in a word that runs user code (see `TODO.md` §"One pass producing everything
+  the callers ask for"), so `$x:noisy` is a call wearing a substitution's
+  spelling — verified, its body prints on a wrong-variant subject exactly as
+  `status(p())` does, and skipping the arm loses that output the same way. The
+  line that actually holds is **the slot's non-executable forms** — a binder, a
+  discard, a literal, or a plain reference — with no executable modifier chain,
+  and it has to hold *inside* arithmetic too rather than being checked only at
+  the top of the payload. **Naming that set as "references and literals" was a
+  category error** (Codex, #472): under this rule the payload is a *pattern*
+  slot, and a binder is not a reference while `_` is neither a reference nor a
+  literal, so the restriction as first written would have rejected `status(n)`
+  and `status(_)` — the two spellings this entry calls settled. An option that
+  forbids the feature's own core is not a narrower option, it is a different
+  one, and the slip came from describing a pattern slot in the vocabulary of
+  the expression slot it replaces. So the alternative buys less
+  and costs more than it first appeared: it is a second clause on top of "the
+  payload slot is just a pattern", and the clause has to walk the payload rather
+  than name a form. Recorded as an option rather than folded in, for the same
+  reason as the range check above.
+
+  **What it takes to reach the changed case — stated carefully, because an
+  earlier draft overstated it.** That draft said the only route to an int subject
+  was projecting a status with `:code`. That is wrong (Codex, #472): int subjects
+  are everywhere — literals, arithmetic, parsed arguments, ordinary variables —
+  so `match 1 { status(1) => … ; _ => … }` is a perfectly ordinary program whose
+  answer changes.
+
+  The accurate claim is about the *pairing*, not the subject. Reaching the change
+  needs an int subject **and** a `status(…)` arm over it, which is asking a type
+  question the subject cannot satisfy. Two things make that combination rare
+  rather than merely uncommon: every source of a status is already status-typed
+  (`$sh.status` reprs as `status(0)`, `$sh.pipestatus` as `[status(0)]`, and
+  `return status N` likewise), so code that *has* statuses never produces the int
+  side; and code that has ints has no reason to write a `status(…)` arm. Where
+  the two do meet, one of them is a mistake — mikelward's framing is the common
+  version of it, a writer who wrote `$s:code` where they meant `$s`. Today that
+  mistake silently matches; under this rule it silently does not, which is the
+  better of the two silences but is **not** free, and is the one thing to weigh
+  against the fix above.
+
+  **Relation to the loudness decision, now much weaker than an earlier draft
+  claimed.** Under option A of `TODO.md` §"Decisions needed", *How loud should a
+  mismatch be?*, an int and a status stop being equal, so `match 0 { status(0) =>
+  … }` would already not match and the one change above becomes a no-op. That is
+  a tidy interaction, not a dependency: this rule stands on its own either way,
+  and the earlier "settle loudness first" ordering overstated it.
+
+  **How far it generalizes** — the broadest of **three** parts still open. The
+  other two are payload restrictions recorded above and neither is settled:
+  **literal range validation** (*"the cheap alternative, if that is judged too
+  quiet"*), and the **effect-free payload** clause (*"recorded as an option
+  rather than folded in"*). An implementer taking the table below as the whole
+  remainder would build unrestricted payload expressions without noticing either
+  (Codex, #472); this heading claimed to be that whole remainder and was not.
+
+  | Option | For | Against |
+  | --- | --- | --- |
+  | **`status(…)` alone** | One constructor, one slot, no grammar to speak of; `Status` is the type a script routinely takes apart | A named special case, and the next value type with a payload asks for the same thing |
+  | **Every value constructor** | One rule covering the [value calls](#calling-for-a-value-and-lambdas) that build a value from a payload; a reader learns "a constructor call in a pattern destructures it" once. The set is **two** — `status`, and one styled-family pattern, since the variant test is exactly what distinguishes a styled value from the plain string it equals | Needs the set named where the parser can see it; still has to exclude `re` on its own grounds; and `style` / `link` share one variant, so telling them apart needs a *structural* rule the option does not otherwise have |
+  | **Any call is a constructor pattern** *(rejected — kept as the record)* | Rust's shape, no list to maintain | mesh calls are ordinary builtins and functions, not tagged variants, so `f(n)` collides head-on with "call `f` and compare against what it returns" — which is what an arm does today |
+  | **Skip it; add a subject binder instead** *(rejected — kept as the record)* | Strictly more general — see below | Does not answer `status(0)` vs `status(n)` *as arms*; you get the value and pick it apart in the body |
+
+  **Only the first two rows are live** (Codex, #472, twice — the second time
+  because the first fix marked one row rejected and left the other overstated).
+  The **live choice is one member or two**, which is exactly what the
+  settled/open summary at the end of this entry says; the bottom two rows are
+  kept as the record of what was considered, not as options an implementer
+  should still be weighing:
+
+  - ***Any call is a constructor pattern*** is rejected on the collision in its
+    own Against column — `f(n)` would stop meaning "call `f` and compare", which
+    is what every non-constructor arm does today. Nothing else in this entry
+    depends on it.
+  - ***Skip it; add a subject binder instead*** is rejected because skipping
+    would reopen the shape this entry opens by calling settled. It stays because
+    a subject binder is a real thing to want — just a *complement* rather than
+    an alternative, which is why it is also filed as its own deferred gap.
+
+  **`:flag` is why the second row needs its set written down rather than
+  inferred.** "Every value constructor" sounds like it names itself, and it does
+  not: `Flag` is built by the **`:flag` modifier**, deliberately spelled that way
+  *"rather than a `flag()` value call, so it costs no reserved function name, and
+  so the list form falls out of `:map(:flag)`"* (`expand.rs`:61). There is no
+  `flag()` to put in a pattern — the value calls are `re`, `style`, `link`,
+  `glob`, `files`, `dirs` (`is_value_call`, `builtins.rs`:636) and the
+  both-ways builtins are `gets`, `status`, `pwd` — so the candidate set is not
+  "anything that produces a value". Extending this to a modifier-spelled
+  constructor would mean **adding the call form first**, which is a separate
+  design change with its own reserved-name cost, not something this entry can
+  assume. `TODO.md` already carries an item on unifying constructor spelling; if
+  that lands the set grows, and until it does the rule should name its members.
+
+  **The whole candidate set, walked, because "every value constructor" is the
+  option that has to survive it.** These are the six value calls plus the three
+  both-ways builtins, each checked against a build:
+
+  | Call | Builds | What a `…(…)` arm does **today** | Under the rule above |
+  | --- | --- | --- | --- |
+  | `status(…)` | `Status` | a literal comparison | **in** — all three spellings work |
+  | `re(…)` | `Regex` | the regex is **applied to the subject** — `match "abc" { re("a") => … }` hits, exactly as `/a/` does | **out** — the pattern slot is already spent |
+  | `style(…)` | `Styled` | a literal comparison, and it is **equal to its own text** (`style("abc") == "abc"`), so a `style("abc")` arm matches the plain string `"abc"` | **in** — the variant test is the only way to ask "is this styled?"; see the shared-variant note below |
+  | `link(…)` | **also `Styled`** — not a type of its own | the same: `link("text", …) == "text"`, and the arm matches the bare string | **not separable from `style`** — same variant |
+  | `glob` / `files` / `dirs` | a **list** | a literal list comparison | **out** — not wrappers; `[a b]` already destructures a list |
+  | `gets` / `pwd` | a string | a literal comparison | **out** — no payload to bind |
+
+  So the general rule would cover **two** members: `status`, plus a single
+  styled-family pattern.
+
+  **`style` and a link are the *same* variant, which caps the variant reading at
+  two and leaves a question inside the second.** `eval_style` and `eval_link`
+  both return `Value::Styled(Box::new(StyledValue { text, style }))`
+  (`repl.rs`:5497 and :5570), and a link is a *field* on the style —
+  `Style { foreground, background, bold, link: Option<String> }`
+  (`vars.rs`:258) — not a parallel type. They compose, and `eval_link` reads an
+  existing value's style to do it, so `link(style("text", fg: red), …)` is one
+  `Styled` carrying both. A variant test therefore cannot tell which constructor
+  produced a subject, and three readings of a `link(…)` pattern are all
+  defensible: every styled value, only those whose `style.link` is set, or
+  exactly what `style(…)` matches. That has to be settled before the variant
+  reading can claim `link` at all — thanks to Codex on #472, which is also what
+  corrected the count from three. The narrow version is probably right (`link`
+  matches when `style.link` is `Some`, since that is the only thing the spelling
+  could usefully ask), but it is a **structural** rule about a field rather than
+  the variant rule this option is otherwise made of, and that is a second
+  mechanism the general option would have to carry.
+
+  **A second wrinkle in the same member: `style(…)` does not always build a
+  `Styled`.** When no attribute is named, `eval_style` returns a plain
+  `Value::String` — *"a call that named no attribute yields a plain string rather
+  than a styled value with nothing to render — one representation for one
+  meaning, so `style(x) == x` holds by type as well as by value"* (`repl.rs`:5490).
+  So under the rule above `match style("abc") { style(n) => … }` would **not**
+  take the arm, because the subject its own constructor produced is a string.
+  Found by Codex on #472. That is not obviously wrong — an unattributed
+  `style(x)` genuinely *is* just a string, and the pattern asking "is this
+  styled?" answering "no" is consistent with the collapse the code comment
+  describes — but it has to be *stated*, because "the constructor produced it, so
+  the constructor pattern matches it" is the natural expectation and it does not
+  hold here. Another thing the general option owes an answer for, and another
+  reason `status(…)` alone is the cheaper row.
+
+  **`re` is excluded because its pattern meaning is taken.** Reinterpreting
+  `re(n)` as destructuring would either break those arms or make one call shape
+  mean matching in one arm and destructuring in the next, decided by whether the
+  operand happens to be a bare word — precisely the type-dispatched
+  unpredictability the [smartmatch rejection](#matching-match) is about. So it is
+  excluded rather than disambiguated.
+
+  **The styled family is the interesting case, and it inverts a rule an earlier
+  draft stated.** Both spellings have free call forms, so neither collides with
+  `re`'s problem of a *name* already meaning something else in a pattern. But
+  **they do have a behavior collision of their own**, which an earlier draft
+  missed by writing "collides with nothing" (Codex, #472). A bare operand is a
+  working arm today:
+
+  ```mesh
+  match style(red, fg: blue) { style(red) => … }   # matches today
+  ```
+
+  because `style(red)` names no attribute and so evaluates to the plain string
+  `'red'` (the collapse noted above), which the styled subject equals. Under the
+  binder reading `red` is a bare word in a sub-pattern position, so the same arm
+  becomes *"any styled value, bind its text as `red`"* — it stops selecting one
+  value and starts selecting all of them, silently.
+
+  **And quoting the operand does not repair it**, which a first attempt at this
+  paragraph claimed (Codex, #472). `style("red")` is a literal today and matches
+  a *plain string* subject `"red"` — verified — because the whole call collapses
+  to that string. Under the variant test it would demand a `Styled` subject, so
+  the plain-string case stops matching. The behavior-preserving rewrite is
+  therefore to **drop the constructor**: a bare `"red"` arm, which matches the
+  styled value and the plain string alike, exactly as the collapsed call does
+  now. Only where the subject is known to be styled does `style("red")` do. So
+  the styled member also **changes the meaning of arms already written**, on top
+  of its three open questions, and putting them right is a rewrite of the arm
+  rather than a quote character. `status`
+  has no equivalent, since its payloads are integers and the string-case rule
+  leaves `status(0)` alone. Both are also **deliberately
+  equal to their text**, because a styled value "has to behave exactly as its
+  text" (see [Comparison across types](#comparison-across-types), where a styled
+  value and a plain string are the one grouping the type rule keeps). That
+  equality is precisely *why* the pattern would be worth having: a variant test
+  is the only way to ask "is this styled?" of a value that otherwise behaves as
+  its text, and there is no other spelling for that question.
+
+  The withdrawn rule read: *a constructor pattern is worth having only where the
+  constructed type is distinguishable from its payload by equality.* It is
+  **backwards** — a type indistinguishable by equality is the one that most needs
+  a variant pattern, because equality can never ask the question for it. The
+  right statement is the plain one: a constructor pattern is worth having where
+  the constructor names a type you would want to test for, and mesh has two.
+
+  **What is still open, and what is not.** Settled by the rule above: all three
+  `status(…)` spellings, and that binding forces the variant test. Still open:
+
+  1. **One member or two** — `status(…)` alone as a named case, or the general
+     rule that also takes the styled family.
+  2. **If two, the styled member's shape**, which is three questions rather than
+     one and is why that row keeps getting more expensive:
+     - *Which `Styled` subjects a `link(…)` pattern qualifies*, per the
+       shared-variant note above — every styled value, only those whose
+       `style.link` is `Some`, or exactly what `style(…)` matches.
+     - *What its operands are.* `eval_link` takes **two required positionals**,
+       text and url (`repl.rs`:5512) — "because both are required and the pair
+       reads in the order it renders" — so a `link(…)` pattern has to say whether
+       the spelling is `link(t, u)`, whether either slot may be omitted, which of
+       them bind, and whether the **normalized** URL is what a `u` binder sees,
+       since `eval_link` percent-encodes and requires a scheme. None of that is
+       settled by deciding the variant question (Codex, #472).
+     - *And `style`'s own slots*: it takes named options (`style(text, fg: red)`),
+       so a binder there owes an answer for an option slot as well as a
+       positional one.
+  3. **Whether a literal payload keeps its range check** — `status(256)` is
+     decidable without running anything, so rejecting it outright is the one
+     piece of the lost diagnostic that is recoverable statically. Buys nothing
+     for `status($n)` or any computed payload.
+  4. **Whether payload patterns are restricted to effect-free forms** — the
+     slot's non-executable forms, meaning a **binder**, a **discard**, a
+     literal or a plain reference, with no executable modifier chain, checked
+     *inside* arithmetic rather than only at the top of the payload. The
+     binder and discard are load-bearing in that list: leave them out and the
+     restriction rejects `status(n)` and `status(_)`, which item 1 above
+     records as settled (Codex, #472, twice — the second time because this
+     closing copy kept the wording after the paragraph it summarizes was
+     corrected).
+
+  Items 3 and 4 are the two payload restrictions this entry records above as
+  options rather than folding in; a closing list that named only 1 and 2 read as
+  though they had been settled (Codex, #472, twice — once for the mid-entry
+  summary and again for this one). Neither 1 nor 2 is gated on the loudness
+  decision. The earlier draft made that ordering central; it isn't.
+
+  **The subject binder is the real alternative, and it is a separate gap worth
+  recording.** Nothing binds the *subject* of a `match` in any arm: a top-level
+  bare word is a literal, so `s => "error $s"` matches the string `"s"` and a
+  guard has nothing to name (`s if $s != status(0)` is likewise testing the
+  literal). Today the answer is to bind before the `match`:
+
+  ```mesh
+  s = f()
+  match $s { 0 => "ok" ; _ => "error $s" }     # works today
+  ```
+
+  which is fine when the subject has a name to give it and useless when it does
+  not — `match $args:get(0) { … }` is the same nowhere-to-hang-it problem the
+  flag entry solves by binding in the arm. Whether that wants Rust's `name @
+  pattern`, a `match expr as s { … }` header, or nothing at all is **deferred**;
+  it is noted here so the two are not conflated. A constructor pattern binds a
+  *payload*, a subject binder names the *whole value*, and the example above
+  wants the first.
+
+  Two smaller things this has to settle, neither of them blocking:
+
+  - **Which name the binder introduces** — and this is an *inherited* question,
+    not one this entry opens. Under the [`_`-prefixed
+    locals](#variables-and-assignment) proposal a binding created inside a
+    function body must be `_`-prefixed with no exemption, so a binder there would
+    be `status(_n)`, read as `$_n`. Every arm binder already written down
+    (`--verb=n`, `[cmd ...rest]`) takes the plain form and would need the same
+    answer, so whatever settles those settles this. Bare `_` is unaffected: it
+    already "stays the discard", which is exactly what `status(_)` above needs.
+  - **Arm order is unchanged**: first-win, so `status(0)` precedes `status(n)`
+    the way `--verb="max"` precedes `--verb=n`, and a binder placed above a
+    literal shadows it. That is the existing rule, not a new one.
 
 **`~` and `match` share one pattern vocabulary, but `~` is a strict subset** *(current
 M3 behavior)*. For a **string** subject and a **glob or regex** pattern,
