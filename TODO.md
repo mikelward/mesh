@@ -5495,18 +5495,25 @@ thing a reader takes on trust.*
 ## Beyond M3 — Declared return types (`int func f()`)
 
 Decided in design discussion; see `docs/DESIGN.md` §"Open questions", the
-`proc` / `func` entry. Nothing here is built. A `func` may declare a return
-type; one that declares none has **no value channel** and its result is a
-`Status`. This is the next implementation task after the design PR that recorded
-it.
+`proc` / `func` entry. A `func` may declare a return type; one that declares
+none has **no value channel** and its result is a `Status`.
 
-**The spelling to build is the prefix, `int func f()`** — a word before `func` is
-the slot `wrapper func` and `fork func` already use. The postfix `func f() int`
-is the fallback if the prefix turns out badly in the hand; the design entry
-records what each costs, and the honest summary is that the prefix reads better
-and the postfix parses cheaper. Build one, then look at it.
+**The declaration is built; the narrowing is not.** Parsing, the closed
+vocabulary, the `float` reservation, the outermost prefix ordering, typed
+lambdas, and reporting through `help` and `type` have all landed — so a typed
+definition parses, carries its type, and prints it. What has *not* landed is the
+part the type is for: a typeless `func f() { 42 }` still has its value channel,
+so `x = f()` still binds `42`. The narrowing and its checks are the remaining
+work, and they are what the unchecked items below cover.
 
-- [ ] **The type vocabulary is `status`, `int`, `str`, `bool`, `list`, `map`** —
+**The spelling built is the prefix, `int func f()`**, type outermost — a word
+before `func` is the slot `wrapper func` and `fork func` already use. The postfix
+`func f() int` stays the fallback if the prefix reads badly in use; the design
+entry records what each costs.
+
+- [x] **The type vocabulary is `status`, `int`, `str`, `bool`, `list`, `map`** —
+      *(landed — `ReturnType` in `parser.rs`, closed at exactly this set plus
+      `value`; the sub-items below record what each one cost.)*
       short forms, since `int` is already the language's word (`:int` parses one)
       and `string` would be the odd one out beside it. The prefix form recognizes
       `WORD func NAME (`, so the parser needs this set closed up front; the
@@ -5515,8 +5522,13 @@ and the postfix parses cheaper. Build one, then look at it.
       with a live command word and `status 5` has to keep working. That is
       `fork`'s problem exactly and `fork`'s solution applies — match the shape,
       never the bare word.
-      - [ ] **Reserve `float` in the same change that closes the set, without
-            implementing it.** `f64` exists as a value; declaring one is later
+      - [x] **Reserve `float` in the same change that closes the set, without
+            implementing it.** *(landed — `RESERVED_TYPE_WORDS`, refused with a
+            diagnostic saying the word is spoken for. The **position** is what is
+            reserved, not the word: a command called `float`, a variable of that
+            name, and `func float() { … }` all keep working, since claiming the
+            word outright would break scripts today for a type that does not
+            exist yet.)* `f64` exists as a value; declaring one is later
             work. Claiming the word now is what keeps that later addition a
             feature instead of a break — nothing else may take the name in the
             meantime. Reserving costs one entry and a diagnostic saying the type
@@ -5544,8 +5556,8 @@ and the postfix parses cheaper. Build one, then look at it.
       - [ ] **User-defined types are not a goal** — the set is closed on purpose.
             Recorded here so the next reader treats it as the boundary that keeps
             this a check rather than a type system, not as a gap to fill.
-- [ ] **Settle where the type sits relative to what already shares its slot —
-      decide this before writing the parser, not during.** Wrappers return rich
+- [x] **Settle where the type sits relative to what already shares its slot.**
+      *(settled — type outermost, `int wrapper func f()`.)* Wrappers return rich
       values today (`wrapper func g(...xs) { return $xs }` yields a list through
       `g(--foo.bar=v)`; `wrapper func w(...rest) { $rest:join("|") }` a string,
       both in `crates/mesh/tests/cli.rs`), so the narrowing reaches them and each
@@ -5637,11 +5649,13 @@ and the postfix parses cheaper. Build one, then look at it.
       it. So validate the resolved definition's return channel at dispatch too.
       A lambda has no such gap — it is the body it was written with — which is
       why the eager check is still worth having.
-- [x] **`help` prints the declared type.** *(landed — `FuncDef::help` emits a
-      `Returns:` line for a declared type and nothing for a func without one,
-      since a line reading `status` there would advertise a value channel the
-      function has not got. Reached through `f --help`.)* Still to do: `type` /
-      `whence` reporting it alongside the signature.
+- [x] **`help` and `type` print the declared type.** *(landed — `FuncDef::help`
+      emits a `Returns:` line for a declared type and nothing for a func without
+      one, since a line reading `status` there would advertise a value channel
+      the function has not got; `whence::signature` prefixes the type onto the
+      reconstructed definition, `int func answer()`, and `whence::shape` answers
+      `a function returning str` for a lambda held in a variable. Reached through
+      `f --help` and `type f`.)*
 - [ ] **A malformed multiline *lambda* body runs at top level.** Found in review
       of the typed-header work and **preexisting** — `x = func() { puts "\z"`
       followed by `puts LEAKED` prints `LEAKED` on `origin/main`, and the typed

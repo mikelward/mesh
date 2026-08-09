@@ -829,6 +829,12 @@ enum Callable {
         /// impossible (`DESIGN.md` §"Calling for a value, and lambdas").
         captured: Vec<(String, Value)>,
         body: crate::parser::Source,
+        /// `str func() { … }` — the declared return type, `None` for a lambda
+        /// that declares none. Carried onto the *callable* rather than left on
+        /// the expression because a hook slot receives the value, not the syntax:
+        /// `$sh.prompt.dir` has to tell a handler with a value channel from one
+        /// run for effect, and by then the AST is gone.
+        return_type: Option<crate::parser::ReturnType>,
     },
     /// A bare `:name` reference — the function that applies that modifier to its
     /// one argument. Held as the name rather than a synthesized lambda body: there
@@ -854,12 +860,22 @@ impl FuncValue {
         params: Vec<crate::parser::Param>,
         captured: Vec<(String, Value)>,
         body: crate::parser::Source,
+        return_type: Option<crate::parser::ReturnType>,
     ) -> Self {
         Self(Arc::new(Callable::Lambda {
             params,
             captured,
             body,
+            return_type,
         }))
+    }
+
+    /// The declared return type, when this is a written lambda that declares one.
+    pub fn return_type(&self) -> Option<crate::parser::ReturnType> {
+        match &*self.0 {
+            Callable::Lambda { return_type, .. } => *return_type,
+            Callable::Modifier(_) | Callable::Named(_) => None,
+        }
     }
 
     pub fn modifier(name: String) -> Self {
@@ -877,6 +893,7 @@ impl FuncValue {
                 params,
                 captured,
                 body,
+                ..
             } => Some((params, captured, body)),
             Callable::Modifier(_) | Callable::Named(_) => None,
         }
