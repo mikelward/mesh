@@ -314,6 +314,10 @@ pub enum ParseErrorKind {
     /// argument list; a modifier's subject arrives through `$x:`, so the two
     /// markers have no combined reading rather than one that has to be guessed at.
     WrapperModifier,
+    /// `float func f() { … }` — a type word the language reserves but does not
+    /// yet accept. Reported here rather than left to read as a command called
+    /// `float`, so the message can say the word is spoken for.
+    ReservedTypeName(String),
     /// A modifier subject written as anything but a plain name or a `...rest` —
     /// `func _s = "x":name()`, `func --s:name()`. The subject is supplied by the
     /// call site, so it can be neither defaulted nor named as a flag.
@@ -475,6 +479,11 @@ impl std::fmt::Display for ParseError {
                 f,
                 "syntax error: a modifier cannot be a `wrapper func`; its subject comes \
                  from `$x:`, not from an argument list to forward"
+            ),
+            ParseErrorKind::ReservedTypeName(name) => write!(
+                f,
+                "syntax error: `{name}` is reserved as a return type but is not \
+                 available yet; a `func` that returns one has no spelling today"
             ),
             ParseErrorKind::ModifierSubjectDefault(name) => write!(
                 f,
@@ -733,6 +742,11 @@ pub enum Executable {
         /// which takes the whole collection; anything else takes one element and
         /// is called per element over a list.
         subject: Option<Param>,
+        /// `int func f() { … }` — the declared return type, `None` for a `func`
+        /// that declares none. The absence is the meaningful case: it is what says
+        /// the function has no value channel, so this stays an `Option` rather
+        /// than defaulting to [`ReturnType::Status`].
+        return_type: Option<ReturnType>,
     },
     If(IfExpr),
     Match(MatchExpr),
@@ -804,6 +818,62 @@ pub struct Param {
     pub name: String,
     pub kind: ParamKind,
 }
+
+/// A declared return type — the `int` of `int func f() { … }`
+/// (`DESIGN.md` §"Open questions", the `proc` / `func` entry).
+///
+/// The set is **closed on purpose**: user-defined types are not a goal, and a
+/// closed set is what lets the prefix spelling be recognized at all, since the
+/// parser has to know a type word on sight to tell `int func f()` from a command
+/// called `int`. Absence is the meaningful case — a `func` that declares no type
+/// has no value channel — so this is carried as an `Option` everywhere rather
+/// than defaulted to [`ReturnType::Status`], which would lose the distinction
+/// between "said nothing" and "said status" that diagnostics want back.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReturnType {
+    Status,
+    Int,
+    Str,
+    Bool,
+    List,
+    Map,
+}
+
+impl ReturnType {
+    /// The word as written, for diagnostics and `help`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ReturnType::Status => "status",
+            ReturnType::Int => "int",
+            ReturnType::Str => "str",
+            ReturnType::Bool => "bool",
+            ReturnType::List => "list",
+            ReturnType::Map => "map",
+        }
+    }
+
+    /// Read a type word, or `None` if it is not one.
+    fn from_word(word: &str) -> Option<Self> {
+        match word {
+            "status" => Some(ReturnType::Status),
+            "int" => Some(ReturnType::Int),
+            "str" => Some(ReturnType::Str),
+            "bool" => Some(ReturnType::Bool),
+            "list" => Some(ReturnType::List),
+            "map" => Some(ReturnType::Map),
+            _ => None,
+        }
+    }
+}
+
+/// Type words the parser recognizes in a declaration but does not yet accept.
+///
+/// `float` is **reserved rather than implemented** (`DESIGN.md`): `f64` exists as
+/// a value, declaring one is later work, and claiming the word now is what keeps
+/// that addition a feature instead of a break. Recognized here so
+/// `float func f()` is a diagnostic saying so, rather than parsing as a command
+/// called `float` and failing somewhere less helpful.
+const RESERVED_TYPE_WORDS: &[&str] = &["float"];
 
 /// The four signature roles a parameter can play (`DESIGN.md` §"Functions").
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3138,12 +3208,25 @@ impl Parser<'_> {
         if self.word("alias") && self.alias_definition_follows() {
             return self.alias_def();
         }
+        // Contextual for the same reason `wrapper` is, and by the same test: a
+        // type word leads a definition only where `func` (or `wrapper func`)
+        // follows it, so `status 5` stays the builtin call and `int` stays an
+        // ordinary command word. The type is written **outermost** —
+        // `int wrapper func f()` — reading as "an int-returning wrapper func".
+        if let Some(declared) = self.typed_definition_lead()? {
+            self.position += 1;
+            if self.word("wrapper") && self.word_at(1, "func") {
+                self.take_word("wrapper");
+                return self.function(true, Some(declared));
+            }
+            return self.function(false, Some(declared));
+        }
         // Contextual, like `fork`: `wrapper` leads a definition only where `func`
         // follows it, so a command or variable of that name is still reachable as
         // `wrapper`, `wrapper --flag`, or `wrapper = 1`.
         if self.word("wrapper") && self.word_at(1, "func") {
             self.take_word("wrapper");
-            return self.function(true);
+            return self.function(true, None);
         }
         if self.word("func")
             && !self
@@ -3151,7 +3234,7 @@ impl Parser<'_> {
                 .get(self.position + 1)
                 .is_some_and(|token| matches!(token.value, TokenKind::LParen))
         {
-            return self.function(false);
+            return self.function(false, None);
         }
         if self.word("if") {
             return Ok(Executable::If(self.if_expr()?));
@@ -4046,10 +4129,49 @@ impl Parser<'_> {
             // An alias desugars to a `wrapper func`, and a wrapper cannot be a
             // modifier — there is no `alias _s:name =` spelling to reach this.
             subject: None,
+            // An alias forwards to a command, whose result is a `Status` anyway,
+            // so it declares nothing and there is no `alias` spelling that could.
+            return_type: None,
         })
     }
 
-    fn function(&mut self, wrapper: bool) -> Result<Executable, ParseError> {
+    /// Does a **typed** definition start at the cursor — `int func f(`, or
+    /// `int wrapper func f(`?
+    ///
+    /// Answers without consuming anything, and only on the complete shape, which
+    /// is what keeps every type word an ordinary name everywhere else: `status 5`
+    /// is the builtin, `int = 1` an assignment, `list` a command. That is `fork`'s
+    /// rule rather than `global`'s — recognize the construct, never the bare word
+    /// (`DESIGN.md` §"Open questions", the `proc` / `func` entry).
+    ///
+    /// A [reserved](RESERVED_TYPE_WORDS) word in the same position is an error
+    /// rather than a decline, so `float func f()` says the word is spoken for
+    /// instead of failing later as a command called `float`.
+    fn typed_definition_lead(&self) -> Result<Option<ReturnType>, ParseError> {
+        let Some(word) = self.word_text_at(0) else {
+            return Ok(None);
+        };
+        // `func` must follow, directly or past a `wrapper`, and a definition needs
+        // a name after it — `int func` alone is a command called `int`.
+        let leads = (self.word_at(1, "func") && self.word_text_at(2).is_some())
+            || (self.word_at(1, "wrapper")
+                && self.word_at(2, "func")
+                && self.word_text_at(3).is_some());
+        if !leads {
+            return Ok(None);
+        }
+        if RESERVED_TYPE_WORDS.contains(&word) {
+            let name = word.to_string();
+            return Err(self.error(ParseErrorKind::ReservedTypeName(name)));
+        }
+        Ok(ReturnType::from_word(word))
+    }
+
+    fn function(
+        &mut self,
+        wrapper: bool,
+        return_type: Option<ReturnType>,
+    ) -> Result<Executable, ParseError> {
         self.take_word("func");
         // `func _s:shorten()` — a modifier declaration, read before the name
         // because the subject is written *first*, left of the colon. Absent for
@@ -4103,6 +4225,7 @@ impl Parser<'_> {
             body,
             wrapper,
             subject,
+            return_type,
         })
     }
 
@@ -7971,6 +8094,84 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn parses_a_return_type_only_before_a_complete_definition() {
+        // The type is written outermost, reading as "an int-returning wrapper
+        // func", and both markers survive together.
+        for (source, expected, is_wrapper) in [
+            ("int func f() { 1 }", ReturnType::Int, false),
+            ("status func f() { cmd }", ReturnType::Status, false),
+            ("str func f() { \"x\" }", ReturnType::Str, false),
+            ("bool func f() { true }", ReturnType::Bool, false),
+            ("list func f() { [1] }", ReturnType::List, false),
+            ("map func f() { [a: 1] }", ReturnType::Map, false),
+            ("int wrapper func f(...xs) { 1 }", ReturnType::Int, true),
+        ] {
+            let tree = complete(source);
+            let Executable::Function {
+                return_type,
+                wrapper,
+                ..
+            } = &tree.statements[0].and_or.first
+            else {
+                panic!("expected a function definition for {source}")
+            };
+            assert_eq!(*return_type, Some(expected), "{source}");
+            assert_eq!(*wrapper, is_wrapper, "{source}");
+        }
+
+        // Declaring nothing is the meaningful absence, not a defaulted `status`.
+        let plain = complete("func f() { 1 }");
+        let Executable::Function { return_type, .. } = &plain.statements[0].and_or.first else {
+            panic!("expected a function definition")
+        };
+        assert!(return_type.is_none());
+    }
+
+    #[test]
+    fn a_type_word_is_only_a_type_in_front_of_a_definition() {
+        // `fork`'s rule, not `global`'s: the construct is recognized, never the
+        // bare word, so every type name stays an ordinary command and name.
+        for source in [
+            "status 5",
+            "int",
+            "list --flag x",
+            // `func` with no name after it is a command called `int`, not a
+            // half-written definition.
+            "int func",
+        ] {
+            let tree = complete(source);
+            assert!(
+                matches!(tree.statements[0].and_or.first, Executable::Pipeline(_)),
+                "{source} should stay a command"
+            );
+        }
+
+        // And a type word is still a legal function name.
+        let named = complete("func int() { puts hi }");
+        let Executable::Function { name, .. } = &named.statements[0].and_or.first else {
+            panic!("expected a function definition")
+        };
+        assert_eq!(name, "int");
+    }
+
+    #[test]
+    fn a_reserved_type_word_is_refused_rather_than_read_as_a_command() {
+        // `float` is claimed now so adding the type later is a feature rather
+        // than a break; the diagnostic has to say so, not fail as a command.
+        let error = parse("float func f() { 1 }").expect_err("float is reserved");
+        assert!(
+            error.to_string().contains("reserved as a return type"),
+            "{error}"
+        );
+        // Reserved only in the type position — the word is otherwise ordinary.
+        let command = complete("float 1.5");
+        assert!(matches!(
+            command.statements[0].and_or.first,
+            Executable::Pipeline(_)
+        ));
+    }
+
     /// The word pieces of a single-command body, span-free so a synthesized body
     /// can be compared against a parsed one.
     fn body_words(body: &Source) -> Vec<Vec<WordPiece>> {
@@ -8003,12 +8204,17 @@ mod tests {
             body,
             wrapper,
             subject,
+            return_type,
         } = &sugar.statements[0].and_or.first
         else {
             panic!("expected a function definition")
         };
         assert!(wrapper);
         assert!(subject.is_none(), "an alias is not a modifier declaration");
+        assert!(
+            return_type.is_none(),
+            "an alias forwards to a command, so it declares no return type"
+        );
         assert_eq!(name, "co");
         // Sugar for the hand-written form, which has no list either unless one is
         // written: `alias` does not bake anything on its own.

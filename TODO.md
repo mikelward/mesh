@@ -9,6 +9,30 @@ file as tasks land.
 Calls autopilot made without asking, each one chosen for being cheap to undo.
 Delete an entry once you have agreed with it or reversed it.
 
+- [ ] **The typed-func implementation rides the same branch as the design
+      commit** rather than merging the design PR and cutting a fresh one. The PR
+      title drops its `design:` prefix as soon as behavior changes, which is the
+      documented handling for a branch carrying both. *Why not the alternative:*
+      the sandbox pins the branch name, so a post-merge fresh branch is not
+      available, and resetting a pinned merged branch is the one in-loop action
+      autopilot is told to ask about. *Reversible:* the commits split cleanly at
+      `bd7545d` if you would rather land the design alone.
+- [ ] **Type words are recognized by shape in the parser, not added to
+      `RESERVED_WORDS`.** `typed_definition_lead` matches `WORD func NAME (`, so
+      `status`/`int`/`str`/`bool`/`list`/`map` keep every other meaning they have
+      — command word, function name, variable. *Alternative:* listing them as
+      `Claim::Contextual`, which would also put them in `help`'s coverage and
+      `whence`'s keyword answer, claiming a vocabulary the language does not
+      otherwise have. *Reversible:* the table is the one place that would change.
+- [ ] **`float` is reserved only in the type position.** `float func f()` is
+      refused; a command called `float`, a variable, and `func float() { … }` all
+      still work. *Alternative:* claiming the word outright, which is a breaking
+      change today for a type that does not exist yet. *Reversible:* widening the
+      claim later is one entry in the same table.
+- [ ] **The type is written outermost — `int wrapper func f()`.** Reads as "an
+      int-returning wrapper func", adjectives before the noun. *Alternative:*
+      `wrapper int func f()`. *Reversible:* one lookahead in
+      `typed_definition_lead`, before anything is written in this spelling.
 - [ ] **`exit` reads a word, not a value, which answers the design's open
       question by omission.** The question was whether `exit` should accept a
       `Status` the way `fail` does; nothing had to, because `exit` reads its
@@ -5492,7 +5516,12 @@ and the postfix parses cheaper. Build one, then look at it.
       type outermost on the prefix (`int wrapper func f()` reads as "an
       int-returning wrapper func"), type before `with` on the postfix (the type is
       part of the interface; `with` is about the environment).
-- [ ] **Parse the marker.** `parser.rs` `executable()` already reads a two-word
+- [x] **Parse the marker.** *(landed — `ReturnType` in `parser.rs`,
+      `typed_definition_lead` recognizing `WORD func NAME (` and
+      `WORD wrapper func NAME (` by shape so no type word is claimed outside a
+      definition, carried through `Executable::Function` and `FuncDef` as an
+      `Option`, and `float` refused via `RESERVED_TYPE_WORDS`. Nothing narrows
+      yet, so this step is purely additive.)* `parser.rs` `executable()` already reads a two-word
       lead-in for `wrapper` (`self.word("wrapper") && self.word_at(1, "func")`);
       a type name is the same test against the closed set above, extended to
       whatever the item above settles. Carry it on `Executable::Function` beside
@@ -5509,11 +5538,16 @@ and the postfix parses cheaper. Build one, then look at it.
       fix: declare a type.
 - [ ] **Static check: a declared type the body cannot produce.** A bare `return`,
       or a tail that is a command, in a func that declares a type. Same locality.
-      **Scope the rejection to types a `Status` does not satisfy** — a command
-      tail produces exactly a `Status(n)`, so it is right for a declared `status`
-      and wrong only for an `int`, a `str`, and the rest. Getting this backwards
-      would make `status func ips() { … }` unwritable, which is the very
-      equivalence the design entry opens with.
+
+      **Both halves are scoped to types a `Status` does not satisfy**, and neither
+      fires for a declared `status`. A command tail produces exactly a `Status(n)`,
+      so it is right for `status` and wrong only for `int`, `str`, and the rest. A
+      bare `return` carries the result so far with the **last status**
+      (`docs/REFERENCE.md` §Functions) — "stop here, as if the body ended at this
+      line" — which is likewise right for `status` and only a problem where a
+      declared type needs a value the result-so-far may not hold. Getting either
+      backwards makes `status func ips() { … }` unwritable, and the equivalence
+      between it and the typeless form is what the design entry opens with.
 - [ ] **Static check: a literal `return` operand against the declared type.**
       `int func f() { return "hi" }`. **Only where the operand is a literal** —
       `return $x` is unanswerable while variables are untyped, and that limit is
@@ -5540,9 +5574,11 @@ and the postfix parses cheaper. Build one, then look at it.
       it. So validate the resolved definition's return channel at dispatch too.
       A lambda has no such gap — it is the body it was written with — which is
       why the eager check is still worth having.
-- [ ] **`help` and `type` print the declared type.** It is part of the signature a
-      caller reads; `FuncDef::help` builds the `Usage:` line and completion is
-      built from that text.
+- [x] **`help` prints the declared type.** *(landed — `FuncDef::help` emits a
+      `Returns:` line for a declared type and nothing for a func without one,
+      since a line reading `status` there would advertise a value channel the
+      function has not got. Reached through `f --help`.)* Still to do: `type` /
+      `whence` reporting it alongside the signature.
 - [ ] **Migrate the docs and the ported configs.** `TOUR.md`, `REFERENCE.md`,
       `INTRO.md` and `prelude.mesh` all contain funcs written under the union.
       Most are typeless and stay as they are; the ones whose value is taken need a
