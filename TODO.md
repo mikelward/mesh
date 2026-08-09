@@ -17,6 +17,33 @@ Delete an entry once you have agreed with it or reversed it.
       available, and resetting a pinned merged branch is the one in-loop action
       autopilot is told to ask about. *Reversible:* the commits split cleanly at
       `bd7545d` if you would rather land the design alone.
+- [ ] **`value` was renamed to `any`, and this one genuinely needs your
+      confirmation** — the repo owner said "go with 1 for now, needs
+      confirmation later". *Why it was not a free choice:* `value` is `return`'s
+      channel word, so `return value func() { … }` silently produced an untyped
+      lambda while `return str func() { … }` worked. Disambiguating by shape was
+      the alternative — `channel_word` already declines when a `(` abuts, so a
+      second special case would fit — but that spends a rule to keep a word we
+      would rather not have picked. *Reversible:* it is `ReturnType::from_word`,
+      `as_str`, `TYPE_MARKER_WORDS`, the grammar and design lines, and whatever
+      has been written against it by then — which is why doing it now was
+      cheaper than later.
+
+      *`docs/TYPES.md` was migrated with the rest, and the first read of it
+      here was wrong.* It landed on `main` as `2f0eadf` while this branch was
+      in review, and its title — "options for a simpler end state" — reads as a
+      proposal, which is how it was first classified and waved past. Its header
+      says the opposite: "**§5 (L3) went first and has landed**", written in
+      the "**shipped spellings**", with a table recording `value func` as the
+      shipped one and `any` as rejected, a closed set naming `value`, and
+      "the narrowing itself … is not enforced yet". All three are false after
+      this branch, so it is documentation of shipped state and migrates on the
+      same rule as every other doc here. Codex caught the misread; the docs
+      suite could not, because `is_design_document` excludes `TYPES.md` exactly
+      as it excludes `DESIGN.md`. The `§5 argued / Shipped` row keeps your
+      original reasoning verbatim — `any` "reads as a claim about a type system
+      this deliberately is not" — and records the reversal against it rather
+      than overwriting it, because that is the call still open here.
 - [ ] **Type words stay contextual — they are *not* becoming reserved words.**
       Raised directly by the repo owner ("make them reserved words if it's useful
       for simplicity") and decided here on the "if". `typed_definition_lead`
@@ -475,7 +502,7 @@ Delete an entry once you have agreed with it or reversed it.
       exist to ask about the link itself; `:type` is the only one that errors on a
       missing path, since there is no word to report.
 - [x] A bare `:mod` reference as a callable value — `$files:filter(:exec)` for
-      `$files:filter(func(f) { $f:exec })`, the equivalence `DESIGN.md` states.
+      `$files:filter(bool func(f) { $f:exec })`, the equivalence `DESIGN.md` states.
       Argument-free **value** modifiers only: `:join` needs a separator, `:map` a
       callable, and `:capture` wraps an invocation, so none is a one-argument
       function and naming one is loud — `:capture` at the point the reference is
@@ -1704,7 +1731,7 @@ the checkable list.
         rule: it feeds `render_prompt_indicator` while every line above comes
         from `preprompt` hooks, which `docs/REFERENCE.md` already spells out as
         "controls only the input indicator". Writing one key also keeps one
-        meaning per key — `$sh.prompt.char = func() { … }` and `prompt "$ "` are
+        meaning per key — `$sh.prompt.char = str func() { … }` and `prompt "$ "` are
         the same slot, last write wins, with no second mechanism to reason about.
         The continuation prompt derives from `char` as it derives from the custom
         text today.
@@ -2983,7 +3010,7 @@ designed, and the cross-references say where the fuller note lives.
         parser claims as a statement can still be called as a value:
 
         ```
-        func while() { return OK }; x = while(); puts $x     # OK
+        str func while() { return OK }; x = while(); puts $x     # OK
         ```
 
         Same for `loop`, `break`, `continue`, `global`, `unset`, `export`. And
@@ -5498,22 +5525,26 @@ Decided in design discussion; see `docs/DESIGN.md` §"Open questions", the
 `proc` / `func` entry. A `func` may declare a return type; one that declares
 none has **no value channel** and its result is a `Status`.
 
-**The declaration is built; the narrowing is not.** Parsing, the closed
+**The declaration and the narrowing are both built.** Parsing, the closed
 vocabulary, the `float` reservation, the outermost prefix ordering, typed
-lambdas, and reporting through `help` and `type` have all landed — so a typed
-definition parses, carries its type, and prints it. What has *not* landed is the
-part the type is for: a typeless `func f() { 42 }` still has its value channel,
-so `x = f()` still binds `42`. The narrowing and its checks are the remaining
-work, and they are what the unchecked items below cover.
+lambdas, and reporting through `help` and `type` landed first — so a typed
+definition parses, carries its type, and prints it. The narrowing followed: a
+typeless `func f() { 42 }` no longer has a value channel, and `x = f()` binds
+`status(0)` — exactly what a bare `f` leaves. The migration is done too, in the
+same commit. What remains is the **checks** — the three static ones, the runtime
+warning, and the hook slots — plus two items that are not checks at all and are
+flagged as such below: the preexisting malformed-multiline-body leak, and making
+`:repr` print a function.
 
 **The spelling built is the prefix, `int func f()`**, type outermost — a word
 before `func` is the slot `wrapper func` and `fork func` already use. The postfix
 `func f() int` stays the fallback if the prefix reads badly in use; the design
 entry records what each costs.
 
-- [x] **The type vocabulary is `status`, `int`, `str`, `bool`, `list`, `map`** —
-      *(landed — `ReturnType` in `parser.rs`, closed at exactly this set plus
-      `value`; the sub-items below record what each one cost.)*
+- [x] **The type vocabulary is `status`, `int`, `str`, `bool`, `list`, `map`,
+      `any`** — *(landed — `ReturnType` in `parser.rs`, closed at exactly this
+      set; the sub-items below record what each one cost. `any` was spelled
+      `value` until the narrowing landed — see the rename below.)*
       short forms, since `int` is already the language's word (`:int` parses one)
       and `string` would be the odd one out beside it. The prefix form recognizes
       `WORD func NAME (`, so the parser needs this set closed up front; the
@@ -5542,24 +5573,25 @@ entry records what each costs.
             no `job` in the vocabulary and none wanted. No concrete spelling fits
             an identity function — what it returns is whatever it was given — so
             this is the true answer rather than an escape from giving one.
-      - [ ] **Consider renaming `value` to `any`.** Both were judged good;
-            `value` went first because it is the design's own word for the
-            channel, where `any` is the conventional gradual-typing spelling and
-            reads as a claim about a type system this deliberately is not. Worth
-            revisiting once there is real code written against it — the argument
-            for `any` is that readers arrive knowing it, and that is the kind of
-            thing only use settles. A rename is a one-word change in
-            `ReturnType::from_word`, `as_str`, and `TYPE_MARKER_WORDS`, plus
-            whatever has been written in the meantime.
+      - [x] **Renamed `value` to `any`.** *(done — needs confirmation, see
+            `Decisions needing review`.)* The argument that decided it is
+            structural rather than stylistic: **`value` is already `return`'s
+            channel word**, so `return value func() { … }` parsed the marker as
+            the channel and handed back an *untyped* lambda. `return str func()`
+            was fine; only the one spelling collided, and it collided in the
+            position that matters most for the hook slots this feature exists to
+            serve. `any` has no such clash — `return any func() { … }` keeps its
+            type. The older argument still stands beside it: readers arrive
+            knowing `any`.
       - [ ] Still open: whether a compound kind is writable at all (`list`, or a
             list of what).
-      - [ ] **Open decision: is there a `job` type — and if not, why is `value`
+      - [ ] **Open decision: is there a `job` type — and if not, why is `any`
             the answer?** Asked directly by the repo owner, twice, and not
             actually settled either time. A **job is a real value kind**: `$j`
             is one, `$j.status` reads it, and `$sh.jobs` is a map of job
             records, so `job func find-server()` is a sentence someone could
             reasonably want to write. Leaving it out means such a function
-            declares `value`, which is true but says less than the truth.
+            declares `any`, which is true but says less than the truth.
 
             **The reason it was not added is a boundary question, not a
             judgment about jobs**, and that is the part worth deciding. The
@@ -5571,13 +5603,13 @@ entry records what each costs.
             for the next. If the set is instead "the kinds worth naming at a
             function boundary", then `job` earns its place on use, not on
             existence — and nothing in the tests wanted it except an identity
-            function, for which `value` is the *correct* answer rather than a
+            function, for which `any` is the *correct* answer rather than a
             fallback, since what it returns is whatever it was given.
 
             So: pick the rule, and `job` follows from it. Adding it later is a
             feature, not a break — it costs one `ReturnType` entry, one word in
             `TYPE_MARKER_WORDS`, and nothing else — so deferring is cheap and
-            reversible, which is why the migration used `value` rather than
+            reversible, which is why the migration used `any` rather than
             waiting. What is *not* cheap is adding kinds one at a time without
             the rule, which is how a closed set stops being one.
       - [ ] **User-defined types are not a goal** — the set is closed on purpose.
@@ -5611,12 +5643,25 @@ entry records what each costs.
       `wrapper` / `subject`, and on `FuncDef` in `funcs.rs`. A lambda takes it
       too — `str func() { … }` — since the hook-slot resolution below depends on
       it.
-- [ ] **Narrow the value channel.** A `func` with no declared type results in a
+- [x] **Narrow the value channel.** *(landed — `run_call_body_for_value` in
+      `repl.rs` maps the outcome against the callee's declared type, reaching
+      every call shape: named calls, lambdas, `&name` references, declared
+      modifiers, and the per-element higher-order call. Migration in the same
+      commit, `crates/` and `prelude.mesh` and the prose. **Which** status a
+      typeless call yields took six review rounds, every one of them spent
+      deriving it from the body's *value* by a rule that was wrong somewhere new.
+      Settled by not deriving it: `run_status_body` runs the body through
+      `run_source`, command position's own runner, so `x = f()` binds what a bare
+      `f` leaves — by construction rather than by a second rule kept in step.
+      `status func` takes that path too, being the typeless function said out
+      loud. Pinned by `a_typeless_call_yields_its_own_status_not_the_callers`,
+      which asserts that equality per body shape rather than literals.)*
+      A `func` with no declared type results in a
       `Status`; the last expression stops being its value. This is what kills the
       `for`-aggregate nobody wrote (`eval_for_passes` / `run_ast_for_passes` in
       `repl.rs`), and it is the breaking half of the change.
 
-      **Unblocked now `value` exists**, and measured rather than guessed:
+      **Unblocked now `any` exists**, and measured rather than guessed:
       implemented against the suite it fails **61 of 1108** cli tests — 5.5%,
       which does bear out the design's claim that the migration lands on the
       minority — across **156** definitions needing a type. Most are honest and
@@ -5651,15 +5696,12 @@ entry records what each costs.
       itself. The tail-is-a-command half stays: that one *is* answerable from
       syntax, since a command produces exactly a `Status`.
 
-      **Both halves are scoped to types a `Status` does not satisfy**, and neither
-      fires for a declared `status`. A command tail produces exactly a `Status(n)`,
-      so it is right for `status` and wrong only for `int`, `str`, and the rest. A
-      bare `return` carries the result so far with the **last status**
-      (`docs/REFERENCE.md` §Functions) — "stop here, as if the body ended at this
-      line" — which is likewise right for `status` and only a problem where a
-      declared type needs a value the result-so-far may not hold. Getting either
-      backwards makes `status func ips() { … }` unwritable, and the equivalence
-      between it and the typeless form is what the design entry opens with.
+      **The surviving half is scoped to types a `Status` does not satisfy**, and it
+      does not fire for a declared `status`. A command tail produces exactly a
+      `Status(n)`, so it is right for `status` and wrong only for `int`, `str`, and
+      the rest. Getting that backwards makes `status func ips() { … }` unwritable,
+      and the equivalence between it and the typeless form is what the design entry
+      opens with.
 - [ ] **Static check: a literal `return` operand against the declared type.**
       `int func f() { return "hi" }`. **Only where the operand is a literal** —
       `return $x` is unanswerable while variables are untyped, and that limit is
@@ -5780,11 +5822,34 @@ entry records what each costs.
       Whichever wins, the declared return type is the part worth showing, and a
       func without one should say so rather than print `status` — the same rule
       `help` follows.
-- [ ] **Migrate the docs and the ported configs.** `TOUR.md`, `REFERENCE.md`,
-      `INTRO.md` and `prelude.mesh` all contain funcs written under the union.
-      Most are typeless and stay as they are; the ones whose value is taken need a
-      type. The count is the real measure of whether the migration lands on the
-      minority, as the design entry claims it does.
+- [x] **Migrate the docs and the ported configs.** *(landed with the narrowing,
+      in the same commit — the break is only coherent with it.)* `TOUR.md`,
+      `REFERENCE.md`, `INTRO.md`, `PROMPT.md`, `DESIGN.md`, `GRAMMAR.md`, this
+      file, and `prelude.mesh`.
+
+      **The count answers the question this item was set to ask, and the design
+      entry's claim holds**: 115 of 477 definitions in the prose are typed (24%),
+      238 of 734 across the CLI tests (32%), 2 of 5 in `prelude.mesh` — 29%
+      overall. The migration lands on the minority; the typeless majority is
+      effect code that never had a value taken.
+
+      `prelude.mesh` is the pair worth reading, being shipped code rather than
+      fixtures: `mesh-title-where` and `mesh-title-who` are honestly `str func`,
+      while the two title **hooks** beside them stay typeless — they run `title`
+      for effect. The helpers declare, the effectful hooks don't.
+
+      It took ten passes, each blind to the call shape the next one found:
+      named calls, lambdas, declared modifiers, `&name` references, a captured
+      predicate whose *declaration* was broken while its call read fine, prose
+      describing the command tail as *the* case yielding a status, the
+      prompt-segment hooks (`PROMPT.md` entire — it is what `INTRO.md` sends
+      readers to for "a real prompt"), a lambda bound to a plain variable and
+      called `$name(…)`, the higher-order callbacks, and the design entries whose
+      *prose asserts a returned value* — `x = while()` yielding `OK`, `match f()`
+      taking the `7` arm, `f():capture` reporting `value=3`, a `bool` predicate.
+      Grepping for a call shape only finds the shape you thought of; that last
+      pass had to read for the claim rather than grep for the syntax, since these
+      sites look identical to the ones correctly left typeless.
 
 **Not in scope, and worth saying out loud before someone starts:** this does not
 make parameters typed. `GRAMMAR.md` §Definitions has nowhere for a type to go in
@@ -5803,7 +5868,7 @@ once there is a type vocabulary in the language to reason with.
 
 **How the current proposal works, in one paragraph.** A `func` may declare a
 return type drawn from a closed set (`status`, `int`, `str`, `bool`, `list`,
-`map`, with `float` reserved). Declaring none means no value channel: the result
+`map`, `any`, with `float` reserved). Declaring none means no value channel: the result
 is a `Status`, and the body's last expression stops being its value. The type
 rides on the definition, so `help` can print it and a caller can read it without
 opening the body.
@@ -6411,7 +6476,7 @@ not.
       aside above stops being the only place it is written down. `&name` names a
       function but cannot pre-supply arguments, so a higher-order slot wanting an
       existing function with one choice already made takes a lambda wrapper
-      (`$xs:map(func(_x) { pad($_x, width: 8) })`). Leading spelling if mesh ever grows
+      (`$xs:map(str func(_x) { pad($_x, width: 8) })`). Leading spelling if mesh ever grows
       one: **`&f(key: value)`** — sigil kept so it stays a value, keyword-bound only.
       Unweighed: `&pad(width: 8)` versus `pad(width: 8)` differing by the sigil
       alone while meaning
@@ -7905,7 +7970,7 @@ of each PR had landed by another route, but these pieces had not.
 
       ```
       cmd = /bin/echo
-      func g() { global cmd = /bin/false; return x }
+      str func g() { global cmd = /bin/false; return x }
       $cmd g()            # ran /bin/false, not the /bin/echo that was selected first
       ```
 
@@ -8624,8 +8689,9 @@ a one-line edit. Every claim below was checked against the built shell.
       rather than a choice:** `DESIGN.md` records "no second keyword; a `func`
       may declare a return type, and one that declares none has no value
       channel", and the parser, `type`, `help` and the lambda path are built.
-      The shipped spellings are `str` and `value`, not the `string` and `any`
-      this entry argued in. What remains open here is the *rest* of the menu —
+      The shipped spellings are `str` and `any`; this entry argued `string`
+      and `any`, so only the first differs — `value` shipped briefly in between
+      and was reversed, see `Decisions needing review`. What remains open here is the *rest* of the menu —
       B, C, and the §5 consequences nobody has built: the slot checks, a return
       type per builtin, and the migration diagnostic. The argument, as it
       stood: the
@@ -8637,7 +8703,7 @@ a one-line edit. Every claim below was checked against the built shell.
       — `status func` *is* `proc` without a second keyword — and it adds a
       printable type for `help`, a *checked* value channel, and hook slots that
       name the type they take — `status func` for the effect-only hooks, and
-      `value func` for a prompt segment, which is *produces a value* rather than
+      `any func` for a prompt segment, which is *produces a value* rather than
       *produces a string*, since a segment may render as a string, a list, a
       keyed sub-map or a structural piece and naming one would reject the rest. The prefix follows the existing `wrapper func`
       marker and is **decided and built**, with the type outermost
@@ -8647,8 +8713,8 @@ a one-line edit. Every claim below was checked against the built shell.
       only** — no parameter types, no parameterization, no unions — which holds
       because a nonzero status being the only failure removes the need for
       `string | false`. The line forces one addition: a top type — shipped as
-      `value`, `any` having been weighed and rejected — for the
-      functions whose result *is* a parameter (`value func id(x)`), which have no
+      `any`, after `value` was tried and reversed — for the
+      functions whose result *is* a parameter (`any func id(x)`), which have no
       other spelling once parameter types are off the table.
 
       **The remaining judgment call**, now three-way rather than binary: does
@@ -9143,7 +9209,7 @@ a one-line edit. Every claim below was checked against the built shell.
       question, two spellings:
 
       ```mesh
-      func f() { return "" }
+      str func f() { return "" }
 
       if f()  { … }    # a string is not a condition; compare it (`… != ""`)
       if f    { … }    # takes the yes branch, silently
@@ -9234,6 +9300,17 @@ a one-line edit. Every claim below was checked against the built shell.
       is documented as "a derived view rather than an independent channel", so
       either it keeps deriving `0` for a string — leaving the inconsistency alive
       in a third place — or it errors, and `f():capture` stops being total.
+
+      **The payload analysis below predates the narrowing**, and is kept as the
+      record of what `call_func` can *see*, not of what these calls now answer.
+      Its examples were written while a typeless `func` still had a value
+      channel: `${a()}`, `${b()}`, `${nop()}` and `${f()}` now answer
+      `status(0)` — interpolating as `0` — rather than `[]`, none of those funcs
+      declaring a type. What the narrowing does not touch is the point it makes:
+      at the moment `call_func` classifies how a body ended, the empty string,
+      the bare `return` and the empty body are indistinguishable by value alone,
+      which is why Option C needs the four-part boundary state below rather than
+      one classified value.
 
       And "the value is there to classify" holds for only one of the two ways a
       function produces one. `call_func` restores the caller's `shell.result`

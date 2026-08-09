@@ -17,10 +17,10 @@ argument of record rather than as an open question, and it is written in the
 | §5 argued | Shipped | Why |
 |---|---|---|
 | `string func` | **`str func`** | short forms throughout, since `int` is already the language's word |
-| `any func` | **`value func`** | `any` "reads as a claim about a type system this deliberately is not"; `value` is the design's own word for the channel |
+| `any func` | **`any func`** | argued as `any`; shipped first as **`value func`** — `any` "reads as a claim about a type system this deliberately is not", and `value` is the design's own word for the channel — then reversed back to `any`, because `value` is *also* `return`'s channel word: `return value func() { … }` read the marker as the channel and produced an untyped lambda in silence. Flagged in `TODO.md` under `Decisions needing review`; not yet confirmed |
 
 The vocabulary is a **closed set** — `status`, `int`, `str`, `bool`, `list`,
-`map`, `value` — with `float` reserved in the declaration position only. Where
+`map`, `any` — with `float` reserved in the declaration position only. Where
 this document still weighs something about §5, it is weighing something that
 is **not** part of the accepted decision or not yet built.
 
@@ -28,9 +28,15 @@ is **not** part of the accepted decision or not yet built.
 one that declares none has no value channel. The parser reads it, `type` and
 `help` report it, and `Callable::Lambda` carries it.
 
-**What is not built**: anything that *reads* a declared type. `repl.rs` stores
-and passes `return_type` and checks nothing, so the narrowing itself — a
-typeless `func` losing its value channel — is not enforced yet.
+**The narrowing is now enforced.** `run_call_body_for_value` maps a call's
+outcome against the declared type on every call path, so a typeless `func`
+called for a value yields a `Status` instead of whatever its body produced
+last. **Still not built**: *none* of the accepted checks are — the parse-time
+ones, the run-time warning at `x = f()` against a typeless callee (the
+narrowing binds a `Status` there silently, which is what that warning is for),
+and the dispatch-time typeless-lambda-in-a-value-slot check. The
+bare-`return` half of the parse-time check was dropped rather than deferred,
+being unanswerable from the syntax alone.
 
 **And the accepted check is narrower than this document argued.** `DESIGN.md`
 draws the boundary explicitly and it is worth quoting, because §5 below reads
@@ -45,10 +51,19 @@ table's own last column says:
 | Checked | When | Needs |
 |---|---|---|
 | `return $v` in a func declaring no type | **parse** | the declaration and the body |
-| a bare `return`, or a command tail, in a func whose declared type a `Status` does not satisfy | **parse** | the same |
+| a command tail in a func whose declared type a `Status` does not satisfy | **parse** | the same |
 | `return "hi"` against a declared `int` | **parse** | the same, and **only where the operand is a literal** |
 | `x = f()` where `f` declares no type | **run** | the callee |
 | a typeless lambda in a value-taking hook slot | **dispatch** | the slot's declared kind |
+
+**A bare `return` was on that list and came off it** — `DESIGN.md` records it
+in full beside its own copy of this table. The check would have rejected
+`str func f() { x = hello; $x; return }`, where the result so far *is* a `str`
+and the function is correct: a bare `return` carries the result so far, so
+whether it satisfies the declared type depends on what the body produced
+before it, which no syntactic check can see. It is off the list for sitting
+outside the boundary, not for wanting a cleverer version. The command-tail
+half stays, a command's result being exactly a `Status`.
 
 So §5's "checking is by *type*, not by class" holds for a literal and is
 **unanswerable otherwise** — an exact check on every `return` and every
@@ -428,7 +443,7 @@ no exceptions. Under §5 the projection applies to the returns that are
 explicit `return "x"` from a `status func` is not projected to `0`, it is an
 error telling you to write `str func` — §5's migration bullet is the same
 rule read from the other end. So the order is *check, then project*, and what
-reaches the projection is a typed func's checked value (status `0`), a `value`
+reaches the projection is a typed func's checked value (status `0`), an `any`
 func's unchecked one (`0`), or a status (its code). A `status func`'s
 *incidental tail value* never reaches it either, being discarded for the status
 of the last statement.
@@ -659,7 +674,7 @@ reason is §5's own distinction: `status func` means **no value channel**, while
 a func returning `true` under C1 hands back `status(0)` as a **value**. Those
 are different functions, and the slot check tells them apart. So C1 owes one of:
 
-- **use `value func`**, which is already shipped and needs nothing new. It
+- **use `any func`**, which is already shipped and needs nothing new. It
   keeps the value channel — so the slot check still tells it from a
   `status func` — while retaining no deleted name and coining no word. What it
   gives up is the *exact* result check, and under C1 there is nothing left to
@@ -674,10 +689,10 @@ are different functions, and the slot check tells them apart. So C1 owes one of:
 **The first is the answer**, and an earlier draft omitted it while calling the
 list exhaustive — which both overstated C1's cost and left the fourth option,
 the destructive one, as the default an implementer would reach for. With
-`value func` in the list, C1's naming cost lands **once**, on `:bool`, not
+`any func` in the list, C1's naming cost lands **once**, on `:bool`, not
 twice; the declaration vocabulary already has a word that fits. The loss is
 real but small and belongs to C1 rather than to the annotation: a reader of
-`value func is-x()` learns less than a reader of `bool func is-x()` did.
+`any func is-x()` learns less than a reader of `bool func is-x()` did.
 
 **The bool surface is wider than the operators, and it is a cost in the tree
 rather than at the call sites.** Counting the relations understates the work:
@@ -689,7 +704,7 @@ and five of them are named configuration arguments rather than relations —
 | `re()` — `repl.rs` | `re("x", literal: true)` | unchanged |
 | `style()` — `repl.rs` | `style($s, bold: true)` | unchanged |
 | a modifier's default — `repl.rs` | `:has("k", false)` | unchanged |
-| `:filter`'s predicate — `repl.rs` | `$xs:filter(func(x) { $x:len > 2 })` | unchanged |
+| `:filter`'s predicate — `repl.rs` | `$xs:filter(bool func(x) { $x:len > 2 })` | unchanged |
 | a switch passed by name — `repl.rs` | `f(force: true)` | unchanged |
 | `$sh.options` — `options.rs` | `$sh.options.errexit = true` | unchanged |
 
@@ -712,7 +727,7 @@ way, and `:bool` inverts a numeral outright.
 **`:filter` is the one to watch**, and the reason is already written in the
 source: its predicate must answer a `Boolean` rather than anything truthy
 precisely because mesh's truthiness is the shell's, so a loose check would make
-`:filter(func(x) { $x })` keep the **zeros**. C1 leaves that intact — the check
+`:filter(any func(x) { $x })` keep the **zeros**. C1 leaves that intact — the check
 stays an exact type test, an int still fails it, and `true` / `false` remain
 the spellings a reader is pointed at. The residue is one degree of confusion in
 the diagnostic: it must now refuse an int while naming a status, and B2 has
@@ -873,7 +888,7 @@ the split provided — plus four things the split cannot give:
    sub-map**, or a **structural piece** (`&rule`, `&newline`, `&fill`). So
    `$sh.prompt.dir` cannot declare `str func` without rejecting renderings
    the prompt is specified to accept, and spelling all of them at once is the
-   union this section's scope line rules out. It declares **`value func`**: the
+   union this section's scope line rules out. It declares **`any func`**: the
    check is *produces a value at all*, not *produces a string*. (`$sh.complete.<cmd>`
    is the other one — "a spec *or* a callable returning candidates" — and lands
    the same way.)
@@ -883,7 +898,7 @@ the split provided — plus four things the split cannot give:
    status decision: `&puts` in a segment slot stops failing, so "a prompt
    segment gets a piece rendering as `0`" — a mistake "the value system no
    longer has a way to catch". A `status func` has no value channel, so an
-   `value func` slot refuses it **by name, before the handler runs**.
+   `any func` slot refuses it **by name, before the handler runs**.
 
    **That is the upper of two layers, not the only one**, and saying so is what
    keeps the guarantee true for callables that declare nothing. `DESIGN.md`
@@ -913,11 +928,11 @@ the split provided — plus four things the split cannot give:
    **Two rules the exact checking forces**, since "checking is by type, not by
    class" would otherwise answer both wrongly:
 
-   - **A slot declaring `value func` accepts a func of any declared type**, and
+   - **A slot declaring `any func` accepts a func of any declared type**, and
      refuses only a `status func`. That is what a top type is for — without it
      a `str func` segment would fail to match the slot written to take
      everything.
-   - **An `value func` handler does not satisfy a slot with a specific type.**
+   - **An `any func` handler does not satisfy a slot with a specific type.**
      Its returns are unchecked, so it promises nothing the slot can rely on.
 
    **A composite slot has no single callee.** `$sh.prompt.line1 = [&host-info
@@ -975,32 +990,32 @@ parameter types, no parameterization (`list`, never `list<int>`), no unions, no
 optionals. Everything past that line is a separate proposal that has to argue
 for itself.
 
-**One addition the line forces: a top type, `value`.** Without parameter types
+**One addition the line forces: a top type, `any`.** Without parameter types
 there is no way to say that `func id(x) { return $x }` returns whatever it was
 given, and the same holds for any function whose result is a parameter or an
 element of a heterogeneous list. Those are legal today and must stay legal, so
 they need a spelling:
 
 ```mesh
-value func id(x)       { return $x }
-value func first(xs)   { return $xs[0] }
+any func id(x)       { return $x }
+any func first(xs)   { return $xs[0] }
 ```
 
-`value func` declares a value channel with **no check at `return`** — the one
+`any func` declares a value channel with **no check at `return`** — the one
 thing every other annotation buys. That is the whole cost, and it is the right
 one to pay: the alternative is parameterization, which is the type system this
 section exists to avoid, and refusing to spell these functions at all would
 make working code unwritable rather than merely unchecked.
 
-`value` is a **typed** func in every other respect: it must not fall off the
+`any` is a **typed** func in every other respect: it must not fall off the
 end, and its slot type has to match where a hook wants one. Only the `return`
 check is given up. *(An earlier draft added "it is refused in command
 position", carried over from advantage 4 — the decision keeps `f arg` legal
-whatever a function declares, `value` included.)*
+whatever a function declares, `any` included.)*
 
 It should stay rare, and the design makes that visible rather than enforcing
-it: `help` prints `value`, so a function that opted out of its own return type
-says so at the place a reader looks. A codebase where `value` is common has
+it: `help` prints `any`, so a function that opted out of its own return type
+says so at the place a reader looks. A codebase where `any` is common has
 answered the "should mesh have parameter types" question empirically, which is
 a better way to reopen it than guessing now.
 
@@ -1170,12 +1185,12 @@ With that correction, the four items:
 | **What status a `return` of a non-bool leaves** — Option C needs a four-part boundary state reconstructed at `call_func`, at a boundary built to discard it, shared with a caller (`run_hooks`) the rule must not apply to | *Under advantage 4, which the decision declined:* a typed func in command position refused at dispatch — the declared type off the resolved callee, checked before the body runs, so no boundary state to reconstruct and no hook exception to carve out. **Under the accepted design** the same item is settled without any dispatch rule: B3 makes every non-status return `0`, and the declaration says whether there is a value channel at all |
 | **`if rootdir { … }` is silently always-yes** (fifteen such functions found porting a real config) | *Under advantage 4* `rootdir` is a `str func`, so command position rejects it and points at `if dir = rootdir() { … }` — a loud error on the line that has it rather than a silently-taken branch. **The decision declines that**, keeping `f arg` legal, so what the trap gets under the accepted design is B3's failing status, not a dispatch refusal |
 | **`ips()` returns an unnamed for-loop aggregate** nobody wrote, because every func carries a value channel | `ips` is a `status func`, so it has no value channel. There is nothing to name |
-| **Hook slots hold both kinds** — `$sh.prompt.dir` returns something renderable, `$sh.postcd.*` runs for effect | Each slot declares the type it takes — `status func` for the effect-only hooks, `value func` for a prompt segment, whose renderings are too many shapes to name one — so a mismatched handler that declares a type is refused when the hook fires, before it runs. An inline un-annotated lambda declares none: a prompt slot still refuses it on the value, an effect hook does not and discards it as it does today |
+| **Hook slots hold both kinds** — `$sh.prompt.dir` returns something renderable, `$sh.postcd.*` runs for effect | Each slot declares the type it takes — `status func` for the effect-only hooks, `any func` for a prompt segment, whose renderings are too many shapes to name one — so a mismatched handler that declares a type is refused when the hook fires, before it runs. An inline un-annotated lambda declares none: a prompt slot still refuses it on the value, an effect hook does not and discards it as it does today |
 
 Costs, stated plainly:
 
 - **A vocabulary of type names becomes claimable in declaration position.**
-  `status`, `int`, `str`, `bool`, `list`, `map`, `value` and `float` have to be
+  `status`, `int`, `str`, `bool`, `list`, `map`, `any` and `float` have to be
   recognized before `func`, contextually, the way `fork` is recognized only
   before a block — so `func int() { … }` stays a legal definition of a function
   named `int`. That is more surface than one `proc` would have claimed, and it
@@ -1345,11 +1360,11 @@ Costs, stated plainly:
   the same as a permissive one: it is unchecked, so neither the `return` check
   nor the must-not-fall-off-the-end rule applies to it.
 
-  **`value func` is the wrong default here, and reaching for it was the first
-  answer.** `value` is a *typed* func in every respect but the `return` check —
+  **`any func` is the wrong default here, and reaching for it was the first
+  answer.** `any` is a *typed* func in every respect but the `return` check —
   it must not fall off the end — and a body ending on a bare command is exactly
   what that rule catches. So `$xs:each(func(x) { puts $x })` would be an error
-  under a `value` default, and the inversion would only have swapped which
+  under an `any` default, and the inversion would only have swapped which
   ordinary callback broke: mappers saved, effect-only `:each` callbacks lost.
 
   **The reason no default is right is that a lambda's mode is set by its
@@ -1528,7 +1543,7 @@ Rough, for weighing rather than planning.
 | B5 order | delete the `as_text` fall-through; refuse the unordered classes | trivial |
 | B6 `~` via `match` | route `~` through the arm matcher; if list arms stay, refuse a binding arm on `~`'s right | small |
 | B7 totality | require `else` / a total `match` in expression position | small, plus the soft-bind word |
-| §5 declared return type | a return annotation on the declaration (contextual keywords before `func` — the prefix is built; the suffix forms are rejected) including the top type `value`, exact checking of the success channel at `return` **and at an implicit tail value** (a failing status passes unchecked; `value` skips the check) — the tail case is the awkward one, since `call_func` today restores the caller's `shell.result` before it classifies how the body ended, so the value is gone by the point the check would run; **the accepted checks**, unbuilt: the parse-time ones (a `return $v` from a func declaring no type; a bare `return` or command tail where a `Status` does not satisfy the declared type; `return "hi"` against `int`, *literal operands only*), the run-time `x = f()` against a typeless callee, and the dispatch-time typeless-lambda-in-a-value-slot check — `repl.rs` stores and passes `return_type` and reads it nowhere, so none of them, and not the narrowing itself, is enforced yet. **Separately proposed here and not accepted**: an *exact* check on every `return` and implicit tail, which needs typed variables to mean anything, and advantage 4's dispatch refusal; hook slot types checked against the resolved callee at each invocation — `status func` for the effect-only slots, `value func` for `$sh.prompt.*` and `$sh.complete.*`, with a `value` slot accepting any declared type and a composite slot (`[&a &b]`, `[k: &a]`) checked per reference rather than once, and the piece producers `rule` / `newline` / `fill` needing a recorded type the way the builtins do — over a **value-level slot requirement** that needs no declaration and so covers an un-annotated lambda, which `DESIGN.md` already specifies for the prompt and which is the layer the type check improves on rather than replaces — the effect hooks have no such layer and need none, since `run_hooks` discards a handler's result by design; **a return type per builtin**, one entry each — the **value form**, since a **hook slot** reaches a builtin only through `call_named_for_value` and `builtins.rs` records no type at all; recording the *status* form as well was an earlier ask here and is dropped, because the only rule that would have read it is advantage 4's declined dispatch refusal; the **annotated lambda** spelling and the un-annotated lambda staying unchecked — *shipped*, `Callable::Lambda` carries `Option<ReturnType>`; what remains is checking it at a slot; a **resolver report** where a bare `f` names a visibly-typed func, on B1's report-don't-refuse terms, since the dispatch refusal is otherwise only met when that path runs; and a **migration diagnostic** on a bare `func` whose last statement can produce a value on *any* path — a value expression, an `if` / `match` with any value-producing arm (partial included, since a caller gets data as soon as one path yields it), or a loop whose body does the same — an **addition to** the accepted call-site warning rather than the missing fix, finding the same functions without waiting for a caller to run, with one **declared false negative**: a loop over a command-bodied body collapses a list of statuses to one status and is left undiagnosed, since firing there would hit nearly every effect-only `for` in the tree | **large** — the only large one |
+| §5 declared return type | a return annotation on the declaration (contextual keywords before `func` — the prefix is built; the suffix forms are rejected) including the top type `any`, exact checking of the success channel at `return` **and at an implicit tail value** (a failing status passes unchecked; `any` skips the check) — the tail case is the awkward one, since `call_func` today restores the caller's `shell.result` before it classifies how the body ended, so the value is gone by the point the check would run; **the accepted checks**, and where each stands: the parse-time ones (a `return $v` from a func declaring no type; a command tail where a `Status` does not satisfy the declared type; `return "hi"` against `int`, *literal operands only*), the run-time `x = f()` against a typeless callee, and the dispatch-time typeless-lambda-in-a-value-slot check — of these, `repl.rs` now reads `return_type` on the value path, so **the narrowing itself** is enforced — but none of the accepted *checks* are, including the run-time one: `x = f()` against a typeless callee now binds a `Status` silently, which is exactly what makes its warning worth building rather than something already built (`TODO.md` leaves it unchecked); the parse-time and dispatch-time ones are unbuilt too, and the bare-`return` parse-time check was dropped rather than deferred, being unanswerable from the syntax. **Separately proposed here and not accepted**: an *exact* check on every `return` and implicit tail, which needs typed variables to mean anything, and advantage 4's dispatch refusal; hook slot types checked against the resolved callee at each invocation — `status func` for the effect-only slots, `any func` for `$sh.prompt.*` and `$sh.complete.*`, with an `any` slot accepting any declared type and a composite slot (`[&a &b]`, `[k: &a]`) checked per reference rather than once, and the piece producers `rule` / `newline` / `fill` needing a recorded type the way the builtins do — over a **value-level slot requirement** that needs no declaration and so covers an un-annotated lambda, which `DESIGN.md` already specifies for the prompt and which is the layer the type check improves on rather than replaces — the effect hooks have no such layer and need none, since `run_hooks` discards a handler's result by design; **a return type per builtin**, one entry each — the **value form**, since a **hook slot** reaches a builtin only through `call_named_for_value` and `builtins.rs` records no type at all; recording the *status* form as well was an earlier ask here and is dropped, because the only rule that would have read it is advantage 4's declined dispatch refusal; the **annotated lambda** spelling and the un-annotated lambda staying unchecked — *shipped*, `Callable::Lambda` carries `Option<ReturnType>`; what remains is checking it at a slot; a **resolver report** where a bare `f` names a visibly-typed func, on B1's report-don't-refuse terms, since the dispatch refusal is otherwise only met when that path runs; and a **migration diagnostic** on a bare `func` whose last statement can produce a value on *any* path — a value expression, an `if` / `match` with any value-producing arm (partial included, since a caller gets data as soon as one path yields it), or a loop whose body does the same — an **addition to** the accepted call-site warning rather than the missing fix, finding the same functions without waiting for a caller to run, with one **declared false negative**: a loop over a command-bodied body collapses a list of statuses to one status and is left undiagnosed, since firing there would hit nearly every effect-only `for` in the tree | **large** — the only large one |
 | C1 delete `Boolean` | every relation in the C1 table; the **other producers** — `:tty`, the file tests, the `:f` `:d` `:l` `:x` predicates, `:bool`, the switch-parameter binding, and the `$sh.options` / `$sh.interactive` entries; the **six sites that require a `Boolean`** (`re()`, `style()`, a modifier default, `:filter`, a switch passed by name, `$sh.options`); and the two renderers that print `true` / `false` | medium, and **entirely in the tree** — the literals survive, so no call site moves. `:bool` additionally needs a naming decision |
 | `Float`, `Instant`, `Duration` | as designed | independent of all of this |
 

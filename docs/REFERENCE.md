@@ -273,7 +273,7 @@ value you can query rather than text to scrape:
 sleep 30 &
 puts $sh.jobs:len              # 1 — one word for a prompt segment
 puts $sh.jobs[1].state         # running
-running = $sh.jobs:values:filter(func(j) { $j.state == running })
+running = $sh.jobs:values:filter(bool func(j) { $j.state == running })
 ```
 
 Each record holds `id`, `pid` (the process group leader, which is what the launch
@@ -538,7 +538,7 @@ is seen by the words after it and not by the ones before:
 
 ```mesh
 n = first
-func g() { global n = second
+str func g() { global n = second
   return x }
 puts $n g() $n                # first x second
 ```
@@ -581,7 +581,7 @@ stage, the same isolation the stage's own body gets:
 
 ```mesh
 n = before
-func change() { global n = MUTATED
+str func change() { global n = MUTATED
   return x }
 puts change() | cat           # x
 puts n=$n                     # n=before
@@ -620,12 +620,12 @@ mesh$ whence ls
 mesh: command not found: whence (mesh spells this `type`)
 ```
 
-A **bound name** draws one too. `double = func(x) { … }` makes `double` a
+A **bound name** draws one too. `double = int func(x) { … }` makes `double` a
 variable, not a command, so `double(5)` is one `$` from working — and the note
 says which, rather than sending you after a program that was never the point:
 
 ```text
-mesh$ double = func(x) { $x * 2 }
+mesh$ double = int func(x) { $x * 2 }
 mesh$ double(5)
 mesh: command not found: double (`double` is a variable holding a function; call it `$double(…)`)
 mesh$ puts $double(5)
@@ -1591,7 +1591,7 @@ no format string to learn. A title and a prompt that should agree share a
 function, not a syntax:
 
 ```mesh
-func where-i-am() { "${sh.host}:${pwd()}" }
+str func where-i-am() { "${sh.host}:${pwd()}" }
 
 func title-idle()      { title "${where-i-am()}" }
 func title-busy(cmd)   { title "$cmd — ${where-i-am()}" }
@@ -1841,7 +1841,7 @@ command in a condition was already being read for.
 ```mesh
 if $sh.status { puts "that worked" }
 puts warn unless $sh.status
-bad = $sh.pipestatus:filter(func(c) { not $c })
+bad = $sh.pipestatus:filter(bool func(c) { not $c })
 ```
 
 A **value** used as a statement reports the status *view* of that value: a status is
@@ -1873,7 +1873,7 @@ and filters like anything else:
 ```mesh
 p = $sh.pipestatus
 puts $p:len $p[0]
-bad = $p:filter(func(c) { not $c })
+bad = $p:filter(bool func(c) { not $c })
 ```
 
 That capture-first habit matters: **reading either entry is itself a command**,
@@ -2007,7 +2007,7 @@ ls ...$found                       # a stored list still spreads into argv
 `glob` is what expands a pattern the program **built**, since a value never
 re-globs on its own: `ls $p` passes the string `*.jpg` verbatim, and `glob($p)`
 hands over its matches. There is no lazy glob value — the call expands when it
-runs, and deferring it is an ordinary thunk (`later = func() { glob("*.txt") }`,
+runs, and deferring it is an ordinary thunk (`later = list func() { glob("*.txt") }`,
 re-globbing on each `$later()`).
 
 `files` and `dirs` are that call preset to `DIR/*` plus the type filter the name
@@ -2079,7 +2079,7 @@ is glued to text:
 ```mesh
 puts "at $(pwd) now"
 puts "$(id -un)@$(hostname)"
-func host-info() { style("$(hostname)", fg: red) }
+any func host-info() { style("$(hostname)", fg: red) }
 ```
 
 What the capture produced crosses **whole** — quoted, so it is never re-split and
@@ -2452,7 +2452,7 @@ mesh: $file.bak: a string has no members; write `${file}.bak` if the rest is lit
 **`${…}` also takes an expression**, not only a reference — a call, or arithmetic:
 
 ```mesh
-func host-info() { "host" }
+str func host-info() { "host" }
 puts "${host-info()} at ${$n + 1}"
 ```
 
@@ -2465,7 +2465,7 @@ first. Two things follow from the quotes:
   loudly:
 
   ```mesh
-  func host-info() { "host" }
+  str func host-info() { "host" }
   puts "[${host-info()}]"      # [host]  — the value
   puts "[$(host-info)]"        # []      — it printed nothing
   ```
@@ -2584,9 +2584,14 @@ colon**, where the call site puts it, and outside the parens — which is what l
 collection modifier still take an argument:
 
 ```
-func _s:shout()   { return "$_s!" }        # $x:shout
-func _s:wrap(_c)  { return "$_c$_s$_c" }   # $x:wrap("*")
+str func _s:shout()   { return "$_s!" }        # $x:shout
+str func _s:wrap(_c)  { return "$_c$_s$_c" }   # $x:wrap("*")
 ```
+
+**A modifier declares its return type like any other `func`.** The value channel is
+what the declaration opens, so a typeless `func _s:shout()` yields a `status` rather
+than the string its body built — and a modifier read for its value is precisely the
+case that wants a type. See [Functions](#functions).
 
 **Element-wise is the default; `...` takes the collection.** A plain subject
 parameter receives one element, so a list subject calls the body per element — the
@@ -2598,7 +2603,7 @@ elements at once, so no amount of mapping would get there — and it still takes
 own arguments, which is the whole reason the subject sits outside the parens:
 
 ```mesh
-func ..._xs:oxford(_conj) {
+str func ..._xs:oxford(_conj) {
   if $_xs:len < 3 { return $_xs:join(" $_conj ") }
   _head = $_xs[..-1]:join(", ")
   return "$_head, $_conj $_xs[-1]"
@@ -2625,7 +2630,7 @@ and not a direct one:
 
 ```
 func f() { puts $x:foo }     # fine — `f` runs below, after the declaration binds
-func _s:foo() { … }
+str func _s:foo() { … }
 f
 ```
 
@@ -2686,7 +2691,7 @@ map over a list like the path modifiers, while the **file filters** (`:files`,
 a subset, not a transform — and chain for AND, so `$paths:f:x` is the executable
 plain files. Applied to a single path a filter is instead the boolean its `test`
 operator gives, which is what lets `:filter` apply one element at a time
-(`$paths:filter(func(p) { $p:exec })` and `$paths:exec` agree).
+(`$paths:filter(bool func(p) { $p:exec })` and `$paths:exec` agree).
 
 Every file modifier **dereferences symlinks**, as `test` does, so a live link is
 `:files` when its target is and a broken link does not `:exist`. The exceptions
@@ -2753,7 +2758,7 @@ That search is the reason the modifier exists — the `cd ..`-in-a-subshell loop
 every shell config writes by hand becomes a `for` over a list:
 
 ```mesh
-func find-up(name) {
+any func find-up(name) {
   for dir in pwd():ancestors {
     if "$dir/$name":exists { return $dir }
   }
@@ -3411,7 +3416,7 @@ nothing" and be tested for it where bash would test a status — and what ends a
 `while` that binds its sentinel:
 
 ```mesh
-func find-up(_name) { … }              # a path, or `false` on a miss
+any func find-up(_name) { … }          # a path, or `false` on a miss
 if path = find-up(Makefile) {
   puts "found $path"
 } else {
@@ -3931,8 +3936,13 @@ greet world          # -> hi, world
 - **Result.** A function's status is its last statement's status, or `0` for an
   empty body — and when that last statement is an expression, its status is the
   view of the resulting value, so a body ending in `1 == 2` fails. A body ending in
-  a **command** yields that command's [status as a value](#exit-status), so
-  `func p() { /bin/false }` has the value `status(1)` and `p()` reads it.
+  a **command** takes that command's status, so `func p() { /bin/false }` reports `1`.
+
+  A **typeless** function has no value channel, so that status is its whole
+  result: call one for a value and a [`status`](#exit-status) is what comes back,
+  whatever the body ended on. `p()` reads `status(1)`, and `func q() { 42 }` read
+  as `q()` gives `status(0)`, not `42`. Declaring a return type is what opens the
+  value channel — see **Calling for a value** below.
 
   **`return expr` carries a value**, and succeeds (status `0`) unless that value is
   `false` or a nonzero status — so `return 3` is the integer three with status `0`,
@@ -3942,11 +3952,16 @@ greet world          # -> hi, world
   what `return 3` means.
 
   ```mesh
-  func port() { return 8080 }         # value 8080, status 0
+  int func port() { return 8080 }     # value 8080, status 0
   func check() { return status 2 }    # value status(2), status 2
   func forward() { some-cmd
     return $sh.status }               # whatever `some-cmd` reported
   ```
+
+  `port` declares `int` because the value it carries is one: `return` in a
+  **typeless** function still sets the status, but the value has nowhere to go,
+  so a typeless `func port()` would answer `status(0)`. `check` and `forward`
+  need no declaration — a status is a typeless function's own channel.
 
   The channel words are recognized **only directly after `return`** and reserve
   nothing: an attached `(` is a call, never a channel word, so `return value(5)`
@@ -3978,11 +3993,20 @@ greet world          # -> hi, world
   `return` carries — so a function can be used in an expression. Command position
   (`f arg`) is unchanged: it runs the function for its status.
 
+  The value channel is only open on a function that **declares its type**. Call a
+  typeless one for a value and what comes back is a `status`, not the body's
+  last expression:
+
+  ```mesh
+  func f() { 42 }
+  x = f()                             # status(0), not 42
+  ```
+
   A block's last expression can be a bare value, including a **lone integer
   literal**:
 
   ```mesh
-  func answer() { 42 }
+  int func answer() { 42 }
   x = answer()                        # 42, an integer
   ```
 
@@ -3992,7 +4016,7 @@ greet world          # -> hi, world
   a word.
 
   ```mesh
-  func double(n) { return $n * 2 }
+  int func double(n) { return $n * 2 }
   x = double(21)                      # x is 42
   ```
 
@@ -4033,10 +4057,10 @@ The same is true of a builtin (`puts hi | tr a-z A-Z`, `puts hi &`).
   as a declaration. Bind it, then value-call it through the variable:
 
   ```mesh
-  double = func(x) { $x * 2 }
+  double = int func(x) { $x * 2 }
   y = $double(5)                      # y is 10
 
-  func apply(f, x) { $f($x) }
+  any func apply(f, x) { $f($x) }
   z = apply($double, 21)              # z is 42 — a lambda is just a value
   ```
 
@@ -4054,8 +4078,8 @@ The same is true of a builtin (`puts hi | tr a-z A-Z`, `puts hi &`).
     is *written*, and the values are **copied** into the function value:
 
     ```mesh
-    func pick(want) {
-      return $paths:filter(func(p) with ($want) { $p:ext == $want }) }
+    list func pick(want) {
+      return $paths:filter(bool func(p) with ($want) { $p:ext == $want }) }
     ```
 
     Without it a lambda and a function-local are mutually unusable — the same text
@@ -4097,7 +4121,7 @@ The same is true of a builtin (`puts hi | tr a-z A-Z`, `puts hi &`).
       the name that cannot be captured is `$args`, the rest parameter the
       desugaring synthesizes.
   - **A global binding is visible to the body**, which is what lets a lambda
-    recurse: `fact = func(n) { if $n == 0 { return 1 }\n return $n * $fact($n - 1) }`.
+    recurse: `fact = int func(n) { if $n == 0 { return 1 }\n return $n * $fact($n - 1) }`.
   - **No text form.** A function value is the one value that cannot be bytes, so a
     command argument, an interpolation, a spread element, and `$env.*` all refuse
     it rather than invent a rendering.
@@ -4110,8 +4134,8 @@ The same is true of a builtin (`puts hi | tr a-z A-Z`, `puts hi &`).
   anything taking a callable can take one directly:
 
   ```mesh
-  func up(s) { $s:upper }
-  puts $xs:map(&up):join(",")         # the lambda `func(s) { up($s) }`, named
+  str func up(s) { $s:upper }
+  puts $xs:map(&up):join(",")         # the lambda `str func(s) { up($s) }`, named
   f = &up
   puts $f(z)                          # Z — called through the variable
   ```
@@ -4141,7 +4165,7 @@ The same is true of a builtin (`puts hi | tr a-z A-Z`, `puts hi &`).
   - **Only a `func` can be applied per element.** `:map` / `:filter` / `:each`
     hand their callable one already-evaluated element, and a value call reads its
     own argument list, so `$xs:map(&glob)` is a loud error naming the lambda
-    wrapper that does work (`$xs:map(func(p) { glob($p) })`).
+    wrapper that does work (`$xs:map(list func(p) { glob($p) })`).
   - **`:capture` works through one**, and records what the name it stands for
     would: `$f("hi"):capture` through `f = &puts` is `puts("hi"):capture`, whose
     `.value` is the status the command left.
@@ -4164,7 +4188,7 @@ The same is true of a builtin (`puts hi | tr a-z A-Z`, `puts hi &`).
   the two are one channel with two views, not two answers.
 
   ```mesh
-  func build() { puts compiling
+  str func build() { puts compiling
     return ok }
   r = build():capture
   puts "$r.value / $r.status"          # ok / 0
@@ -4209,12 +4233,12 @@ The same is true of a builtin (`puts hi | tr a-z A-Z`, `puts hi &`).
 
   ```mesh
   xs = [1 2 3 4]
-  doubled = $xs:map(func(x) { $x * 2 })          # [2 4 6 8]
-  evens   = $xs:filter(func(x) { $x % 2 == 0 })  # [2 4]
+  doubled = $xs:map(int func(x) { $x * 2 })          # [2 4 6 8]
+  evens   = $xs:filter(bool func(x) { $x % 2 == 0 })  # [2 4]
   $xs:each(func(x) { puts $x })                  # for effect
 
   fs = ["a.txt" "b.md" "c.txt"]
-  stems = $fs:filter(func(f) { $f:ext == txt }):map(func(f) { $f:stem })
+  stems = $fs:filter(bool func(f) { $f:ext == txt }):map(str func(f) { $f:stem })
   ```
 
   - **The call is an ordinary call.** They go through the same machinery `f(x)`
@@ -4224,7 +4248,7 @@ The same is true of a builtin (`puts hi | tr a-z A-Z`, `puts hi &`).
     caller is running.
   - **`:filter` requires a boolean.** Not a truthy value: mesh's truthiness is the
     shell's, where an integer is true when it is *zero*, so a loose reading would
-    make `:filter(func(x) { $x })` keep the zeros. A predicate that must say `true`
+    make `:filter(int func(x) { $x })` keep the zeros. A predicate that must say `true`
     or `false` cannot fall into that.
   - **`:each` yields the empty string**, mesh's "nothing produced" — not the list —
     so a chain cannot silently read side-effecting code as a transform.
@@ -4232,8 +4256,8 @@ The same is true of a builtin (`puts hi | tr a-z A-Z`, `puts hi &`).
     `:values`; elements keep their types, so a list element arrives as a list.
   - **A bare `:mod` reference is itself a callable**, so a predicate or mapper can
     take the modifier directly rather than a lambda that only forwards to it:
-    `$files:filter(:exec)` is `$files:filter(func(f) { $f:exec })`, and
-    `$paths:map(:stem)` is `$paths:map(func(p) { $p:stem })`. Only the
+    `$files:filter(:exec)` is `$files:filter(bool func(f) { $f:exec })`, and
+    `$paths:map(:stem)` is `$paths:map(str func(p) { $p:stem })`. Only the
     argument-free **value** modifiers can be referenced — `:join` needs a separator
     and `:map` a callable, and `:capture` wraps an invocation rather than a value,
     so none of them is a one-argument function to denote, and naming one is a loud
@@ -4355,8 +4379,8 @@ would run it in command position and yield a status. They can be written inline 
 argument, or returned from a function, which is how a prompt segment is built:
 
 ```mesh
-puts style(x, fg: red)                              # inline
-func dir-info() { style(tilde-pwd(), fg: blue) }    # a prompt segment
+puts style(x, fg: red)                                  # inline
+any func dir-info() { style(tilde-pwd(), fg: blue) }    # a prompt segment
 ```
 
 ## Not yet implemented

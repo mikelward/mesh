@@ -837,7 +837,7 @@ pub enum ReturnType {
     Bool,
     List,
     Map,
-    /// `value func f()` — **a value channel of unstated kind.** Not a gap in the
+    /// `any func f()` — **a value channel of unstated kind.** Not a gap in the
     /// vocabulary but a member of it: the closed set names the kinds a reader
     /// writes, and mesh has values it deliberately does not name there — a job, a
     /// styled string, an `Instant`, a `Duration`. A pass-through helper over any
@@ -857,7 +857,7 @@ impl ReturnType {
             ReturnType::Bool => "bool",
             ReturnType::List => "list",
             ReturnType::Map => "map",
-            ReturnType::Value => "value",
+            ReturnType::Value => "any",
         }
     }
 
@@ -870,7 +870,7 @@ impl ReturnType {
             "bool" => Some(ReturnType::Bool),
             "list" => Some(ReturnType::List),
             "map" => Some(ReturnType::Map),
-            "value" => Some(ReturnType::Value),
+            "any" => Some(ReturnType::Value),
             _ => None,
         }
     }
@@ -1206,7 +1206,7 @@ pub enum Expr {
     },
     /// A bare modifier reference — `:stem` — denoting "the function that applies
     /// `:stem`". Written where a callable is wanted, so `$paths:map(:stem)` says
-    /// what `$paths:map(func(p) { $p:stem })` says (`DESIGN.md`).
+    /// what `$paths:map(str func(p) { $p:stem })` says (`DESIGN.md`).
     ModifierRef(String),
     /// A function reference — `&name` — denoting the function command position
     /// would run for `name`. **Late bound**: the name is carried, not the
@@ -8240,7 +8240,7 @@ mod tests {
             ("bool func f() { true }", ReturnType::Bool, false),
             ("list func f() { [1] }", ReturnType::List, false),
             ("map func f() { [a: 1] }", ReturnType::Map, false),
-            ("value func f() { 1 }", ReturnType::Value, false),
+            ("any func f() { 1 }", ReturnType::Value, false),
             ("int wrapper func f(...xs) { 1 }", ReturnType::Int, true),
         ] {
             let tree = complete(source);
@@ -8321,7 +8321,7 @@ mod tests {
             // A whole-collection modifier subject opens with `...`, which
             // `modifier_subject` reads and this scan has to follow. Raised in
             // review as a P2.
-            "value func ..._xs:whole() { return $_xs }",
+            "any func ..._xs:whole() { return $_xs }",
             // …and a bare `...` is a name that table takes too, which a
             // spread-specific guard requiring a subject after it declined.
             // Raised in review as a P2.

@@ -211,7 +211,7 @@ mod tests {
 
         let hatch = typed_def(Vec::new(), Some(ReturnType::Value));
         assert!(
-            hatch.help("f").contains("Returns: value"),
+            hatch.help("f").contains("Returns: any"),
             "{}",
             hatch.help("f")
         );

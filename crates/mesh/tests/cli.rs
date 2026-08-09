@@ -689,9 +689,9 @@ fn a_variable_holding_a_function_says_so_rather_than_dead_ending() {
     // `type double` already says so — a bare not-found sends the reader looking
     // for a program that was never the point. Both spellings reach it.
     for source in [
-        "double = func(x) { $x * 2 }\ndouble(5)\n",
-        "double = func(x) { $x * 2 }\nx = double(5)\n",
-        "double = func(x) { $x * 2 }\ndouble 5\n",
+        "double = any func(x) { $x * 2 }\ndouble(5)\n",
+        "double = any func(x) { $x * 2 }\nx = double(5)\n",
+        "double = any func(x) { $x * 2 }\ndouble 5\n",
     ] {
         let out = run_with_input(source);
         let stderr = String::from_utf8_lossy(&out.stderr);
@@ -708,13 +708,13 @@ fn a_variable_holding_a_function_says_so_rather_than_dead_ending() {
     // assignment is the exception the status decision already makes: a
     // command-shaped call yields *how it went*, so `x` binds `status(127)` and
     // the binding itself succeeds — the note is what tells you, not the status.
-    let statement = run_with_input("double = func(x) { $x * 2 }\ndouble(5)\n");
+    let statement = run_with_input("double = any func(x) { $x * 2 }\ndouble(5)\n");
     assert_eq!(statement.status.code(), Some(127));
-    let bound = run_with_input("double = func(x) { $x * 2 }\nx = double(5)\nputs $x:repr\n");
+    let bound = run_with_input("double = any func(x) { $x * 2 }\nx = double(5)\nputs $x:repr\n");
     assert_eq!(String::from_utf8_lossy(&bound.stdout), "status(127)\n");
 
     // The spelling it points at works.
-    let works = run_with_input("double = func(x) { $x * 2 }\nputs $double(5)\n");
+    let works = run_with_input("double = any func(x) { $x * 2 }\nputs $double(5)\n");
     assert_eq!(String::from_utf8_lossy(&works.stdout), "10\n");
 
     // It is a diagnostic, not a resolution rule: a real program of the same name
@@ -730,29 +730,28 @@ fn a_variable_holding_a_function_says_so_rather_than_dead_ending() {
         std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755))
             .expect("make it executable");
     }
-    let shadowed = mesh_command()
-        .env(
-            "PATH",
-            format!(
-                "{}:{}",
-                dir.display(),
-                std::env::var("PATH").unwrap_or_default()
-            ),
-        )
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .and_then(|mut child| {
-            use std::io::Write;
-            child
-                .stdin
-                .take()
-                .expect("stdin")
-                .write_all(b"meshtest-callable = func() { puts nope }\nmeshtest-callable\n")?;
-            child.wait_with_output()
-        })
-        .expect("run mesh");
+    let shadowed =
+        mesh_command()
+            .env(
+                "PATH",
+                format!(
+                    "{}:{}",
+                    dir.display(),
+                    std::env::var("PATH").unwrap_or_default()
+                ),
+            )
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .and_then(|mut child| {
+                use std::io::Write;
+                child.stdin.take().expect("stdin").write_all(
+                    b"meshtest-callable = any func() { puts nope }\nmeshtest-callable\n",
+                )?;
+                child.wait_with_output()
+            })
+            .expect("run mesh");
     assert_eq!(
         String::from_utf8_lossy(&shadowed.stdout),
         "the program ran\n",
@@ -802,7 +801,7 @@ fn a_variable_holding_a_function_says_so_rather_than_dead_ending() {
     // The same answer with and without a same-named callable bound.
     for source in [
         "meshtestunrunnable\n",
-        "meshtestunrunnable = func() { puts nope }\nmeshtestunrunnable\n",
+        "meshtestunrunnable = any func() { puts nope }\nmeshtestunrunnable\n",
     ] {
         let out = denied(source);
         assert_eq!(out.status.code(), Some(126), "{source}");
@@ -847,7 +846,7 @@ fn a_variable_holding_a_function_says_so_rather_than_dead_ending() {
                 .stdin
                 .take()
                 .expect("stdin")
-                .write_all(b"meshtestblocked = func() { puts nope }\nmeshtestblocked\n")?;
+                .write_all(b"meshtestblocked = any func() { puts nope }\nmeshtestblocked\n")?;
             child.wait_with_output()
         })
         .expect("run mesh");
@@ -3569,8 +3568,8 @@ fn a_braced_interpolation_takes_a_call() {
     // `DESIGN.md` puts general expressions in `${…}`; until now only a variable
     // access parsed there, so composing segments meant binding every call first.
     let out = run_with_input(
-        "func host-info() { \"host\" }\n\
-         func dir-info() { \"~/src\" }\n\
+        "any func host-info() { \"host\" }\n\
+         any func dir-info() { \"~/src\" }\n\
          puts \"${host-info()} ${dir-info()}\"\n\
          puts \"pre${host-info()}post\"\n",
     );
@@ -3597,7 +3596,7 @@ fn a_braced_interpolation_takes_an_expression_across_lines() {
     let script = dir.join("wrap.mesh");
     std::fs::write(
         &script,
-        "func f() { \"v\" }\nputs \"${1 +\n2\n} ${\nf()\n}\"\n",
+        "any func f() { \"v\" }\nputs \"${1 +\n2\n} ${\nf()\n}\"\n",
     )
     .expect("write script");
     let out = run_script_with_stdin(&script, isolated_config_home(), b"");
@@ -3770,7 +3769,7 @@ fn a_group_takes_an_expression_across_lines() {
     // working once the rule stops leaking.
     let out = script(
         "arguments",
-        "func f(a) { return $a }\nputs (f(2\n))\nxs = [1, (2\n+ 3)]\nputs $xs\n",
+        "any func f(a) { return $a }\nputs (f(2\n))\nxs = [1, (2\n+ 3)]\nputs $xs\n",
     );
     assert_eq!(
         String::from_utf8_lossy(&out.stdout),
@@ -3780,7 +3779,7 @@ fn a_group_takes_an_expression_across_lines() {
     );
     let out = script(
         "argument_wrap",
-        "func f(a) { return $a }\nputs (f(1\n+ 2))\n",
+        "any func f(a) { return $a }\nputs (f(1\n+ 2))\n",
     );
     assert!(
         !out.status.success(),
@@ -3957,8 +3956,8 @@ fn a_quoted_modifier_chain_reads_the_same_in_every_position() {
          y = \"$x:upper\"\nputs $y\n\
          ys = [\"$x:upper\"]\nputs ...$ys\n\
          m = [k: \"$x:upper\"]\nputs $m.k\n\
-         func f(v) { puts $v }\nf(\"$x:upper\")\n\
-         func g() { return \"$x:upper\" }\nputs g()\n\
+         any func f(v) { puts $v }\nf(\"$x:upper\")\n\
+         any func g() { return \"$x:upper\" }\nputs g()\n\
          b = if true { \"$x:upper\" }\nputs $b\n\
          if \"$x:upper\" == AB { puts compared }\n\
          puts \"pre-$x:upper/post\"\n\
@@ -4336,7 +4335,7 @@ fn a_braced_reference_takes_a_modifiers_arguments() {
     // from the parse rather than from a scan over the source.
     let out = run_with_input(
         "xs = [a b]\n\
-         func f() { \")\" }\n\
+         any func f() { \")\" }\n\
          puts \"${xs:join(\"${f()}\")} ${$xs:join(\"${f()}\")}\"\n",
     );
     assert!(
@@ -4353,7 +4352,7 @@ fn a_braced_reference_takes_a_modifiers_arguments() {
     let script = dir.join("comment.mesh");
     std::fs::write(
         &script,
-        "xs = [a b]\nputs \"${xs:map(func(x) {# ) here\n$x:upper}):join(\"-\")}\"\n",
+        "xs = [a b]\nputs \"${xs:map(any func(x) {# ) here\n$x:upper}):join(\"-\")}\"\n",
     )
     .expect("write script");
     let out = run_script_with_stdin(&script, isolated_config_home(), b"");
@@ -4385,7 +4384,7 @@ fn a_quoted_call_returning_a_collection_is_refused() {
     // The quotes say "make this text", so the rule is `"$xs"`'s: a scalar renders
     // and a collection is a loud error. Without this a list would leave the call
     // still a list, and quoting would stop meaning "one string".
-    let out = run_with_input("func f() { [a b] }\nx = \"${f()}\"\nputs after\n");
+    let out = run_with_input("any func f() { [a b] }\nx = \"${f()}\"\nputs after\n");
     assert!(
         String::from_utf8_lossy(&out.stderr).contains("no text form to interpolate"),
         "stderr was {}",
@@ -10002,7 +10001,7 @@ fn a_handle_reads_the_same_however_it_arrives() {
     // Both access forms, since indexing and member access are separate arms and
     // each needed teaching on its own.
     let out = run_with_input(
-        "j = sh -c 'sleep 0.2; exit 6' &\na = ($j).state\nputs a=$a\nfunc ident(x) { return $x }\nb = ident($j).state\nputs b=$b\nsleep 0.5\nc = ($j).status\nputs c=$c\nd = ($sh.jobs[1]).state\nputs d=$d\n",
+        "j = sh -c 'sleep 0.2; exit 6' &\na = ($j).state\nputs a=$a\nany func ident(x) { return $x }\nb = ident($j).state\nputs b=$b\nsleep 0.5\nc = ($j).status\nputs c=$c\nd = ($sh.jobs[1]).state\nputs d=$d\n",
     );
     assert_eq!(
         String::from_utf8_lossy(&out.stdout),
@@ -10012,7 +10011,7 @@ fn a_handle_reads_the_same_however_it_arrives() {
     );
 
     let indexed = run_with_input(
-        "j = sh -c 'sleep 0.2; exit 6' &\na = ($j)[\"state\"]\nputs a=$a\nfunc ident(x) { return $x }\nb = ident($j)[\"state\"]\nputs b=$b\nsleep 0.5\nc = ($j)[\"status\"]\nputs c=$c\n",
+        "j = sh -c 'sleep 0.2; exit 6' &\na = ($j)[\"state\"]\nputs a=$a\nany func ident(x) { return $x }\nb = ident($j)[\"state\"]\nputs b=$b\nsleep 0.5\nc = ($j)[\"status\"]\nputs c=$c\n",
     );
     assert_eq!(
         String::from_utf8_lossy(&indexed.stdout),
@@ -12041,8 +12040,9 @@ fn a_compound_stage_yields_a_status_not_its_bodys_value() {
     // The body reads its input, so the producer always finishes writing: left
     // unread, `puts x` races into a SIGPIPE and pipefail would surface 141 here
     // instead of the status under test.
-    let last = run_with_input("func f() { puts x | if true { gets l; 42 } }\nputs f()\n");
-    let forked = run_with_input("func f() { puts x | if true { gets l; 42 } | cat }\nputs f()\n");
+    let last = run_with_input("any func f() { puts x | if true { gets l; 42 } }\nputs f()\n");
+    let forked =
+        run_with_input("any func f() { puts x | if true { gets l; 42 } | cat }\nputs f()\n");
     assert_eq!(
         String::from_utf8_lossy(&last.stdout),
         String::from_utf8_lossy(&forked.stdout),
@@ -12052,7 +12052,7 @@ fn a_compound_stage_yields_a_status_not_its_bodys_value() {
 
     // Outside a pipeline the same body still yields its value, so the boundary is
     // what changed and not the compound itself.
-    let out = run_with_input("func g() { if true { 42 } }\nputs g()\n");
+    let out = run_with_input("any func g() { if true { 42 } }\nputs g()\n");
     assert_eq!(String::from_utf8_lossy(&out.stdout), "42\n");
 }
 
@@ -15226,7 +15226,7 @@ fn a_value_block_streams_its_commands_instead_of_capturing_them() {
     let out = run_with_input(
         "a = if true { echo from-if }\n\
          b = match 1 { 1 => { echo from-match } }\n\
-         func f() { echo from-func }\n\
+         any func f() { echo from-func }\n\
          c = f()\n\
          puts \"<$a> <$b> <$c>\"\n",
     );
@@ -15240,7 +15240,7 @@ fn a_value_block_streams_its_commands_instead_of_capturing_them() {
     let valued = run_with_input(
         "a = if true { \"x\" }\n\
          b = match 1 { 1 => { \"y\" } }\n\
-         func f() { \"z\" }\n\
+         any func f() { \"z\" }\n\
          c = f()\n\
          puts \"<$a> <$b> <$c>\"\n",
     );
@@ -15357,7 +15357,7 @@ fn fail_names_a_status_and_return_names_a_value() {
     // `fail` names a status and leaves that status *as the value*, since it is a
     // validating wrapper over `return status(N)`; both render as the bare number.
     let out = run_with_input(
-        "func v() { return 5 }\nfunc f() { fail 5 }\n\
+        "any func v() { return 5 }\nfunc f() { fail 5 }\n\
          v\nputs \"return $sh.status\"\n\
          f\nputs \"fail $sh.status\"\n\
          x = v()\ny = f()\nputs \"[$x:repr][$y:repr]\"\n",
@@ -15660,12 +15660,12 @@ fn the_channel_word_says_which_channel_a_return_fills() {
     // `return status N` is sugar for `return status(N)`: the value is the status
     // and the function leaves with that code. `return value N` and a bare
     // `return N` are the same thing as each other — the load-bearing rule, since
-    // `func f() { 5 }` and `func f() { return 5 }` must agree.
+    // `any func f() { 5 }` and `any func f() { return 5 }` must agree.
     let out = run_with_input(
-        "func s() { return status 5 }\n\
-         func c() { return status(5) }\n\
-         func v() { return value 5 }\n\
-         func b() { return 5 }\n\
+        "any func s() { return status 5 }\n\
+         any func c() { return status(5) }\n\
+         any func v() { return value 5 }\n\
+         any func b() { return 5 }\n\
          puts s():repr c():repr v():repr b():repr\n\
          s\nputs \"status=$sh.status\"\n\
          b\nputs \"status=$sh.status\"\n",
@@ -15679,8 +15679,9 @@ fn the_channel_word_says_which_channel_a_return_fills() {
     // The channel words are positional and reserve nothing, so a function named
     // `value` is still callable — an attached `(` is a call, never a channel
     // word.
-    let call =
-        run_with_input("func value(n) { $n * 2 }\nfunc f() { return value(21) }\nputs f()\n");
+    let call = run_with_input(
+        "any func value(n) { $n * 2 }\nany func f() { return value(21) }\nputs f()\n",
+    );
     assert_eq!(String::from_utf8_lossy(&call.stdout), "42\n");
     assert!(call.stderr.is_empty(), "{:?}", call.stderr);
 
@@ -15690,11 +15691,11 @@ fn the_channel_word_says_which_channel_a_return_fills() {
     // whatever the body produced last.
     for (source, message) in [
         (
-            "func f() { return status }\n",
+            "any func f() { return status }\n",
             "expected a status code after `status`",
         ),
         (
-            "func f() { 7\n return value }\n",
+            "any func f() { 7\n return value }\n",
             "expected a value after `value`",
         ),
     ] {
@@ -15707,7 +15708,7 @@ fn the_channel_word_says_which_channel_a_return_fills() {
     }
 
     // And the constructor's range check is the same one.
-    let range = run_with_input("func f() { return status 300 }\nf\nputs after\n");
+    let range = run_with_input("any func f() { return status 300 }\nf\nputs after\n");
     assert!(
         String::from_utf8_lossy(&range.stderr).contains("status must be between 0 and 255"),
         "{:?}",
@@ -16236,7 +16237,8 @@ fn a_return_reached_through_a_variable_is_typed_like_a_written_one() {
     // *argv* — which flattens. A list was refused outright ("list value needs
     // `...`") and a quoted `"42"` came back as the integer 42, so the same `return`
     // meant two things depending on how it was spelled.
-    let list = run_with_input("func f() { xs = [a b c]\n r = return\n $r $xs }\nputs f():repr\n");
+    let list =
+        run_with_input("any func f() { xs = [a b c]\n r = return\n $r $xs }\nputs f():repr\n");
     assert_eq!(
         String::from_utf8_lossy(&list.stdout),
         "['a', 'b', 'c']\n",
@@ -16247,11 +16249,11 @@ fn a_return_reached_through_a_variable_is_typed_like_a_written_one() {
 
     // Quoting separates the string from the integer here as it does everywhere
     // else a value is typed from a word.
-    let quoted = run_with_input("func f() { r = return\n $r \"42\" }\nputs f():repr\n");
+    let quoted = run_with_input("any func f() { r = return\n $r \"42\" }\nputs f():repr\n");
     assert_eq!(String::from_utf8_lossy(&quoted.stdout), "'42'\n");
 
     // A surplus operand keeps its answer.
-    let surplus = run_with_input("func f() { r = return\n $r a b }\nf\n");
+    let surplus = run_with_input("any func f() { r = return\n $r a b }\nf\n");
     assert!(
         String::from_utf8_lossy(&surplus.stderr).contains("return: too many arguments"),
         "{}",
@@ -16270,11 +16272,11 @@ fn a_bare_return_uses_the_last_status() {
 fn a_lone_numeric_literal_is_a_value_not_a_command() {
     // "A block evaluates to its last expression — a bare value, a `[…]` literal, …"
     // (`DESIGN.md`). Every such spelling already worked *except* an unquoted
-    // numeral, which fell through to command resolution: `func f() { 42 }` reported
+    // numeral, which fell through to command resolution: `any func f() { 42 }` reported
     // "command not found: 42". It is a value now, and a real integer — not the
     // string "42".
     let out = run_with_input(
-        "func answer() { 42 }\nfunc zero() { 0 }\nfunc big() { 1000 }\n\
+        "any func answer() { 42 }\nany func zero() { 0 }\nany func big() { 1000 }\n\
          a = answer()\nb = zero()\nc = big()\n\
          sum = $a + 1\n\
          puts \"$a $b $c $sum\"\n",
@@ -16318,16 +16320,16 @@ fn a_bare_word_is_a_command_and_a_quoted_one_is_a_string() {
     );
 
     // The carve-out: a numeral and a boolean can never name a command, so they stay
-    // literals. This is what keeps `func answer() { 42 }` the integer.
+    // literals. This is what keeps `any func answer() { 42 }` the integer.
     let literals = run_with_input(
-        "func answer() { 42 }\nfunc no() { false }\n\
+        "any func answer() { 42 }\nfunc no() { false }\n\
          puts answer():repr\nx = if true { false }\nputs $x:repr\n",
     );
     assert_eq!(String::from_utf8_lossy(&literals.stdout), "42\nfalse\n");
 
     // And a quoted word as a whole statement is a value, so it is what a bare
     // `return` carries — it no longer looks for a program of that name.
-    let statement = run_with_input("func f() { \"foo\"\n return }\nputs f():repr\n");
+    let statement = run_with_input("any func f() { \"foo\"\n return }\nputs f():repr\n");
     assert_eq!(String::from_utf8_lossy(&statement.stdout), "'foo'\n");
     assert!(statement.stderr.is_empty(), "{:?}", statement.stderr);
 }
@@ -16418,7 +16420,7 @@ fn only_a_lone_numeral_becomes_a_value() {
     // integer rule.
     for spelled in ["4\"2\"", "42\"\"", "4\\2"] {
         let out = run_with_input(&format!(
-            "func f() {{ {spelled} }}\nv = f()\nn = $v + 1\nputs \"[$v] $n\"\n"
+            "any func f() {{ {spelled} }}\nv = f()\nn = $v + 1\nputs \"[$v] $n\"\n"
         ));
         let stderr = String::from_utf8_lossy(&out.stderr);
         assert!(
@@ -16427,31 +16429,32 @@ fn only_a_lone_numeral_becomes_a_value() {
         );
     }
     // The bare spelling is the integer, and arithmetic on it works.
-    let bare = run_with_input("func f() { 42 }\nv = f()\nn = $v + 1\nputs $n\n");
+    let bare = run_with_input("any func f() { 42 }\nv = f()\nn = $v + 1\nputs $n\n");
     assert_eq!(String::from_utf8_lossy(&bare.stdout), "43\n");
 
     // `true` / `false` are literals for the numeral's reason, even though a program
     // of each name exists: read as a value they are the boolean, so no `/usr/bin/true`
     // is forked to learn what everyone already knows.
-    let word = run_with_input("func t() { true }\nfunc f() { false }\nputs t():repr f():repr\n");
+    let word =
+        run_with_input("any func t() { true }\nany func f() { false }\nputs t():repr f():repr\n");
     assert_eq!(String::from_utf8_lossy(&word.stdout), "true false\n");
 
     // The program is still reachable the way `./42` is — by a spelling that is not a
     // lone bare word. `$sh.status` is a `Status`, so that is what the body yields.
-    let program = run_with_input("func t() { command -- true\n $sh.status }\nputs t():repr\n");
+    let program = run_with_input("any func t() { command -- true\n $sh.status }\nputs t():repr\n");
     assert_eq!(String::from_utf8_lossy(&program.stdout), "status(0)\n");
 
     // And a bare word that names a command and is *not* a literal still runs: its
     // output streams and a function body's result is its status **as a value**,
     // which is exactly what `true` did before it became a literal.
-    let ran = run_with_input("func p() { pwd }\nv = p()\nputs \"v=$v:repr\"\n");
+    let ran = run_with_input("any func p() { pwd }\nv = p()\nputs \"v=$v:repr\"\n");
     let ran = String::from_utf8_lossy(&ran.stdout);
     assert!(ran.ends_with("v=status(0)\n"), "{ran:?}");
     assert!(ran.starts_with('/'), "pwd should have streamed: {ran:?}");
 
     // mesh has no float literals, so `3.5` is still just a word — and still a
     // command. Closing that would mean adding a type, not a parse rule.
-    let float = run_with_input("func f() { 3.5 }\nv = f()\nputs after\n");
+    let float = run_with_input("any func f() { 3.5 }\nv = f()\nputs after\n");
     assert!(
         String::from_utf8_lossy(&float.stderr).contains("command not found: 3.5"),
         "{:?}",
@@ -16459,12 +16462,12 @@ fn only_a_lone_numeral_becomes_a_value() {
     );
 
     // A *negative* literal lexes as the minus operator followed by `3` rather than as
-    // one numeric word, so it used to miss this rule and `func f() { -3 }` reported
+    // one numeric word, so it used to miss this rule and `any func f() { -3 }` reported
     // "command not found: -3" beside a `return -3` that carried the number. The rule
     // is asked of the parsed expression now, and the parser folds the sign into the
     // literal, so all three spellings agree.
     let carried = run_with_input(
-        "func f() { -3 }\nfunc g() { return -3 }\nfunc h() { (-3) }\n\
+        "any func f() { -3 }\nany func g() { return -3 }\nany func h() { (-3) }\n\
          a = f()\nb = g()\nc = h()\nputs \"$a $b $c\"\n",
     );
     assert_eq!(String::from_utf8_lossy(&carried.stdout), "-3 -3 -3\n");
@@ -16486,11 +16489,124 @@ fn only_a_lone_numeral_becomes_a_value() {
 }
 
 #[test]
+fn a_typeless_call_yields_its_own_status_not_the_callers() {
+    // A typeless func has no value channel, so `x = f()` binds a status. **Which**
+    // status is the whole question, and the answer is the rule the design states:
+    // the one the same body leaves in command position. So that is what this
+    // asserts — every shape, both spellings, against the command-position oracle
+    // rather than against a literal somebody wrote down.
+    //
+    // Six review rounds got here one case at a time, each fix deriving the status
+    // from the body's *value* by a rule that was wrong somewhere new: the caller's
+    // status leaked into `false || x = f()`; a hard-coded `0` split `{ false }`
+    // from `{ return false }`; then three narrowing "did anything record?" windows,
+    // caught by `{ /bin/false; 42 }`, by `if /bin/false { 0 } else { 42 }`, and
+    // finally by `[false() 42]`, where the command runs arbitrarily deep inside the
+    // tail value. Asserting literals is what let each of those hide behind the
+    // cases that happened to be listed, so this asserts the invariant instead.
+    for body in [
+        "42",
+        "false",
+        "/bin/false",
+        "/bin/true",
+        "/bin/false\n42",
+        "/bin/true\nfalse",
+        "[false() 42]",
+        "$(/bin/false)",
+        "(for i in [1,2] { /bin/false })",
+        "if true { /bin/false }",
+        "if /bin/false { 0 } else { 42 }",
+        "if /bin/false { 0 }",
+        "if false { 42 }",
+        "if /bin/false { } else { }",
+        "if true { }",
+        "match 1 { 1 => 42 }",
+        "match 9 { 1 => 42 }",
+        "for i in [1,2] { $i }",
+        "for i in [1,2] { /bin/false }",
+        "",
+    ] {
+        let called = run_with_input(&format!("func h() {{ {body} }}\nx = h()\nputs $x:repr\n"));
+        let statement = run_with_input(&format!("func h() {{ {body} }}\nh\nputs $sh.status\n"));
+        let expected = format!(
+            "status({})",
+            String::from_utf8_lossy(&statement.stdout).trim()
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&called.stdout).trim(),
+            expected,
+            "`x = h()` must bind what `h` leaves in command position, for \
+             `func h() {{ {body} }}`"
+        );
+
+        // `status func` is that same function *said out loud* (`docs/DESIGN.md`
+        // §"Functions"), so declaring the type a call already yields must not
+        // change what it yields. Raised in review as a P1: the projection asked
+        // `declared.is_none()` — whether a type was written, not which — so an
+        // explicit `status` fell through and handed back the raw body value.
+        let spelled = run_with_input(&format!(
+            "status func h() {{ {body} }}\nx = h()\nputs $x:repr\n"
+        ));
+        assert_eq!(
+            String::from_utf8_lossy(&called.stdout),
+            String::from_utf8_lossy(&spelled.stdout),
+            "`func h() {{ {body} }}` and `status func …` must agree"
+        );
+    }
+
+    // The case that started it: the status is the *body's*, so a caller that just
+    // failed must not show through a body that only produced a value.
+    let inherited = run_with_input("func f() { 42 }\nfalse || x = f()\nputs $x:repr\n");
+    assert_eq!(String::from_utf8_lossy(&inherited.stdout), "status(0)\n");
+
+    // …and one that really does end on a command still carries that status, with a
+    // *succeeding* caller, so neither direction is inherited.
+    let command = run_with_input("func g() { /bin/false }\ntrue && y = g()\nputs $y:repr\n");
+    assert_eq!(String::from_utf8_lossy(&command.stdout), "status(1)\n");
+
+    // A default is *setup*, not body output — the same classification the result
+    // reset in `run_call_body_for_value` already makes — so a command run while
+    // binding one is not an empty body's answer. Raised in review as a P2.
+    let default = run_with_input("func h(a = $(/bin/false)) { }\nx = h()\nputs $x:repr\n");
+    assert_eq!(String::from_utf8_lossy(&default.stdout), "status(0)\n");
+
+    // An explicit `return val` ends the call with that value's status, and the
+    // bare tail spelling of the same body has to agree with it.
+    for tail in ["false", "42", "[false() 42]", "$(/bin/false)"] {
+        let fell_off = run_with_input(&format!("func h() {{ {tail} }}\nx = h()\nputs $x:repr\n"));
+        let returned = run_with_input(&format!(
+            "func h() {{ return {tail} }}\nx = h()\nputs $x:repr\n"
+        ));
+        assert_eq!(
+            String::from_utf8_lossy(&fell_off.stdout),
+            String::from_utf8_lossy(&returned.stdout),
+            "`{{ {tail} }}` and `{{ return {tail} }}` must agree"
+        );
+    }
+    let returned = run_with_input("func h() { return false }\nx = h()\nputs $x:repr\n");
+    assert_eq!(String::from_utf8_lossy(&returned.stdout), "status(1)\n");
+
+    // A bare trailing `for` is the one shape where the command-position status and
+    // the built list disagree, so it is worth pinning outright: as a statement its
+    // status is the last command's, and `list func` is how the aggregate is asked
+    // for. An earlier revision projected the completed list here and answered
+    // `status(0)` for a loop whose every pass failed.
+    let looped = run_with_input(
+        "func h() { for i in [1,2] { /bin/false } }\nx = h()\nputs $x:repr\n\
+         list func k() { for i in [1,2] { $i } }\ny = k()\nputs $y:repr\n",
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&looped.stdout),
+        "status(1)\n[1, 2]\n"
+    );
+}
+
+#[test]
 fn a_value_call_returns_the_functions_value() {
     // `f(args)` calls a function for its value: the last expression, or an explicit
     // `return`. Positionals are comma-separated inside the parens.
     let out = run_with_input(
-        "func add(a, b) { $a + $b }\nfunc greet(who) { return \"hi $who\" }\nn = add(2, 3)\nm = greet(world)\nputs \"$n $m\"\n",
+        "any func add(a, b) { $a + $b }\nany func greet(who) { return \"hi $who\" }\nn = add(2, 3)\nm = greet(world)\nputs \"$n $m\"\n",
     );
     assert_eq!(String::from_utf8_lossy(&out.stdout), "5 hi world\n");
     assert!(out.stderr.is_empty(), "{:?}", out.stderr);
@@ -16500,8 +16616,7 @@ fn a_value_call_returns_the_functions_value() {
 fn a_value_call_binds_named_options_like_flags() {
     // `key: value` options bind the same parameter as `--key` (`force: true` ≡
     // `--force`), in any order, and omitted flags take their defaults.
-    let src =
-        "func deploy(target, --region = us-west, --force) { return \"$target/$region/$force\" }\n";
+    let src = "any func deploy(target, --region = us-west, --force) { return \"$target/$region/$force\" }\n";
     let out = run_with_input(&format!(
         "{src}a = deploy(prod, region: eu, force: true)\nb = deploy(app)\nputs \"$a | $b\"\n"
     ));
@@ -16515,7 +16630,7 @@ fn a_value_call_binds_named_options_like_flags() {
 #[test]
 fn a_value_call_spreads_lists_as_positionals_and_maps_as_options() {
     let out = run_with_input(
-        "func d(target, --region = us, --force) { return \"$target/$region/$force\" }\nfunc sum3(a, b, c) { $a + $b + $c }\nopts = [region: eu, force: true]\nxs = [10 20 30]\nr = d(prod, ...$opts)\nt = sum3(...$xs)\nputs \"$r $t\"\n",
+        "any func d(target, --region = us, --force) { return \"$target/$region/$force\" }\nany func sum3(a, b, c) { $a + $b + $c }\nopts = [region: eu, force: true]\nxs = [10 20 30]\nr = d(prod, ...$opts)\nt = sum3(...$xs)\nputs \"$r $t\"\n",
     );
     // The spread map fills the options; the spread list fills the positionals.
     assert_eq!(String::from_utf8_lossy(&out.stdout), "prod/eu/true 60\n");
@@ -16527,7 +16642,7 @@ fn a_value_call_accepts_the_dashed_option_spelling() {
     // `--flag` and `key: value` are interchangeable inside a value call
     // (`DESIGN.md` §"Calling for a value"), so both bind the same parameter — and a
     // dashed value types like the same token in command position (`--n=2` → int).
-    let src = "func d(target, --force, --tag = latest) { return \"$target/$force/$tag\" }\n";
+    let src = "any func d(target, --force, --tag = latest) { return \"$target/$force/$tag\" }\n";
     let out = run_with_input(&format!(
         "{src}r = d(prod, --force)\ns = d(prod, --tag=v2)\nt = d(prod, force: true, tag: v9)\nputs \"$r | $s | $t\"\n"
     ));
@@ -16724,14 +16839,14 @@ fn a_chain_on_an_attached_value_transforms_the_value_not_the_name() {
         // empty string, so its trailed spelling binds the trailed empty string
         // rather than falling back to the whole-word reading.
         ("f(--tag=:upper)", "tag=\n"),
-        ("func v() { return v9 }\nf(--tag=v())", "tag=v9\n"),
+        ("any func v() { return v9 }\nf(--tag=v())", "tag=v9\n"),
         (
-            "func g() { return [key: v2] }\nf(--tag=g().key)",
+            "any func g() { return [key: v2] }\nf(--tag=g().key)",
             "tag=v2\n",
         ),
     ] {
         let out = run_with_input(&format!(
-            "func f(--tag = none) {{ puts \"tag=$tag\" }}\n{call}\n"
+            "any func f(--tag = none) {{ puts \"tag=$tag\" }}\n{call}\n"
         ));
         assert_eq!(
             String::from_utf8_lossy(&out.stdout),
@@ -16751,7 +16866,7 @@ fn a_chain_on_an_attached_value_transforms_the_value_not_the_name() {
     // A chain that leaves the value a list is still refused — the chain changes
     // where a modifier anchors, not what an option may hold.
     let list = run_with_input(
-        "func f(--tag = none) { puts \"tag=$tag\" }\nxs = [a b a]\nf(--tag=$xs:dedup)\n",
+        "any func f(--tag = none) { puts \"tag=$tag\" }\nxs = [a b a]\nf(--tag=$xs:dedup)\n",
     );
     assert!(
         String::from_utf8_lossy(&list.stderr).contains("list"),
@@ -16773,7 +16888,7 @@ fn a_chain_on_an_attached_value_transforms_the_value_not_the_name() {
     // the message no longer names `fo*` because the word never gets as far as
     // binding, where the name is judged. Recorded in `TODO.md`.
     let glob_name = run_with_input(
-        "func f(target = none, --tag = none) { puts \"$target/$tag\" }\nf(--fo*=bad[:upper)\n",
+        "any func f(target = none, --tag = none) { puts \"$target/$tag\" }\nf(--fo*=bad[:upper)\n",
     );
     assert!(
         String::from_utf8_lossy(&glob_name.stderr).contains("cannot apply string modifier"),
@@ -17090,14 +17205,14 @@ fn control_flow_in_a_value_call_argument_belongs_to_the_caller() {
     // An argument expression is evaluated in the caller's scope, so a `return` it
     // raises unwinds the *caller* — it must not be captured as the callee's result.
     let returned = run_with_input(
-        "func id(v) { return $v }\nfunc outer() { x = id(if true { return early })\n puts \"NOT REACHED $x\" }\nr = outer()\nputs \"outer=[$r]\"\n",
+        "any func id(v) { return $v }\nany func outer() { x = id(if true { return early })\n puts \"NOT REACHED $x\" }\nr = outer()\nputs \"outer=[$r]\"\n",
     );
     assert_eq!(String::from_utf8_lossy(&returned.stdout), "outer=[early]\n");
     assert!(returned.stderr.is_empty(), "{:?}", returned.stderr);
 
     // Likewise a `break` belongs to the caller's loop rather than being cleared.
     let broke = run_with_input(
-        "func id(v) { return $v }\nfor i in [1 2 3] {\n  x = id(if true { break })\n  puts \"iter $i\"\n}\nputs done\n",
+        "any func id(v) { return $v }\nfor i in [1 2 3] {\n  x = id(if true { break })\n  puts \"iter $i\"\n}\nputs done\n",
     );
     assert_eq!(String::from_utf8_lossy(&broke.stdout), "done\n");
 
@@ -17105,20 +17220,20 @@ fn control_flow_in_a_value_call_argument_belongs_to_the_caller() {
     // runs (no division error) and a named option whose expression broke is never
     // bound (no spurious type error).
     let later = run_with_input(
-        "func two(a, b) { return \"$a/$b\" }\nfor i in [1 2] {\n  x = two(if true { break }, 1 / 0)\n  puts \"iter $i\"\n}\nputs done\n",
+        "any func two(a, b) { return \"$a/$b\" }\nfor i in [1 2] {\n  x = two(if true { break }, 1 / 0)\n  puts \"iter $i\"\n}\nputs done\n",
     );
     assert_eq!(String::from_utf8_lossy(&later.stdout), "done\n");
     assert!(later.stderr.is_empty(), "{:?}", later.stderr);
 
     let named = run_with_input(
-        "func f(a, --force) { return $a }\nfor i in [1 2] {\n  x = f(if true { break }, force: if true { break })\n  puts \"iter $i\"\n}\nputs done\n",
+        "any func f(a, --force) { return $a }\nfor i in [1 2] {\n  x = f(if true { break }, force: if true { break })\n  puts \"iter $i\"\n}\nputs done\n",
     );
     assert_eq!(String::from_utf8_lossy(&named.stdout), "done\n");
     assert!(named.stderr.is_empty(), "{:?}", named.stderr);
 
     // `continue` still skips only its own iteration.
     let continued = run_with_input(
-        "func id(v) { return $v }\nfor i in [1 2 3] {\n  x = id(if $i == 2 { continue })\n  puts \"iter $i\"\n}\nputs done\n",
+        "any func id(v) { return $v }\nfor i in [1 2 3] {\n  x = id(if $i == 2 { continue })\n  puts \"iter $i\"\n}\nputs done\n",
     );
     assert_eq!(
         String::from_utf8_lossy(&continued.stdout),
@@ -17129,8 +17244,8 @@ fn control_flow_in_a_value_call_argument_belongs_to_the_caller() {
     // that expression must not run either, so no operator is applied to a value
     // that was never produced (which would report a spurious type error).
     for source in [
-        "func two(a, b) { return \"$a/$b\" }\nfor i in [1 2] {\n  x = two((if true { break }) + 1, 2)\n  puts \"iter $i\"\n}\nputs done\n",
-        "func one(a) { return $a }\nfor i in [1 2] {\n  x = one(-(if true { break }))\n  puts \"iter $i\"\n}\nputs done\n",
+        "any func two(a, b) { return \"$a/$b\" }\nfor i in [1 2] {\n  x = two((if true { break }) + 1, 2)\n  puts \"iter $i\"\n}\nputs done\n",
+        "any func one(a) { return $a }\nfor i in [1 2] {\n  x = one(-(if true { break }))\n  puts \"iter $i\"\n}\nputs done\n",
     ] {
         let out = run_with_input(source);
         assert_eq!(String::from_utf8_lossy(&out.stdout), "done\n", "{source:?}");
@@ -17173,7 +17288,7 @@ fn pending_loop_control_stops_every_statement_consumer() {
     //
     // The outer `for` runs twice if the `break` is not honored, so a body that
     // leaks would print twice as well.
-    let call = "func id(v) { return $v }\n";
+    let call = "any func id(v) { return $v }\n";
     for (label, source) in [
         (
             "for iterable",
@@ -17294,7 +17409,7 @@ fn a_statements_operands_do_not_become_its_result() {
     // Every header here ends in a truthy value but records a `false` on the way,
     // so a leak shows up as `1` (that `false`'s status) instead of `7`.
     let headers = run_with_input(
-        "func ifc() { 7 + 0\n if (if true { false\n 1 == 1 }) { return } }\n         func whilec() { 7 + 0\n while (if true { false\n 1 == 1 }) { return } }\n         func matchc() { 7 + 0\n match (if true { false\n 9 + 0 }) { _ => { return } } }\n         func forc() { 7 + 0\n for i in (if true { false\n [1] }) { return } }\n         a = ifc()\nb = whilec()\nc = matchc()\nd = forc()\n         puts \"[$a][$b][$c][$d]\"\n",
+        "any func ifc() { 7 + 0\n if (if true { false\n 1 == 1 }) { return } }\n         any func whilec() { 7 + 0\n while (if true { false\n 1 == 1 }) { return } }\n         any func matchc() { 7 + 0\n match (if true { false\n 9 + 0 }) { _ => { return } } }\n         any func forc() { 7 + 0\n for i in (if true { false\n [1] }) { return } }\n         a = ifc()\nb = whilec()\nc = matchc()\nd = forc()\n         puts \"[$a][$b][$c][$d]\"\n",
     );
     assert_eq!(
         String::from_utf8_lossy(&headers.stdout),
@@ -17307,7 +17422,7 @@ fn a_statements_operands_do_not_become_its_result() {
     // An assignment reports its own *status*, so a compound right-hand side must
     // not leave the assignment looking like a value-producing statement.
     let assigned = run_with_input(
-        "func plain() { x = if true { 5 + 0\n 6 + 0 }\n return }\n         func env() { 7 + 0\n $env.MESH_OPERAND = if true { 5 + 0\n 6 + 0 }\n return }\n         a = plain()\nb = env()\nputs \"[$a][$b]\"\n",
+        "any func plain() { x = if true { 5 + 0\n 6 + 0 }\n return }\n         any func env() { 7 + 0\n $env.MESH_OPERAND = if true { 5 + 0\n 6 + 0 }\n return }\n         a = plain()\nb = env()\nputs \"[$a][$b]\"\n",
     );
     assert_eq!(
         String::from_utf8_lossy(&assigned.stdout),
@@ -17318,8 +17433,9 @@ fn a_statements_operands_do_not_become_its_result() {
 
     // A guarded *pipeline* that is skipped produced nothing, exactly as a guarded
     // expression does, so the typed result before it still stands.
-    let skipped =
-        run_with_input("func f() { 1 == 2\n puts no if false\n return }\nx = f()\nputs \"[$x]\"\n");
+    let skipped = run_with_input(
+        "any func f() { 1 == 2\n puts no if false\n return }\nx = f()\nputs \"[$x]\"\n",
+    );
     assert_eq!(
         String::from_utf8_lossy(&skipped.stdout),
         "[false]\n",
@@ -17388,7 +17504,7 @@ fn a_builtin_value_call_cannot_be_a_function_name() {
     }
 
     // A name that merely contains or resembles it is unaffected.
-    let ok = run_with_input("func read(x) { return \"ok:$x\" }\ny = read(v)\nputs \"$y\"\n");
+    let ok = run_with_input("any func read(x) { return \"ok:$x\" }\ny = read(v)\nputs \"$y\"\n");
     assert_eq!(String::from_utf8_lossy(&ok.stdout), "ok:v\n");
     assert!(ok.stderr.is_empty(), "{:?}", ok.stderr);
 }
@@ -17551,7 +17667,7 @@ fn one_bad_definition_name_costs_only_its_own_definition() {
 #[test]
 fn a_value_call_evaluates_arguments_in_the_callers_scope() {
     // `f($x)` reads the caller's `$x`, not the callee's fresh scope.
-    let out = run_with_input("func id(v) { return $v }\nx = outer\ny = id($x)\nputs \"$y\"\n");
+    let out = run_with_input("any func id(v) { return $v }\nx = outer\ny = id($x)\nputs \"$y\"\n");
     assert_eq!(String::from_utf8_lossy(&out.stdout), "outer\n");
 }
 
@@ -17617,9 +17733,9 @@ fn a_bare_return_carries_the_result_so_far() {
     // freshly minted status: a value the body produced, the status of a command
     // that produced none, and the empty string when nothing ran at all.
     let out = run_with_input(
-        "func carried() { x = hello\n $x\n return }\n\
-         func empty() { return }\n\
-         func failed() { false\n return }\n\
+        "any func carried() { x = hello\n $x\n return }\n\
+         any func empty() { return }\n\
+         any func failed() { false\n return }\n\
          a = carried()\nb = empty()\nputs \"[$a][$b]\"\n\
          failed || puts command-status\nfailed() || puts value-status\n",
     );
@@ -17634,7 +17750,7 @@ fn a_bare_return_carries_the_result_so_far() {
     // A bare `false` is the boolean literal, so that is what the `return` carries;
     // its status view is 1, which is what makes the `||` fire in the first place.
     let chained = run_with_input(
-        "func f() { false || return }\nf && puts bad\nf || puts ok\nv = f()\nputs \"v=[$v]\"\n",
+        "any func f() { false || return }\nf && puts bad\nf || puts ok\nv = f()\nputs \"v=[$v]\"\n",
     );
     assert_eq!(String::from_utf8_lossy(&chained.stdout), "ok\nv=[false]\n");
     assert!(chained.stderr.is_empty(), "{:?}", chained.stderr);
@@ -17642,8 +17758,8 @@ fn a_bare_return_carries_the_result_so_far() {
     // What produced the result is *observed*: a branch's value survives the `if`
     // that ran it, and an expression that failed leaves no stale value behind.
     let observed = run_with_input(
-        "func nested() { if true { 1 == 2 }\n return }\n\
-         func failed() { 2 + 3\n 1 / 0\n return }\n\
+        "any func nested() { if true { 1 == 2 }\n return }\n\
+         any func failed() { 2 + 3\n 1 / 0\n return }\n\
          a = nested()\nb = failed()\nputs \"[$a][$b]\"\n",
     );
     assert_eq!(String::from_utf8_lossy(&observed.stdout), "[false][1]\n");
@@ -17651,7 +17767,7 @@ fn a_bare_return_carries_the_result_so_far() {
     // A call is a command like any other: the callee's own result, and its mark,
     // stay with the callee, so the caller records the call's *status*.
     let nested = run_with_input(
-        "func inner() { fail 7 }\nfunc outer() { 42 + 0\n inner\n return }\n\
+        "any func inner() { fail 7 }\nfunc outer() { 42 + 0\n inner\n return }\n\
          x = outer()\nputs \"x=[$x]\"\n",
     );
     assert_eq!(String::from_utf8_lossy(&nested.stdout), "x=[7]\n");
@@ -17659,8 +17775,8 @@ fn a_bare_return_carries_the_result_so_far() {
     // An argument's own statements record results of their own; they belong to
     // neither side, so a failing call still records its failure.
     let argument = run_with_input(
-        "func need2(a, b) { return \"$a$b\" }\n\
-         func outer() { need2(if true { 0 + 0\n 6 + 0 })\n return }\n\
+        "any func need2(a, b) { return \"$a$b\" }\n\
+         any func outer() { need2(if true { 0 + 0\n 6 + 0 })\n return }\n\
          outer && puts bad\nouter || puts ok\n",
     );
     assert_eq!(String::from_utf8_lossy(&argument.stdout), "ok\n");
@@ -17669,8 +17785,8 @@ fn a_bare_return_carries_the_result_so_far() {
     // typed one — still stands; and a compound argument's own result belongs to
     // the setup, not to a body that has produced nothing yet.
     let skipped = run_with_input(
-        "func f() { 1 == 2\n 4 + 5 if false\n return }\n\
-         func g(x) { return }\n\
+        "any func f() { 1 == 2\n 4 + 5 if false\n return }\n\
+         any func g(x) { return }\n\
          a = f()\nb = g(if true { 1 + 1 })\nputs \"[$a][$b]\"\n",
     );
     assert_eq!(String::from_utf8_lossy(&skipped.stdout), "[false][]\n");
@@ -17679,15 +17795,16 @@ fn a_bare_return_carries_the_result_so_far() {
     // a bare `return` is that string — status 0, since producing a value is
     // success. Quoting makes a value; `command -- "…"` is how a path with spaces
     // is run.
-    let quoted =
-        run_with_input("func f() { \"false\"\n return }\nf && puts ok\nv = f()\nputs \"v=[$v]\"\n");
+    let quoted = run_with_input(
+        "any func f() { \"false\"\n return }\nf && puts ok\nv = f()\nputs \"v=[$v]\"\n",
+    );
     assert_eq!(String::from_utf8_lossy(&quoted.stdout), "ok\nv=[false]\n");
 
     // A compound that ran but produced no value results in the empty string — not
     // the result the statement before it recorded, and not its own status. That is
     // what the same construct yields in value position, so the two agree.
     let empty_compound = run_with_input(
-        "func branch() { 5 + 0\n if true { }\n return }\n         func unbranched() { 5 + 0\n if false { 1 + 1 }\n return }\n         func elsewhere() { 5 + 0\n if false { 9 } else { }\n return }\n         func unmatched() { 5 + 0\n match 1 { 2 => { 3 + 3 } }\n return }\n         func unlooped() { 5 + 0\n while false { 1 + 1 }\n return }\n         a = branch()\nb = unbranched()\nc = elsewhere()\nd = unmatched()\ne = unlooped()\n         puts \"[$a][$b][$c][$d][$e]\"\n",
+        "any func branch() { 5 + 0\n if true { }\n return }\n         any func unbranched() { 5 + 0\n if false { 1 + 1 }\n return }\n         any func elsewhere() { 5 + 0\n if false { 9 } else { }\n return }\n         any func unmatched() { 5 + 0\n match 1 { 2 => { 3 + 3 } }\n return }\n         any func unlooped() { 5 + 0\n while false { 1 + 1 }\n return }\n         a = branch()\nb = unbranched()\nc = elsewhere()\nd = unmatched()\ne = unlooped()\n         puts \"[$a][$b][$c][$d][$e]\"\n",
     );
     assert_eq!(
         String::from_utf8_lossy(&empty_compound.stdout),
@@ -17703,7 +17820,7 @@ fn a_bare_return_carries_the_result_so_far() {
     // A branch that *did* produce keeps its value, so the normalization only
     // applies to a construct that produced nothing.
     let produced = run_with_input(
-        "func f() { 5 + 0\n if true { 1 == 2 }\n return }\na = f()\nputs \"[$a]\"\n",
+        "any func f() { 5 + 0\n if true { 1 == 2 }\n return }\na = f()\nputs \"[$a]\"\n",
     );
     assert_eq!(String::from_utf8_lossy(&produced.stdout), "[false]\n");
 
@@ -17712,7 +17829,7 @@ fn a_bare_return_carries_the_result_so_far() {
     // aggregate list — the same value the loop yields as the body's last
     // statement. A pass that produced nothing contributes the empty string.
     let aggregate = run_with_input(
-        "func carried() { for i in [1 2] { $i + 10 }\n return }\n         func direct() { for i in [1 2] { $i + 10 } }\n         func silent() { for i in [1 2] { }\n return }\n         a = carried()\nb = direct()\nc = silent()\n         puts \"[$a[0]][$a[1]][$b[0]][$b[1]][$c[0]][$c[1]]\"\n",
+        "any func carried() { for i in [1 2] { $i + 10 }\n return }\n         any func direct() { for i in [1 2] { $i + 10 } }\n         any func silent() { for i in [1 2] { }\n return }\n         a = carried()\nb = direct()\nc = silent()\n         puts \"[$a[0]][$a[1]][$b[0]][$b[1]][$c[0]][$c[1]]\"\n",
     );
     assert_eq!(
         String::from_utf8_lossy(&aggregate.stdout),
@@ -17727,10 +17844,10 @@ fn a_bare_return_carries_the_result_so_far() {
     // `return` carries outside the call. A default is the callee's code, so its
     // bare `return` carries the callee's result, which is nothing yet.
     let in_argument = run_with_input(
-        "func id(v) { v }\n\
-         func called() { 5 + 0\n x = id(if true { return })\n puts bad }\n\
-         func plain() { 5 + 0\n if true { return }\n puts bad }\n\
-         func defaulted(x = if true { return }) { puts bad }\n\
+        "any func id(v) { v }\n\
+         any func called() { 5 + 0\n x = id(if true { return })\n puts bad }\n\
+         any func plain() { 5 + 0\n if true { return }\n puts bad }\n\
+         any func defaulted(x = if true { return }) { puts bad }\n\
          a = called()\nb = plain()\nc = defaulted()\nputs \"[$a][$b][$c]\"\n",
     );
     assert_eq!(String::from_utf8_lossy(&in_argument.stdout), "[5][5][]\n");
@@ -17780,7 +17897,7 @@ fn a_conditional_list_is_still_the_functions_value() {
     // A final `&&` / `||` list is not a tail expression, but the branch that ran
     // still produced the body's result.
     let out = run_with_input(
-        "func f() { 1 == 2 || 3 + 4 }\nfunc g() { 1 == 1 && 4 + 5 }\nx = f()\ny = g()\nputs \"[$x][$y]\"\n",
+        "any func f() { 1 == 2 || 3 + 4 }\nany func g() { 1 == 1 && 4 + 5 }\nx = f()\ny = g()\nputs \"[$x][$y]\"\n",
     );
     assert_eq!(String::from_utf8_lossy(&out.stdout), "[7][9]\n");
     assert!(out.stderr.is_empty(), "{:?}", out.stderr);
@@ -17802,7 +17919,7 @@ fn a_guarded_final_expression_is_still_the_functions_value() {
     // A guard on the last statement does not stop it being the body's value; a
     // guard that fails leaves the expression unevaluated, so there is no value.
     let out = run_with_input(
-        "func f() { 1 + 1 if true }\nfunc g() { 1 + 1 if false }\nx = f()\ny = g()\nputs \"[$x][$y]\"\n",
+        "any func f() { 1 + 1 if true }\nany func g() { 1 + 1 if false }\nx = f()\ny = g()\nputs \"[$x][$y]\"\n",
     );
     assert_eq!(String::from_utf8_lossy(&out.stdout), "[2][]\n");
     assert!(out.stderr.is_empty(), "{:?}", out.stderr);
@@ -17812,7 +17929,7 @@ fn a_guarded_final_expression_is_still_the_functions_value() {
     // the result so far, or the `return` it guards carries the guard's bookkeeping
     // instead of what the body produced.
     let compound_guard = run_with_input(
-        "func returned() { 1 + 6\n return if (if 1 == 1 { false\n 1 == 1 }) }\n         func valued() { 1 + 6\n 2 + 3 if (if 1 == 1 { false\n 1 == 1 }) }\n         a = returned()\nb = valued()\nputs \"[$a][$b]\"\n",
+        "any func returned() { 1 + 6\n return if (if 1 == 1 { false\n 1 == 1 }) }\n         any func valued() { 1 + 6\n 2 + 3 if (if 1 == 1 { false\n 1 == 1 }) }\n         a = returned()\nb = valued()\nputs \"[$a][$b]\"\n",
     );
     assert_eq!(
         String::from_utf8_lossy(&compound_guard.stdout),
@@ -17830,7 +17947,7 @@ fn a_guarded_final_expression_is_still_the_functions_value() {
     // so an earlier statement's result still stands, exactly as a bare `return` in
     // its place would carry it. Only a body with nothing before it is empty.
     let earlier = run_with_input(
-        "func kept() { 1 + 1\n 3 + 4 if false }\n         func returned() { 1 + 1\n 3 + 4 if false\n return }\n         a = kept()\nb = returned()\nputs \"[$a][$b]\"\n",
+        "any func kept() { 1 + 1\n 3 + 4 if false }\n         any func returned() { 1 + 1\n 3 + 4 if false\n return }\n         a = kept()\nb = returned()\nputs \"[$a][$b]\"\n",
     );
     assert_eq!(
         String::from_utf8_lossy(&earlier.stdout),
@@ -17973,7 +18090,7 @@ fn a_value_call_streams_stdout_independently_of_its_value() {
     // The value call reads the return value; whatever the function prints still
     // streams (the channels are independent, `DESIGN.md`).
     let out = run_with_input(
-        "func work() { puts progress\n return done }\nr = work()\nputs \"got $r\"\n",
+        "any func work() { puts progress\n return done }\nr = work()\nputs \"got $r\"\n",
     );
     assert_eq!(String::from_utf8_lossy(&out.stdout), "progress\ngot done\n");
     assert!(out.stderr.is_empty(), "{:?}", out.stderr);
@@ -17981,15 +18098,15 @@ fn a_value_call_streams_stdout_independently_of_its_value() {
 
 #[test]
 fn a_lambda_is_a_value_called_through_its_variable() {
-    // `func(params) { … }` with the name left off is an anonymous function *value*:
+    // `any func(params) { … }` with the name left off is an anonymous function *value*:
     // bind it, then value-call it through the variable. The whole signature grammar
     // comes along — defaults, `key:` options, `...rest` — since it is the same
     // parser and the same binding as a named `func`.
     let out = run_with_input(
-        "double = func(x) { $x * 2 }\n\
-         greet = func(who = world) { \"hello $who\" }\n\
-         twice = func(x, --loud) { if $loud { return \"$x!\" }\n return $x }\n\
-         count = func(...xs) { $xs:len }\n\
+        "double = any func(x) { $x * 2 }\n\
+         greet = any func(who = world) { \"hello $who\" }\n\
+         twice = any func(x, --loud) { if $loud { return \"$x!\" }\n return $x }\n\
+         count = any func(...xs) { $xs:len }\n\
          a = $double(5)\n\
          b = $greet()\n\
          c = $greet(mesh)\n\
@@ -18012,11 +18129,11 @@ fn the_higher_order_modifiers_apply_a_callable_per_element() {
     // written inline.
     let out = run_with_input(
         "xs = [1 2 3 4]\n\
-         doubled = $xs:map(func(x) { $x * 2 })\n\
-         evens = $xs:filter(func(x) { $x % 2 == 0 })\n\
+         doubled = $xs:map(any func(x) { $x * 2 })\n\
+         evens = $xs:filter(any func(x) { $x % 2 == 0 })\n\
          fs = [\"a.txt\" \"b.md\" \"c.txt\"]\n\
-         stems = $fs:filter(func(f) { $f:ext == txt }):map(func(f) { $f:stem })\n\
-         twice = func(n) { $n * 2 }\n\
+         stems = $fs:filter(any func(f) { $f:ext == txt }):map(any func(f) { $f:stem })\n\
+         twice = any func(n) { $n * 2 }\n\
          through = [5]:map($twice)\n\
          puts ...$doubled\n\
          puts ...$evens\n\
@@ -18031,18 +18148,18 @@ fn the_higher_order_modifiers_apply_a_callable_per_element() {
 
     // `:each` runs for effect, in order, and yields mesh's "nothing" rather than the
     // list — so a chain cannot read side-effecting code as a transform.
-    let each = run_with_input("r = [a b]:each(func(x) { puts got-$x })\nputs \"[$r]\"\n");
+    let each = run_with_input("r = [a b]:each(any func(x) { puts got-$x })\nputs \"[$r]\"\n");
     assert_eq!(String::from_utf8_lossy(&each.stdout), "got-a\ngot-b\n[]\n");
 
     // An empty list is not a special case.
-    let empty = run_with_input("ys = []:map(func(x) { $x })\nputs $ys:len\n");
+    let empty = run_with_input("ys = []:map(any func(x) { $x })\nputs $ys:len\n");
     assert_eq!(String::from_utf8_lossy(&empty.stdout), "0\n");
 
     // Elements keep their types: a list element arrives as a list, not a rendering.
     let nested = run_with_input(
         "xss = [[1 2] [3]]\n\
-         lens = $xss:map(func(l) { $l:len })\n\
-         kept = $xss:filter(func(l) { $l:len == 2 })\n\
+         lens = $xss:map(any func(l) { $l:len })\n\
+         kept = $xss:filter(any func(l) { $l:len == 2 })\n\
          puts ...$lens\n\
          puts \"$kept:len $kept[0]:len\"\n",
     );
@@ -18052,15 +18169,15 @@ fn the_higher_order_modifiers_apply_a_callable_per_element() {
 #[test]
 fn a_filter_predicate_must_answer_with_a_boolean() {
     // mesh's truthiness is the *shell's* — an integer is true when it is zero — so
-    // reading a predicate loosely would make `:filter(func(x) { $x })` keep the
+    // reading a predicate loosely would make `:filter(any func(x) { $x })` keep the
     // zeros, and a transform used as a predicate (`:filter(:dir)`, once a bare
     // modifier reference is callable) keep everything, since a dirname is always a
     // non-empty string. `DESIGN.md` raises that footgun as an open question and
     // leans loud; requiring `true`/`false` makes it unreachable.
     for (predicate, kind) in [
-        ("func(x) { $x }", "an integer"),
-        ("func(x) { \"yes\" }", "a string"),
-        ("func(x) { [1] }", "a list"),
+        ("any func(x) { $x }", "an integer"),
+        ("any func(x) { \"yes\" }", "a string"),
+        ("any func(x) { [1] }", "a list"),
     ] {
         let out = run_with_input(&format!(
             "xs = [1 2]\nys = $xs:filter({predicate})\nputs after\n"
@@ -18081,16 +18198,22 @@ fn a_higher_order_callable_behaves_like_any_other_call() {
     // The point of routing these through the same machinery a written call uses: a
     // `return`, an arity mismatch, a runtime error, an escaped `break`, and an
     // `exit` all behave exactly as they do in `f(x)`.
-    let returned = run_with_input("ys = [1 2]:map(func(x) { return $x * 10 })\nputs ...$ys\n");
+    let returned = run_with_input("ys = [1 2]:map(any func(x) { return $x * 10 })\nputs ...$ys\n");
     assert_eq!(String::from_utf8_lossy(&returned.stdout), "10 20\n");
 
     for (src, needle) in [
         // Arity is checked per element, naming the modifier that made the call.
-        ("ys = [1 2]:map(func(a, b) { $a })\n", "expected 2 argument"),
+        (
+            "ys = [1 2]:map(any func(a, b) { $a })\n",
+            "expected 2 argument",
+        ),
         // A runtime error inside fails the statement rather than yielding a value.
-        ("ys = [1]:map(func(x) { $x + $nope })\n", "unbound variable"),
+        (
+            "ys = [1]:map(any func(x) { $x + $nope })\n",
+            "unbound variable",
+        ),
         // A `break` with no loop of its own is reported and fails the call.
-        ("ys = [1]:map(func(x) { break })\n", "not inside a loop"),
+        ("ys = [1]:map(any func(x) { break })\n", "not inside a loop"),
         // The argument has to be callable at all.
         (
             "ys = [1]:map(5)\n",
@@ -18098,7 +18221,7 @@ fn a_higher_order_callable_behaves_like_any_other_call() {
         ),
         // And the subject has to be a list, with the fix pointed at.
         (
-            "m = [a: 1]\nys = $m:map(func(x) { $x })\n",
+            "m = [a: 1]\nys = $m:map(any func(x) { $x })\n",
             "requires a list; for a map use `:keys` or `:values` first",
         ),
         // Written bare, they report the missing argument rather than claiming to be
@@ -18118,14 +18241,14 @@ fn a_higher_order_callable_behaves_like_any_other_call() {
     }
 
     // `exit` leaves the shell from inside a callable, as it does anywhere.
-    let exited = run_with_input("[1 2]:each(func(x) { exit 5 })\nputs unreachable\n");
+    let exited = run_with_input("[1 2]:each(any func(x) { exit 5 })\nputs unreachable\n");
     assert_eq!(exited.status.code(), Some(5));
     assert!(exited.stdout.is_empty(), "{:?}", exited.stdout);
 
     // Loop state is the callee's: a `break` inside the callable does not escape into
     // the loop the caller is running.
     let looped = run_with_input(
-        "for i in [1 2] {\n  ys = [9]:map(func(x) { break })\n  puts iter-$i\n}\nputs done\n",
+        "for i in [1 2] {\n  ys = [9]:map(any func(x) { break })\n  puts iter-$i\n}\nputs done\n",
     );
     assert_eq!(
         String::from_utf8_lossy(&looped.stdout),
@@ -18134,7 +18257,7 @@ fn a_higher_order_callable_behaves_like_any_other_call() {
 
     // And scope is a lambda's: globals yes, the enclosing function's locals no.
     let scoped = run_with_input(
-        "g = 10\nfunc outer() { n = 2\n  return [1]:map(func(x) { $x * $g })\n}\n\
+        "g = 10\nany func outer() { n = 2\n  return [1]:map(any func(x) { $x * $g })\n}\n\
          ys = outer()\nputs ...$ys\n",
     );
     assert_eq!(String::from_utf8_lossy(&scoped.stdout), "10\n");
@@ -18188,11 +18311,11 @@ fn a_lambda_travels_as_a_value() {
     // is called straight out of the element; and a global binding is visible to the
     // lambda's own body, which is what makes recursion work without a name.
     let out = run_with_input(
-        "func apply(f, x) { $f($x) }\n\
-         double = func(n) { $n * 2 }\n\
-         fact = func(n) { if $n == 0 { return 1 }\n return $n * $fact($n - 1) }\n\
-         fs = [func() { return seven }]\n\
-         m = [go: func() { return nine }]\n\
+        "any func apply(f, x) { $f($x) }\n\
+         double = any func(n) { $n * 2 }\n\
+         fact = any func(n) { if $n == 0 { return 1 }\n return $n * $fact($n - 1) }\n\
+         fs = [any func() { return seven }]\n\
+         m = [go: any func() { return nine }]\n\
          a = apply($double, 5)\n\
          b = $fact(5)\n\
          c = $fs[0]()\n\
@@ -18214,12 +18337,13 @@ fn a_lambda_sees_the_globals_and_not_the_enclosing_locals() {
     // over the scope it was written in, so a lambda inside a function cannot read
     // that function's locals; the read fails loud rather than resolving to
     // something surprising.
-    let sees = run_with_input("factor = 10\nf = func(x) { $x * $factor }\nv = $f(3)\nputs $v\n");
+    let sees =
+        run_with_input("factor = 10\nf = any func(x) { $x * $factor }\nv = $f(3)\nputs $v\n");
     assert_eq!(String::from_utf8_lossy(&sees.stdout), "30\n");
     assert!(sees.stderr.is_empty(), "{:?}", sees.stderr);
 
     let hidden = run_with_input(
-        "func outer() { n = 2\n inner = func(x) { $x * $n }\n return $inner(3) }\nv = outer()\nputs done\n",
+        "any func outer() { n = 2\n inner = any func(x) { $x * $n }\n return $inner(3) }\nv = outer()\nputs done\n",
     );
     assert!(
         String::from_utf8_lossy(&hidden.stderr).contains("n: unbound variable"),
@@ -18337,7 +18461,7 @@ fn capture_returns_a_record_of_every_channel() {
 fn capture_works_on_a_lambda_and_reads_a_captured_field() {
     // The callee is whatever a value call accepts, so a lambda captures too.
     let out = run_with_input(
-        "g = func(x) { puts side\nreturn $x }\n\
+        "g = any func(x) { puts side\nreturn $x }\n\
          r = $g(4):capture\n\
          puts \"v=$r.value out=[$r.out]\"\n",
     );
@@ -18544,7 +18668,7 @@ fn capture_covers_the_whole_invocation_including_its_arguments() {
     // command's own output. A captured mesh call never had that gap; the two agree
     // now.
     let external = run_with_input(
-        "func side() { puts from-arg\nreturn x }\n\
+        "any func side() { puts from-arg\nreturn x }\n\
          r = echo(side()):capture\n\
          puts \"out=[$r.out]\"\n",
     );
@@ -18555,7 +18679,7 @@ fn capture_covers_the_whole_invocation_including_its_arguments() {
     assert!(external.stderr.is_empty(), "{:?}", external.stderr);
 
     let mesh = run_with_input(
-        "func side() { puts from-arg\nreturn x }\nfunc takes(v) { puts $v }\n\
+        "any func side() { puts from-arg\nreturn x }\nfunc takes(v) { puts $v }\n\
          r = takes(side()):capture\n\
          puts \"out=[$r.out]\"\n",
     );
@@ -18608,7 +18732,7 @@ fn a_capture_waits_for_a_background_child_that_holds_the_channel() {
     };
 
     let (freed, quick) = timed(
-        "func f() { sleep 5 > /dev/null 2> /dev/null &\nreturn ok }\n\
+        "any func f() { sleep 5 > /dev/null 2> /dev/null &\nreturn ok }\n\
          r = f():capture\n\
          puts \"v=$r.value\"\n",
     );
@@ -18620,7 +18744,7 @@ fn a_capture_waits_for_a_background_child_that_holds_the_channel() {
 
     // Left inheriting them, the capture waits — the same answer bash gives.
     let (held, waited) =
-        timed("func f() { sleep 0.5 &\nreturn ok }\nr = f():capture\nputs \"v=$r.value\"\n");
+        timed("any func f() { sleep 0.5 &\nreturn ok }\nr = f():capture\nputs \"v=$r.value\"\n");
     assert_eq!(String::from_utf8_lossy(&held.stdout), "v=ok\n");
     assert!(
         waited >= std::time::Duration::from_millis(400),
@@ -18959,20 +19083,22 @@ fn a_wrapper_func_forwards_a_word_that_is_not_a_mesh_option_name() {
     // callee's. Typing flags moved name checking into expansion, and expansion
     // has to hear the call's flag policy or it rejects the word before the
     // wrapper's own policy applies.
-    let out = run_with_input("wrapper func g(...xs) { puts $xs:repr }\ng --foo.bar=v\ng --bad[\n");
+    let out =
+        run_with_input("any wrapper func g(...xs) { puts $xs:repr }\ng --foo.bar=v\ng --bad[\n");
     assert_eq!(
         String::from_utf8_lossy(&out.stdout),
         "[--foo.bar='v']\n[--bad[]\n"
     );
     assert!(out.stderr.is_empty(), "{:?}", out.stderr);
     // The value spelling is the same call, so it forwards the same way.
-    let value = run_with_input("wrapper func g(...xs) { return $xs }\nputs g(--foo.bar=v):repr\n");
+    let value =
+        run_with_input("any wrapper func g(...xs) { return $xs }\nputs g(--foo.bar=v):repr\n");
     assert_eq!(String::from_utf8_lossy(&value.stdout), "[--foo.bar='v']\n");
     // A plain `func` does read flags, so the same word is a mistake there — and
     // it is reported at the bind, which is the first point that knows the callee
     // parses mesh flags at all.
     for call in ["g --foo.bar=v", "puts g(--foo.bar=v)"] {
-        let plain = run_with_input(&format!("func g(...xs) {{ puts $xs:repr }}\n{call}\n"));
+        let plain = run_with_input(&format!("any func g(...xs) {{ puts $xs:repr }}\n{call}\n"));
         assert!(
             String::from_utf8_lossy(&plain.stderr).contains("`foo.bar` is not a name"),
             "{call}: {:?}",
@@ -19052,7 +19178,7 @@ fn a_wrapper_func_forwards_flags_in_a_value_call_too() {
     // a value-mode `g(--color=never)` used to scan the token as an option and fail
     // on a flag the wrapper never declared.
     let out = run_with_input(
-        "wrapper func g(...xs) { return $xs }\nputs g(--color=never, --, --help):repr\n",
+        "any wrapper func g(...xs) { return $xs }\nputs g(--color=never, --, --help):repr\n",
     );
     assert_eq!(
         String::from_utf8_lossy(&out.stdout),
@@ -21452,7 +21578,7 @@ fn file_filters_keep_the_matching_list_elements_and_chain() {
          puts ...$xs:f:x\n\
          one = run.sh\n\
          puts $one:files $one:exec $one:dirs $one:links\n\
-         same = $xs:filter(func(f) {{ $f:exec }})\n\
+         same = $xs:filter(any func(f) {{ $f:exec }})\n\
          puts ...$same\n\
          puts ...$xs:exec\n",
         dir.display()
@@ -21668,7 +21794,7 @@ fn a_modifier_reference_follows_the_value_type_like_the_postfix_form() {
          strict = abc ~ $rs[0]\n\
          loose = $rs:map(:i)\n\
          by_ref = abc ~ $loose[0]\n\
-         lam = $rs:map(func(r) { $r:i })\n\
+         lam = $rs:map(any func(r) { $r:i })\n\
          by_lambda = abc ~ $lam[0]\n\
          puts $strict $by_ref $by_lambda\n",
     );
@@ -21720,7 +21846,7 @@ fn a_modifier_reference_follows_the_value_type_like_the_postfix_form() {
 #[test]
 fn capture_is_not_a_modifier_a_reference_can_denote() {
     let out = run_with_input(
-        "func f() { puts ran\n\
+        "any func f() { puts ran\n\
          return 7 }\n\
          m = :capture\n\
          r = $m(f())\n",
@@ -21742,7 +21868,7 @@ fn capture_is_not_a_modifier_a_reference_can_denote() {
     // The postfix form is untouched — that is where `:capture` belongs, and there it
     // does capture, so `ran` lands in the record rather than on stdout.
     let postfix = run_with_input(
-        "func f() { puts ran\n\
+        "any func f() { puts ran\n\
          return 7 }\n\
          r = f():capture\n\
          puts $r.value $r.out:len\n",
@@ -21845,8 +21971,8 @@ fn an_invalid_break_in_a_reference_argument_recovers_like_a_lambda() {
 #[test]
 fn a_function_reference_is_a_callable() {
     let out = run_with_input(
-        "func up(s) { $s:upper }\n\
-         func long(s) { $s:len >= 2 }\n\
+        "any func up(s) { $s:upper }\n\
+         any func long(s) { $s:len >= 2 }\n\
          xs = [a bb ccc]\n\
          puts $xs:map(&up):join(\",\")\n\
          puts $xs:filter(&long):join(\",\")\n\
@@ -21874,8 +22000,8 @@ fn a_function_reference_is_a_callable() {
 #[test]
 fn a_function_reference_calls_the_whole_signature() {
     let out = run_with_input(
-        "func g(a, --loud = \"n\") { \"$a/$loud\" }\n\
-         wrapper func w(...rest) { $rest:join(\"|\") }\n\
+        "any func g(a, --loud = \"n\") { \"$a/$loud\" }\n\
+         any wrapper func w(...rest) { $rest:join(\"|\") }\n\
          f = &g\n\
          puts $f(x, loud: \"y\")\n\
          puts $f(x)\n\
@@ -21884,7 +22010,7 @@ fn a_function_reference_calls_the_whole_signature() {
     );
     assert_eq!(String::from_utf8_lossy(&out.stdout), "x/y\nx/n\na|b\n");
 
-    let arity = run_with_input("func up(s) { $s }\nf = &up\nputs $f()\n");
+    let arity = run_with_input("any func up(s) { $s }\nf = &up\nputs $f()\n");
     assert!(!arity.status.success());
     assert!(
         String::from_utf8_lossy(&arity.stderr).contains("up: expected 1 argument"),
@@ -21899,9 +22025,9 @@ fn a_function_reference_calls_the_whole_signature() {
 #[test]
 fn a_function_reference_resolves_when_it_is_called() {
     let out = run_with_input(
-        "func up(s) { \"first-$s\" }\n\
+        "any func up(s) { \"first-$s\" }\n\
          f = &up\n\
-         func up(s) { \"second-$s\" }\n\
+         any func up(s) { \"second-$s\" }\n\
          puts $f(x)\n",
     );
     assert_eq!(String::from_utf8_lossy(&out.stdout), "second-x\n");
@@ -21911,7 +22037,7 @@ fn a_function_reference_resolves_when_it_is_called() {
     // further down the file.
     let later = run_with_input(
         "f = &defined-later\n\
-         func defined-later(s) { \"ran-$s\" }\n\
+         any func defined-later(s) { \"ran-$s\" }\n\
          puts $f(x)\n",
     );
     assert_eq!(String::from_utf8_lossy(&later.stdout), "ran-x\n");
@@ -21923,7 +22049,7 @@ fn a_function_reference_resolves_when_it_is_called() {
     // pinned here so the asymmetry cannot drift unnoticed either way.
     let hook_first = run_with_input(
         "$sh.preprompt.x = &declared-below\n\
-         func declared-below() { puts hi }\n",
+         any func declared-below() { puts hi }\n",
     );
     // Asserted on stderr rather than the status: the refused assignment is not the
     // last statement, and a script's status is the last thing it ran.
@@ -21965,7 +22091,7 @@ fn a_function_reference_in_a_value_slot_yields_a_command_status() {
     // standing status: the second `:map` here sees what the first one left,
     // where a hard-coded `0` would have hidden it.
     let published = run_with_input(
-        "xs = [x]\nys = $xs:map(&false):map(func(_x) { $sh.status })\nputs $ys:repr\n",
+        "xs = [x]\nys = $xs:map(&false):map(any func(_x) { $sh.status })\nputs $ys:repr\n",
     );
     assert_eq!(
         String::from_utf8_lossy(&published.stdout),
@@ -22125,7 +22251,10 @@ fn a_function_reference_applied_per_element_needs_a_function() {
         // is named in the message.
         (
             "xs = [\"*.md\"]\ny = $xs:map(&glob)\n",
-            "&glob: a value call cannot be applied per element",
+            // The whole message, including the wrapper's `any`: a typeless one has
+            // no value channel, so a suggestion without it hands back a status.
+            "&glob: a value call cannot be applied per element; wrap it \
+             (`any func(x) { glob($x) }`)",
         ),
         // And a name that resolves to nothing is the other.
         (
@@ -22142,16 +22271,18 @@ fn a_function_reference_applied_per_element_needs_a_function() {
     // The wrapper the message points at is the working spelling.
     let dir = fresh_dir("func_ref_wrapped");
     std::fs::write(dir.join("one.md"), "x").unwrap();
+    // Printed rather than counted: `[status(0)]` is also one element long, so a
+    // length assertion passes on a typeless wrapper that returns nothing useful.
     let wrapped = run_with_input(&format!(
         "cd {}\n\
          xs = [\"*.md\"]\n\
-         y = $xs:map(func(p) {{ glob($p) }})\n\
-         puts $y:len\n",
+         y = $xs:map(any func(p) {{ glob($p) }})\n\
+         puts ...$y[0]\n",
         dir.display()
     ));
     assert_eq!(
         String::from_utf8_lossy(&wrapped.stdout),
-        "1\n",
+        "one.md\n",
         "{}",
         String::from_utf8_lossy(&wrapped.stderr)
     );
@@ -22168,7 +22299,7 @@ fn a_function_reference_captures_like_the_name_it_stands_for() {
         "f = &puts\n\
          r = $f(\"hi\"):capture\n\
          puts \"cmd=[$r.out] status=$r.status\"\n\
-         func up(s) { puts noise\n\
+         any func up(s) { puts noise\n\
          return $s:upper }\n\
          g = &up\n\
          v = $g(\"x\"):capture\n\
@@ -22211,8 +22342,8 @@ fn a_function_reference_captures_like_the_name_it_stands_for() {
     // Regressed once by evaluating the callee early to find out whether it was a
     // command reference; pinned here because nothing else caught it.
     let computed = run_with_input(
-        "func make() { puts maker\n\
-         return func() { puts body\n\
+        "any func make() { puts maker\n\
+         return str func() { puts body\n\
          return ok } }\n\
          r = (make())():capture\n\
          puts \"value=$r.value out=[$r.out]\"\n",
@@ -22227,7 +22358,7 @@ fn a_function_reference_captures_like_the_name_it_stands_for() {
     // The same rule an argument already followed, asserted beside it so the two
     // cannot drift back apart.
     let printing_argument = run_with_input(
-        "func side() { puts arg\n\
+        "any func side() { puts arg\n\
          return x }\n\
          r = puts(side()):capture\n\
          puts \"out=[$r.out]\"\n",
@@ -22259,8 +22390,8 @@ fn a_lambda_captures_by_an_explicit_list() {
     // The motivating case: a predicate that needs an argument of the function it
     // is written in. This is the example `DESIGN.md` argues from.
     let out = run_with_input(
-        "func pick(want) { xs = [\"a.txt\" \"b.md\" \"c.md\"]\n\
-         return $xs:filter(func(p) with ($want) { $p:ext == $want }):join(\",\") }\n\
+        "any func pick(want) { xs = [\"a.txt\" \"b.md\" \"c.md\"]\n\
+         return $xs:filter(any func(p) with ($want) { $p:ext == $want }):join(\",\") }\n\
          puts pick(\"md\")\n",
     );
     assert_eq!(String::from_utf8_lossy(&out.stdout), "b.md,c.md\n");
@@ -22268,19 +22399,19 @@ fn a_lambda_captures_by_an_explicit_list() {
     // Called immediately in the frame that wrote it, and outliving that frame:
     // both work, because the values were copied rather than the scope borrowed.
     let escaping = run_with_input(
-        "func f() { n = 41\n\
-         g = func() with ($n) { puts $n }\n\
+        "any func f() { n = 41\n\
+         g = any func() with ($n) { puts $n }\n\
          $g() }\n\
          f\n\
-         func make(tag) { n = 7\n\
-         return func() with ($tag, $n) { \"$tag/$n\" } }\n\
+         any func make(tag) { n = 7\n\
+         return str func() with ($tag, $n) { \"$tag/$n\" } }\n\
          g = make(\"hi\")\n\
          puts $g()\n",
     );
     assert_eq!(String::from_utf8_lossy(&escaping.stdout), "41\nhi/7\n");
 
     // Types survive the copy — a captured list is still a list.
-    let typed = run_with_input("xs = [1 2]\ng = func() with ($xs) { $xs:len }\nputs $g()\n");
+    let typed = run_with_input("xs = [1 2]\ng = any func() with ($xs) { $xs:len }\nputs $g()\n");
     assert_eq!(String::from_utf8_lossy(&typed.stdout), "2\n");
 }
 
@@ -22416,7 +22547,7 @@ fn a_definition_bakes_what_its_capture_list_names() {
 fn a_captured_definition_binds_however_it_is_called() {
     let out = run_with_input(
         "n = 20\n\
-         func twice() with ($n) { return ($n * 2) }\n\
+         any func twice() with ($n) { return ($n * 2) }\n\
          n = 0\n\
          twice\n\
          puts (twice())\n",
@@ -22428,7 +22559,7 @@ fn a_captured_definition_binds_however_it_is_called() {
     // different answer depending on which spelling reached it.
     let referenced = run_with_input(
         "n = 10\n\
-         func add(x) with ($n) { return ($x + $n) }\n\
+         any func add(x) with ($n) { return ($x + $n) }\n\
          n = 100\n\
          puts (add(1))\n\
          puts ([1 2]:map(&add))\n",
@@ -22439,7 +22570,7 @@ fn a_captured_definition_binds_however_it_is_called() {
     // by the time the reference is applied. Reading late here is not a wrong
     // answer but an unbound-variable error.
     let gone = run_with_input(
-        "for i in [5] { func plus(x) with ($i) { return ($x + $i) } }\n\
+        "for i in [5] { any func plus(x) with ($i) { return ($x + $i) } }\n\
          puts ([1 2]:map(&plus))\n",
     );
     assert_eq!(String::from_utf8_lossy(&gone.stdout), "6\n7\n");
@@ -22670,7 +22801,7 @@ fn a_function_answering_false_ends_a_while_that_binds_it() {
     // end, bound the sentinel, and then tripped over it comparing `false` to an
     // integer.
     let out = run_with_input(
-        "func nxt(_n) { if $_n < 3 { $_n + 1 } else { false } }\n\
+        "any func nxt(_n) { if $_n < 3 { $_n + 1 } else { false } }\n\
          n = 0\n\
          while n = nxt($n) { puts \"n=$n\" }\n\
          puts \"done n=$n\"\n",
@@ -22686,7 +22817,7 @@ fn a_function_answering_false_ends_a_while_that_binds_it() {
 fn a_value_function_answering_false_is_testable_where_bash_tests_a_status() {
     // Rough edge 25's motivating idiom, `find_up x && …`. Both spellings reach
     // the same answer: the binding condition, and the status `false` carries.
-    let script = "func find-up(_n) { if $_n == \"yes\" { \"/found\" } else { false } }\n";
+    let script = "any func find-up(_n) { if $_n == \"yes\" { \"/found\" } else { false } }\n";
 
     let bound = run_with_input(&format!(
         "{script}\
@@ -22819,13 +22950,13 @@ fn a_capture_inside_a_callee_does_not_decide_the_callers_status() {
     // failing capture and then returning a value has succeeded, so `if x = f()`
     // must take the then-branch. Raised in review on the capture-status change.
     let out = run_with_input(
-        "func f() { puts $(sh -c 'exit 3')\n  return ok }\nif x = f() { puts \"then=[$x]\" } else { puts \"else=[$x]\" }\n",
+        "any func f() { puts $(sh -c 'exit 3')\n  return ok }\nif x = f() { puts \"then=[$x]\" } else { puts \"else=[$x]\" }\n",
     );
     assert_eq!(String::from_utf8_lossy(&out.stdout), "\nthen=[ok]\n");
 
     // The same through a lambda, which reaches the callee half by another route.
     let lambda = run_with_input(
-        "g = func() { puts $(sh -c 'exit 3')\n  return ok }\nif y = $g() { puts \"then=[$y]\" } else { puts \"else=[$y]\" }\n",
+        "g = any func() { puts $(sh -c 'exit 3')\n  return ok }\nif y = $g() { puts \"then=[$y]\" } else { puts \"else=[$y]\" }\n",
     );
     assert_eq!(String::from_utf8_lossy(&lambda.stdout), "\nthen=[ok]\n");
 }
@@ -25719,7 +25850,7 @@ fn a_for_binding_belongs_to_its_loop() {
 
     // Nor does returning out of the loop from inside a function.
     let returned = run_with_input(
-        "i = \"before\"\nfunc f() { for i in [1 2] { return done } }\nputs f()\nputs $i\n",
+        "i = \"before\"\nany func f() { for i in [1 2] { return done } }\nputs f()\nputs $i\n",
     );
     assert_eq!(String::from_utf8_lossy(&returned.stdout), "done\nbefore\n");
 }
@@ -25897,8 +26028,8 @@ fn a_value_expression_can_be_a_command_argument() {
 #[test]
 fn spaced_value_arguments_stay_separate_arguments() {
     let out = run_with_input(
-        "func a() { return A }\n\
-         func b() { return B }\n\
+        "any func a() { return A }\n\
+         any func b() { return B }\n\
          puts (a()) (b())\n\
          puts (1 + 2) (3 + 4)\n\
          puts (a()) (b()) (a())\n",
@@ -25914,8 +26045,8 @@ fn spaced_value_arguments_stay_separate_arguments() {
     // Attached, it is the call it always was, and the rule is the argument's own top
     // level: inside a group the spacing freedom is back.
     let called = run_with_input(
-        "func a() { return func(x) { \"a got $x\" } }\n\
-         func b() { return B }\n\
+        "any func a() { return str func(x) { \"a got $x\" } }\n\
+         any func b() { return B }\n\
          puts (a())(b())\n\
          puts ((a()) (b()))\n",
     );
@@ -25935,11 +26066,11 @@ fn a_value_argument_stays_typed_for_a_builtin_and_bytes_for_an_external() {
     // per line and keeps a styled value's attributes, while argv gets the same loud
     // refusal it gives a bare list.
     let rendered =
-        run_with_input("func xs() { return [a b] }\nputs xs()\nputs style(x, fg: red)\n");
+        run_with_input("any func xs() { return [a b] }\nputs xs()\nputs style(x, fg: red)\n");
     assert_eq!(String::from_utf8_lossy(&rendered.stdout), "a\nb\nx\n");
     assert!(rendered.stderr.is_empty(), "{:?}", rendered.stderr);
 
-    let refused = run_with_input("func xs() { return [a b] }\n/bin/echo xs()\nputs after\n");
+    let refused = run_with_input("any func xs() { return [a b] }\n/bin/echo xs()\nputs after\n");
     assert!(
         String::from_utf8_lossy(&refused.stderr).contains("a list needs `...`"),
         "{:?}",
@@ -26019,7 +26150,7 @@ fn a_stage_evaluates_its_own_value_arguments_in_its_fork() {
     // left `n=MUTATED` before; backgrounded was refused rather than wrong.
     for source in ["puts change() | cat\n", "puts change() &\nwait\n"] {
         let isolated = run_with_input(&format!(
-            "n = before\nfunc change() {{ global n = MUTATED\n  return x }}\n{source}puts n=$n\n"
+            "n = before\nany func change() {{ global n = MUTATED\n  return x }}\n{source}puts n=$n\n"
         ));
         let stdout = String::from_utf8_lossy(&isolated.stdout);
         assert!(stdout.contains('x'), "{source:?}: {stdout:?}");
@@ -26045,7 +26176,7 @@ fn a_stage_evaluates_its_own_value_arguments_in_its_fork() {
     // known until the fork expands the words: an external to `exec`, a builtin, a
     // function — and an external that does not exist, still 127 with the same message.
     let kinds = run_with_input(
-        "func f(x) { puts f=$x }\n\
+        "any func f(x) { puts f=$x }\n\
          /bin/echo \"$(puts ext)\" | cat\n\
          puts \"$(puts builtin)\" | cat\n\
          f \"$(puts fn)\" | cat\n\
@@ -26095,7 +26226,7 @@ fn a_value_in_a_word_is_evaluated_when_that_word_is_expanded() {
     // reassigned it, so this ran `/bin/false` and printed nothing.
     let selected = run_with_input(
         "cmd = /bin/echo\n\
-         func g() { global cmd = /bin/false\n  return x }\n\
+         any func g() { global cmd = /bin/false\n  return x }\n\
          $cmd g()\n\
          puts status=$sh.status\n",
     );
@@ -26109,8 +26240,9 @@ fn a_value_in_a_word_is_evaluated_when_that_word_is_expanded() {
     // The general rule, both directions at once: the word before the call reads the
     // old value and the word after it reads the new one. Up-front evaluation printed
     // `second x second`.
-    let both =
-        run_with_input("n = first\nfunc g() { global n = second\n  return x }\nputs $n g() $n\n");
+    let both = run_with_input(
+        "n = first\nany func g() { global n = second\n  return x }\nputs $n g() $n\n",
+    );
     assert_eq!(String::from_utf8_lossy(&both.stdout), "first x second\n");
 
     // Word zero is expanded **once**, for all that it is asked several questions —
@@ -26123,8 +26255,8 @@ fn a_value_in_a_word_is_evaluated_when_that_word_is_expanded() {
         ("f", "f=hi\nran=1\n"),
     ] {
         let out = run_with_input(&format!(
-            "n = 0\nfunc f(x) {{ puts f=$x }}\n\
-             func pick() {{ global n = ($n + 1)\n  puts {names} }}\n\
+            "n = 0\nany func f(x) {{ puts f=$x }}\n\
+             any func pick() {{ global n = ($n + 1)\n  puts {names} }}\n\
              \"$(pick)\" hi\nputs ran=$n\n"
         ));
         assert_eq!(
@@ -26157,8 +26289,8 @@ fn a_redirect_target_is_expanded_after_every_word() {
     // `f * > summary` from globbing the file the redirection is about to create.
     let order = run_with_input(&format!(
         "order = ''\n\
-         func arg() {{ global order = \"${{order}}arg-\"\n  return x }}\n\
-         func tgt() {{ global order = \"${{order}}tgt\"\n  puts {} }}\n\
+         any func arg() {{ global order = \"${{order}}arg-\"\n  return x }}\n\
+         any func tgt() {{ global order = \"${{order}}tgt\"\n  puts {} }}\n\
          /bin/echo arg() > \"$(tgt)\"\nputs order=$order\n",
         target.display()
     ));
@@ -26192,7 +26324,7 @@ fn a_redirect_target_is_expanded_after_every_word() {
 
     // And a failing target does not stop the words from running.
     let failing = run_with_input(
-        "func g() { puts G-RAN\n  return x }\nputs g() > $missing | cat\nputs s=$sh.status\n",
+        "any func g() { puts G-RAN\n  return x }\nputs g() > $missing | cat\nputs s=$sh.status\n",
     );
     let stdout = String::from_utf8_lossy(&failing.stdout);
     assert!(stdout.contains("G-RAN"), "{stdout:?}");
@@ -26245,7 +26377,7 @@ fn control_flow_inside_a_value_argument_belongs_to_the_caller() {
     // the enclosing function. Evaluated as top-level code it reported "not inside a
     // function" and the body carried on past it.
     let returned = run_with_input(
-        "func f() { puts (if true { return 7 })\n  puts BAD }\nx = f()\nputs x=$x:repr\n",
+        "any func f() { puts (if true { return 7 })\n  puts BAD }\nx = f()\nputs x=$x:repr\n",
     );
     assert_eq!(String::from_utf8_lossy(&returned.stdout), "x=7\n");
     assert!(returned.stderr.is_empty(), "{:?}", returned.stderr);
@@ -26289,7 +26421,7 @@ fn a_redirect_after_a_value_argument_still_redirects() {
     assert_eq!(String::from_utf8_lossy(&compared.stdout), "true\nfalse\n");
 
     // The connectives sit below comparison too, so they keep their readings.
-    let connected = run_with_input("func f() { return v }\nputs f() && puts second\n");
+    let connected = run_with_input("any func f() { return v }\nputs f() && puts second\n");
     assert_eq!(String::from_utf8_lossy(&connected.stdout), "v\nsecond\n");
 
     let _ = std::fs::remove_dir_all(&dir);
@@ -26310,7 +26442,7 @@ fn text_glued_to_a_value_argument_is_a_loud_error() {
         // the capture as a separate argument.
         "/bin/echo hi >out$(puts suffix)\n",
     ] {
-        let out = run_with_input(&format!("func f() {{ return v }}\n{source}"));
+        let out = run_with_input(&format!("any func f() {{ return v }}\n{source}"));
         let stderr = String::from_utf8_lossy(&out.stderr);
         assert!(
             stderr.contains("a value argument cannot have text attached"),
@@ -26326,7 +26458,7 @@ fn text_glued_to_a_value_argument_is_a_loud_error() {
 
     // And a value argument flush against the *end* of a command is not glued text —
     // a newline sits there too.
-    let trailing = run_with_input("func f() { return v }\nputs f()\nputs f();\n");
+    let trailing = run_with_input("any func f() { return v }\nputs f()\nputs f();\n");
     assert_eq!(String::from_utf8_lossy(&trailing.stdout), "v\nv\n");
     assert!(trailing.stderr.is_empty(), "{:?}", trailing.stderr);
 }
@@ -27202,23 +27334,23 @@ fn a_leading_not_negates_a_commands_status_in_a_condition() {
     // any of this — the negation changes neither. Raised in review.
     for (source, expected) in [
         (
-            "func g() { while not [a] = [x] { 7 } }\nv = g()\nputs \"[$v]\"\n",
+            "any func g() { while not [a] = [x] { 7 } }\nv = g()\nputs \"[$v]\"\n",
             "[]\n",
         ),
         (
-            "func g() { while [a b] = [x] { 7 } }\nv = g()\nputs \"[$v]\"\n",
+            "any func g() { while [a b] = [x] { 7 } }\nv = g()\nputs \"[$v]\"\n",
             "[]\n",
         ),
         (
-            "func g() { while false { 7 } }\nv = g()\nputs \"[$v]\"\n",
+            "any func g() { while false { 7 } }\nv = g()\nputs \"[$v]\"\n",
             "[]\n",
         ),
         (
-            "func g() { while not test -d / { 7 } }\nv = g()\nputs \"[$v]\"\n",
+            "any func g() { while not test -d / { 7 } }\nv = g()\nputs \"[$v]\"\n",
             "[0]\n",
         ),
         (
-            "func g() { while test -d /nonexistent-mesh-path { 7 } }\nv = g()\nputs \"[$v]\"\n",
+            "any func g() { while test -d /nonexistent-mesh-path { 7 } }\nv = g()\nputs \"[$v]\"\n",
             "[0]\n",
         ),
     ] {
@@ -28256,7 +28388,7 @@ fn sh_pipestatus_breaks_a_pipeline_down_by_stage() {
     // rule calls false — `$c != 0` would be cross-type and select every stage.
     let out = run_with_input(
         "sh -c 'exit 3' | sh -c 'exit 0' | sh -c 'exit 7'\n\
-         bad = $sh.pipestatus:filter(func(c) { not $c })\nputs ...$bad\n",
+         bad = $sh.pipestatus:filter(any func(c) { not $c })\nputs ...$bad\n",
     );
     assert_eq!(String::from_utf8_lossy(&out.stdout), "3 7\n");
 
@@ -28334,7 +28466,7 @@ fn a_while_reports_its_last_passs_breakdown_not_its_final_tests() {
     // which displaced the pass's value, so a `while` in tail position answered the
     // loop's code instead of what its last pass evaluated. Raised in review.
     let valued = run_with_input(
-        "func f() { n = 0\n  while test $n -lt 1 { n = 1\n    7 + 0 } }\nputs f()\n",
+        "any func f() { n = 0\n  while test $n -lt 1 { n = 1\n    7 + 0 } }\nputs f()\n",
     );
     assert_eq!(
         String::from_utf8_lossy(&valued.stdout),
@@ -28344,12 +28476,12 @@ fn a_while_reports_its_last_passs_breakdown_not_its_final_tests() {
     );
     // The reference: a value condition, which never had the problem, agrees.
     let reference =
-        run_with_input("func f() { n = 0\n  while $n < 1 { n = 1\n    7 + 0 } }\nputs f()\n");
+        run_with_input("any func f() { n = 0\n  while $n < 1 { n = 1\n    7 + 0 } }\nputs f()\n");
     assert_eq!(String::from_utf8_lossy(&reference.stdout), "7\n");
 
     // A loop whose condition was false from the start ran no pass, so it produced
     // nothing and reports its own 0 rather than restoring what it never made.
-    let never = run_with_input("func g() { while false { 7 } }\nputs \"[$(g())]\"\n");
+    let never = run_with_input("any func g() { while false { 7 } }\nputs \"[$(g())]\"\n");
     assert_eq!(String::from_utf8_lossy(&never.stdout), "[]\n");
     assert_eq!(
         status_line("while false { sh -c 'exit 4' | true }"),
@@ -29207,7 +29339,7 @@ fn return_leaves_a_sourced_file_and_gives_source_its_status() {
     // function's and the file keeps going.
     let inside = run(
         "lib.mesh",
-        "func f() { return 9 }\nx = f()\nputs fn $x\nfail 2\n",
+        "any func f() { return 9 }\nx = f()\nputs fn $x\nfail 2\n",
         "source lib.mesh\nputs after $sh.status\n",
     );
     assert_eq!(String::from_utf8_lossy(&inside.stdout), "fn 9\nafter 2\n");
@@ -29835,7 +29967,7 @@ fn sh_jobs_is_a_map_of_job_records() {
 
     // The records are values, so the filter from `DESIGN.md` works verbatim.
     let out = run_with_input(
-        "sleep 5 &\nrunning = $sh.jobs:values:filter(func(j) { $j.state == running })\n\
+        "sleep 5 &\nrunning = $sh.jobs:values:filter(any func(j) { $j.state == running })\n\
          puts $running:len\n",
     );
     assert_eq!(String::from_utf8_lossy(&out.stdout), "1\n");
@@ -33392,7 +33524,7 @@ fn a_builtin_with_no_options_reports_a_flag_rather_than_printing_it() {
 #[test]
 fn a_declared_modifier_runs_when_it_is_applied() {
     let out = run_with_input(
-        "func _s:shout() { return \"$_s!\" }\n\
+        "any func _s:shout() { return \"$_s!\" }\n\
          x = hi\n\
          puts $x:shout\n\
          puts \"$x:shout\"\n\
@@ -33414,7 +33546,7 @@ fn a_declared_modifier_runs_when_it_is_applied() {
     // An argument reaches it the way any call's does, and a chain mixes freely
     // with the built-ins in either order.
     let mixed = run_with_input(
-        "func _s:wrap(_c) { return \"$_c$_s$_c\" }\n\
+        "any func _s:wrap(_c) { return \"$_c$_s$_c\" }\n\
          x = ab\n\
          puts $x:wrap(\"*\")\n\
          puts \"${x:wrap(\"*\")}\"\n\
@@ -33429,8 +33561,8 @@ fn a_declared_modifier_runs_when_it_is_applied() {
     // Its own vocabulary, so an ordinary `func` of the same name is untouched and
     // unreachable as `:foo` — and the modifier is unreachable as a command.
     let namespaces = run_with_input(
-        "func foo() { puts command }\n\
-         func _s:foo() { return \"[$_s]\" }\n\
+        "any func foo() { puts command }\n\
+         any func _s:foo() { return \"[$_s]\" }\n\
          foo\n\
          x = q\n\
          puts $x:foo\n",
@@ -33443,7 +33575,7 @@ fn a_declared_modifier_runs_when_it_is_applied() {
     // And by reference, which is the spelling `DESIGN.md` offers for passing one
     // to a higher-order modifier.
     let referenced = run_with_input(
-        "func _s:foo() { return \"[$_s]\" }\n\
+        "any func _s:foo() { return \"[$_s]\" }\n\
          xs = [a b]\n\
          puts $xs:map(:foo)\n\
          m = :foo\n\
@@ -33462,10 +33594,10 @@ fn a_declared_modifier_resolves_when_it_is_called() {
     // A later declaration reaches a *delayed* use, and redefining changes what an
     // already-written use runs. Exactly what `func f { g }` buys, and no more.
     let late = run_with_input(
-        "func f() { x = hi; puts $x:said }\n\
-         func _s:said() { return \"one($_s)\" }\n\
+        "any func f() { x = hi; puts $x:said }\n\
+         any func _s:said() { return \"one($_s)\" }\n\
          f\n\
-         func _s:said() { return \"two($_s)\" }\n\
+         any func _s:said() { return \"two($_s)\" }\n\
          f\n",
     );
     assert_eq!(String::from_utf8_lossy(&late.stdout), "one(hi)\ntwo(hi)\n");
@@ -33483,14 +33615,15 @@ fn a_declared_modifier_resolves_when_it_is_called() {
 
     // Nowhere is out of bounds, because there is no pre-pass to keep honest: a
     // declaration inside a branch binds when the branch runs.
-    let nested = run_with_input("if true { func _s:cond() { return C } }\nx = q\nputs $x:cond\n");
+    let nested =
+        run_with_input("if true { any func _s:cond() { return C } }\nx = q\nputs $x:cond\n");
     assert_eq!(String::from_utf8_lossy(&nested.stdout), "C\n");
 
     // And a sourced library's modifiers work in the script that sources it —
     // the boundary a load-time check could not see across.
     let dir = fresh_dir("sourced_modifier");
     let library = dir.join("lib.mesh");
-    std::fs::write(&library, "func _s:lib() { return \"lib:$_s\" }\n").expect("write library");
+    std::fs::write(&library, "any func _s:lib() { return \"lib:$_s\" }\n").expect("write library");
     let sourced = run_with_input(&format!(
         "source {}\nx = q\nputs $x:lib\n",
         library.to_str().unwrap()
@@ -33505,8 +33638,8 @@ fn a_declared_modifier_resolves_when_it_is_called() {
 #[test]
 fn a_declared_modifier_is_element_wise_unless_its_subject_is_a_rest() {
     let out = run_with_input(
-        "func _s:tag() { return \"<$_s>\" }\n\
-         func ..._xs:count() { return $_xs:len }\n\
+        "any func _s:tag() { return \"<$_s>\" }\n\
+         any func ..._xs:count() { return $_xs:len }\n\
          xs = [a b]\n\
          puts $xs:tag\n\
          puts $xs:count\n\
@@ -33531,7 +33664,7 @@ fn a_declared_modifier_is_element_wise_unless_its_subject_is_a_rest() {
     // are where an Oxford join differs from a plain one: no separator at one, no
     // comma at two, a comma before the conjunction from three on.
     let oxford = run_with_input(
-        "func ..._xs:oxford(_conj) {\n\
+        "any func ..._xs:oxford(_conj) {\n\
          if $_xs:len < 3 { return $_xs:join(\" $_conj \") }\n\
          _head = $_xs[..-1]:join(\", \")\n\
          return \"$_head, $_conj $_xs[-1]\"\n\
@@ -33567,8 +33700,8 @@ fn a_declared_modifier_is_element_wise_unless_its_subject_is_a_rest() {
         ("puts $empty:pad", "expected 1 argument(s), got 0"),
     ] {
         let out = run_with_input(&format!(
-            "func _s:tag() {{ return $_s }}\n\
-             func _s:pad(_n) {{ return $_s }}\n\
+            "any func _s:tag() {{ return $_s }}\n\
+             any func _s:pad(_n) {{ return $_s }}\n\
              empty = []\n\
              {source}\n"
         ));
@@ -33580,12 +33713,12 @@ fn a_declared_modifier_is_element_wise_unless_its_subject_is_a_rest() {
     }
     // …and a *correct* call on an empty list is still the empty list.
     let empty =
-        run_with_input("func _s:pad(_n) { return $_s }\nempty = []\nputs $empty:pad(8):repr\n");
+        run_with_input("any func _s:pad(_n) { return $_s }\nempty = []\nputs $empty:pad(8):repr\n");
     assert_eq!(String::from_utf8_lossy(&empty.stdout), "[]\n");
 
     // A map is neither, and says which modifier to reach for. A placeholder for a
     // question `TODO.md` keeps open, not an answer to it.
-    let map = run_with_input("func _s:tag() { return $_s }\nm = [k: v]\nputs $m:tag\n");
+    let map = run_with_input("any func _s:tag() { return $_s }\nm = [k: v]\nputs $m:tag\n");
     assert!(
         String::from_utf8_lossy(&map.stderr).contains("`:keys` or `:values`"),
         "{}",
@@ -33682,7 +33815,7 @@ fn a_spread_reaches_an_argument_taking_modifier() {
 #[test]
 fn an_anonymous_spread_is_not_given_an_invented_name() {
     let resolved =
-        run_with_input("func _s:nest() { return [[a b]] }\nxs = [q]\n/bin/echo ...$xs:nest\n");
+        run_with_input("any func _s:nest() { return [[a b]] }\nxs = [q]\n/bin/echo ...$xs:nest\n");
     let stderr = String::from_utf8_lossy(&resolved.stderr);
     assert!(stderr.contains("...: nested list element"), "{stderr}");
     assert!(!stderr.contains("$..."), "{stderr}");
@@ -33760,7 +33893,7 @@ fn a_declared_modifier_body_runs_in_the_stage_that_wrote_it() {
         "puts ...$xs:change | cat",
     ] {
         let out = run_with_input(&format!(
-            "func _s:change() {{ global n = after; return $_s }}\n\
+            "any func _s:change() {{ global n = after; return $_s }}\n\
              n = before\n\
              x = q\n\
              xs = [q]\n\
@@ -33777,7 +33910,7 @@ fn a_declared_modifier_body_runs_in_the_stage_that_wrote_it() {
 
     // A backgrounded stage is the other half of the same rule.
     let background = run_with_input(
-        "func _s:change() { global n = after; return $_s }\n\
+        "any func _s:change() { global n = after; return $_s }\n\
          n = before\n\
          x = q\n\
          puts \"$x:change\" &\n\
@@ -33802,7 +33935,7 @@ fn a_declared_modifier_body_runs_in_the_stage_that_wrote_it() {
     // is refused rather than silently done in the parent, exactly as
     // `cmd $(…) > out &` is. Raised in review as a P1.
     let heredoc = run_with_input(
-        "func _s:change() { global n = after; return $_s }\n\
+        "any func _s:change() { global n = after; return $_s }\n\
          n = before\n\
          x = q\n\
          cat << END &\n\
@@ -33827,7 +33960,7 @@ fn a_declared_modifier_body_runs_in_the_stage_that_wrote_it() {
             "'END'"
         };
         let out = run_with_input(&format!(
-            "func _s:change() {{ return $_s }}\nx = q\ncat << {quoted} &\n{body}\nEND\nwait\n"
+            "any func _s:change() {{ return $_s }}\nx = q\ncat << {quoted} &\n{body}\nEND\nwait\n"
         ));
         assert!(
             out.status.success(),
@@ -33902,8 +34035,8 @@ fn a_modifier_declaration_names_its_subject_left_of_the_colon() {
     for source in [
         "func _s:shorten() { puts short }",
         "func _s:pad(_n) { puts padded }",
-        "func ..._xs:oxford(_conj) { puts joined }",
-        "func ..._xs:longest() { puts longest }",
+        "any func ..._xs:oxford(_conj) { puts joined }",
+        "any func ..._xs:longest() { puts longest }",
         // `_s` is the docs' naming style, not a rule — the subject is an ordinary
         // parameter name.
         "func a:b() { puts x }",
@@ -33976,7 +34109,7 @@ fn a_modifier_cannot_be_a_wrapper() {
 fn a_modifier_declaration_can_open_its_body_on_the_next_line() {
     for source in [
         "func _s:shorten()\n{\nputs body\n}\n",
-        "func ..._xs:oxford(_conj)\n{\nputs body\n}\n",
+        "any func ..._xs:oxford(_conj)\n{\nputs body\n}\n",
         "func _s:pad(_n)\n{\nputs body\n}\n",
     ] {
         let out = run_with_input(&format!("{source}puts after\n"));

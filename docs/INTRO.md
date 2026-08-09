@@ -157,9 +157,9 @@ add to. The subject sits left of the colon in the declaration, exactly where the
 call site puts it:
 
 <pre>
-<strong>func _s:shout()  { return "$_s!" }</strong>        # $x:shout
-<strong>func _s:wrap(_c) { return "$_c$_s$_c" }</strong>   # $x:wrap("*")
-<strong>func ..._xs:oxford(_conj) { … }</strong>           # a ... subject takes the whole list at once
+<strong>str func _s:shout()  { return "$_s!" }</strong>        # $x:shout
+<strong>str func _s:wrap(_c) { return "$_c$_s$_c" }</strong>   # $x:wrap("*")
+<strong>str func ..._xs:oxford(_conj) { … }</strong>       # a ... subject takes the whole list at once
 </pre>
 
 A plain subject receives one element, so `$xs:shout` on `[a b]` gives
@@ -270,8 +270,8 @@ instead of swallowing them. See [`docs/PROMPT.md`](PROMPT.md) for a real prompt
 built this way.
 
 <pre>
-<strong>$sh.prompt.dir  = func() { style(if inside-project() { "$(vcs prompt-info)" } else { tilde-pwd() }, fg: blue) }</strong>
-<strong>$sh.prompt.auth = func() { if not ssh-id-loaded() { style("SSH", fg: yellow) } }</strong>   # nothing to show → omitted
+<strong>$sh.prompt.dir  = any func() { style(if inside-project() { "$(vcs prompt-info)" } else { tilde-pwd() }, fg: blue) }</strong>
+<strong>$sh.prompt.auth = any func() { if not ssh-id-loaded() { style("SSH", fg: yellow) } }</strong>   # nothing to show → omitted
 <strong>$sh.postcd.fetch = func() { vcs auto-fetch &amp; }</strong>                                     # runs only on a real cd
 </pre>
 
