@@ -5553,6 +5553,33 @@ entry records what each costs.
             whatever has been written in the meantime.
       - [ ] Still open: whether a compound kind is writable at all (`list`, or a
             list of what).
+      - [ ] **Open decision: is there a `job` type — and if not, why is `value`
+            the answer?** Asked directly by the repo owner, twice, and not
+            actually settled either time. A **job is a real value kind**: `$j`
+            is one, `$j.status` reads it, and `$sh.jobs` is a map of job
+            records, so `job func find-server()` is a sentence someone could
+            reasonably want to write. Leaving it out means such a function
+            declares `value`, which is true but says less than the truth.
+
+            **The reason it was not added is a boundary question, not a
+            judgment about jobs**, and that is the part worth deciding. The
+            vocabulary was closed on purpose to keep this *channel* checking
+            rather than a type system. If the set is "every value kind the
+            runtime has", it is not closed and never can be: the migration also
+            turned up styled strings, `Instant`, and `Duration`, each with
+            exactly as good a claim as `job`, and each new one is a precedent
+            for the next. If the set is instead "the kinds worth naming at a
+            function boundary", then `job` earns its place on use, not on
+            existence — and nothing in the tests wanted it except an identity
+            function, for which `value` is the *correct* answer rather than a
+            fallback, since what it returns is whatever it was given.
+
+            So: pick the rule, and `job` follows from it. Adding it later is a
+            feature, not a break — it costs one `ReturnType` entry, one word in
+            `TYPE_MARKER_WORDS`, and nothing else — so deferring is cheap and
+            reversible, which is why the migration used `value` rather than
+            waiting. What is *not* cheap is adding kinds one at a time without
+            the rule, which is how a closed set stops being one.
       - [ ] **User-defined types are not a goal** — the set is closed on purpose.
             Recorded here so the next reader treats it as the boundary that keeps
             this a check rather than a type system, not as a gap to fill.
