@@ -5600,19 +5600,29 @@ entry records what each costs.
       that are not obvious are the ones that need the hatch. The narrowing and
       its migration are **one commit** — do not land the break without the fixes.
 
-      One case worth re-deciding rather than annotating:
-      `a_bare_return_carries_the_result_so_far` asserts
-      `func carried() { x = hello; $x; return }` yields `hello`. As a `str func`
-      that keeps working, but a bare `return` in a non-`status` func is exactly
-      what the static check above is meant to flag, so the test is asserting
-      something the language is about to stop meaning. Decide what it should say
-      before mechanically typing it.
+      `a_bare_return_carries_the_result_so_far` needs no decision — typing it
+      `str func` keeps it asserting `hello`, verified: the same bare `return`
+      carries the result so far and yields `'hello'`, where the typeless spelling
+      now yields `status(0)` like every other case here. An earlier note here
+      called it a case to re-decide; that was wrong, and what it actually
+      exposes is a defect in the *static check* below rather than in the test.
 - [ ] **Static check: `return $v` in a func that declares no type.** Local to one
       definition, so no resolver pass — which is the point, per §"Beyond M3 —
       Static checks" below on why mesh cannot have one. The diagnostic names the
       fix: declare a type.
-- [ ] **Static check: a declared type the body cannot produce.** A bare `return`,
-      or a tail that is a command, in a func that declares a type. Same locality.
+- [ ] **Static check: a declared type the body cannot produce.** A tail that is
+      a command, in a func that declares a type. Same locality.
+
+      **The bare-`return` half is dropped, and why matters.** It read "a bare
+      `return` in a func declaring a non-`status` type", which would reject
+      `str func f() { x = hello; $x; return }` — where the result so far is a
+      `str` and the function is correct. Whether a bare `return` can satisfy the
+      declared type depends on what the body produced before it, which no
+      syntactic check can see. That is the boundary this whole feature is drawn
+      at (every check answerable from one definition, no resolver pass), so the
+      check does not belong here rather than needing a cleverer version of
+      itself. The tail-is-a-command half stays: that one *is* answerable from
+      syntax, since a command produces exactly a `Status`.
 
       **Both halves are scoped to types a `Status` does not satisfy**, and neither
       fires for a declared `status`. A command tail produces exactly a `Status(n)`,
