@@ -136,6 +136,10 @@ Delete an entry once you have agreed with it or reversed it.
       (`DESIGN.md`:1270), and `match` literal arms are `==` under first-match
       traversal, so a `match` with both a `"--help"` arm and a `--help` arm
       would raise on whichever came first and make the correct one unreachable.
+      *(The first two are about **today's code**, not the language — see
+      §"Decisions needed", option C: `apply_modifier` returns a `Result`, so a
+      fallible `:dedup` is buildable. The `match`-ordering half stands on its
+      own and is the durable argument here.)*
       Scoping to the operator keeps all three working and still refuses the
       case the decision was about. The alternative is to make those operations
       fallible too, which is a much larger change and can still be made later.
@@ -4576,6 +4580,14 @@ thing a reader takes on trust.*
         `"--help"` arm and a `--help` arm raises on whichever comes first,
         making the correct later arm unreachable.
 
+        *(Narrowed after the fact: "nowhere to put the error" is true of the
+        code as written, not of the language — `apply_modifier` returns a
+        `Result` and list `-` is unbuilt, so both could report. See
+        §"Decisions needed", *How loud should a mismatch be?*, option C. What
+        survives unconditionally is the **arm-ordering** half: a refusal in an
+        arm aborts at the arm rather than at a value the writer chose, which no
+        change of signature fixes.)*
+
         So the split is operator versus mechanism. `==` and `!=` are where a
         person states a belief, and a wrong one is worth refusing.
         `:dedup`, list `-`, hashing and `match` dispatch are mechanisms that
@@ -7133,7 +7145,7 @@ two other shells' answers turned out to be strictly better than ours.
       every existing single-quoted string.
 
 - [ ] **A `match` must be exhaustive — most likely by requiring a default arm.**
-      Directed by mikelward. **Option B of the five weighed under §"Decisions needed", *How
+      Directed by mikelward. **Option B of the six weighed under §"Decisions needed", *How
       loud should a mismatch be?*** — that entry is where the choice is made;
       this one is the build notes for it. Don't start until it is chosen. This
       **reverses a lean**: `DESIGN.md` §Matching records
@@ -8114,6 +8126,14 @@ unguarded, alongside fish and elvish, and carries a `TODO:` naming this entry.
       `:dedup` is a `HashSet<Value>` and a
       `match` literal arm is `==` under first-match traversal — neither can accept
       a fallible answer. `DESIGN.md` §"Comparison across types" is canonical.
+      *("Forced" is about **the code as it stands**, not about the language, and
+      a later entry establishes the stronger reading — see §"Decisions needed",
+      *How loud should a mismatch be?*, option C (Codex, #472). `match_bindings`
+      and `apply_modifier` both return a `Result`, so an arm and `:dedup` could
+      each report; the `HashSet` is an implementation of `:dedup`, not its
+      definition. Read this sentence as "operator-only is what today's code
+      admits without restructuring", which is what it was deciding — not as
+      "propagating the refusal is impossible", which C shows is false.)*
       *(This sentence used to list map keys as a third case "hashing to agree"
       with `Value::eq`. That was never true — `Value::Map` is
       `Vec<(String, Value)>` (`vars.rs`:41) and scalar keys render to text before
@@ -8488,7 +8508,7 @@ the same web, and each correction after that has more sites to miss.
 ## Beyond M3 — Type-strict equality
 
 - [ ] **Equality compares only within a type — a status is never equal to an
-      int.** Directed by mikelward. **Option A of the five weighed under
+      int.** Directed by mikelward. **Option A of the six weighed under
       §"Decisions needed", *How loud should a mismatch be?*** — that entry is
       where the choice is made; this one is the build notes for it. Don't start
       until it is chosen. This **reverses a decided entry**, so the
@@ -8581,8 +8601,22 @@ the same web, and each correction after that has more sites to miss.
       can report before the filter runs (Codex, #472; the C analysis under
       §"Decisions needed" works this through, and this paragraph was still
       asserting the opposite two screens above it). So **every** silent row is
-      silent by choice. A leaves them that way because it changes `Value::eq`
-      and stops there, which is a decision open to revisiting rather than a wall.
+      silent by choice. A leaves them that way because it stops at the two places
+      below, which is a decision open to revisiting rather than a wall.
+
+      **What A actually has to change, since "just `Value::eq`" is wrong**
+      (Codex, #472). A's *one loud row* does not come from `Value::eq` at all:
+      `eval_binary` gates the comparison first and admits a status/int pair
+      through `numeric_pair` (`repl.rs`:8345), and the code says why in a
+      comment — *"it has to be **here** rather than only in `Value::eq`: this
+      gate runs first, so an equality the operator never reaches is an equality
+      nobody sees."* Change `Value::eq` alone and `$sh.status == 0` does not
+      refuse; it reaches the comparison and answers a silent **`false`** — the
+      exact opposite of the row A is chosen for, and an eighth silent change
+      rather than the one loud one. So A is **two** edits: drop the status/int
+      exception from the operator gate, which buys the refusal, *and* change
+      `Value::eq`, which is what the other seven consumers see. The stopping
+      point that makes the seven silent is everything past those two.
 
       The two `match` rows are worth keeping apart: without a catch-all the result is the
       silent `""` this file's exhaustiveness entry is about, and with one it is a
@@ -10270,6 +10304,329 @@ a one-line edit. Every claim below was checked against the built shell.
       settled `:flag` behavior above, where `"--n=2":flag` holds the integer
       `2`. Note B1 already pays most of what `Flag` used to cost, since a
       separate class without the refusal is one table row.
+
+- [ ] **How loud should a mismatch be? Pick one of six.** Two entries in this
+      file — §"Beyond M3 — Type-strict equality" and the exhaustive-`match` item
+      under §"Beyond M3 — Static checks" — were filed separately at mikelward's
+      direction, then noticed to be answers to the same question and gathered
+      here to be chosen between. Each stays filed as the build notes for
+      whichever wins; **this entry is the choice**, and nothing should be built
+      until it is made.
+
+      **The question underneath both.** mesh has three places where a value can
+      fail to be what the code expected, and today two of them are quiet:
+
+      ```mesh
+      $sh.status == 0                          # loud if the types don't meet — refuses
+      match $sh.status { 0 => … ; _ => … }     # quiet — a non-match just falls through
+      match $kind { file => … ; dir => … }     # quiet — nothing hit, the answer is ""
+      ```
+
+      Strict equality makes the *type* mismatch loud. Exhaustiveness makes the
+      *unhandled case* loud. They are not the same failure, which is why picking
+      one does not get you the other.
+
+      **There is a fourth failure none of the six reaches, and it is worth
+      naming before the table rather than after** (Codex, #472). Everything
+      below is about mismatches that run through the *equality* — which is why
+      C is scoped to "every consumer of the equality" and E inherits that
+      scope. A **pattern-kind** mismatch never gets there: a regex, glob or
+      structural arm decides on kind or shape and misses first. Verified on the
+      current build, all three redirecting to `_` at exit `0`:
+
+      ```mesh
+      match 7 { /x/ => …  ; _ => … }     # a regex against an int — quiet miss
+      match 7 { [n] => …  ; _ => … }     # a list pattern against an int — quiet miss
+      match 7 { x* => …   ; _ => … }     # a glob against an int — quiet miss
+      ```
+
+      The constructor entry on this branch already records the mechanism for
+      the structural case — *"a list pattern against an int never reaches the
+      equality comparison, it fails the destructure first"* — and the table did
+      not absorb it. Making these loud is a rule about pattern **shape**
+      against a subject, a different mechanism from anything the six weigh, so
+      it is named as out of scope rather than folded into a row.
+
+      **The one finding that shapes the choice:** *exhaustiveness does not rescue
+      strict equality.* A `match` that already ends in `_` passes any
+      exhaustiveness check and still silently redirects to `_` when a `0` arm
+      stops matching a status — and requiring catch-alls everywhere *increases*
+      the number of sites in that state. Anyone assuming the two compose into
+      "both failures fixed" is wrong, in both directions. (Found by Codex on
+      #472; each entry now records its half.)
+
+      **Whether there is a *seventh* answer is open, and it blocks calling
+      these six exhaustive.** `main` adopted, in `3d033ff`, *an operation that
+      hands back a value fails when it has none; a predicate answering no keeps
+      `false`* (`DESIGN.md`:8169). An expression-position `match` that hits no
+      arm hands back a value and has none, so by the letter of that rule it
+      should **fail** — and that is not among A–F, since A, C and F all preserve
+      the `""`. Either the rule reaches `match`, in which case failure-on-miss
+      is a seventh answer that also changes what every row's *quiet* column
+      means, or `match` is exempt the way statement-position `match` already is
+      on effect-only-dispatch grounds. **Filed for the repo owner, not guessed
+      here**; Codex reached the same conflict independently (#472). Until it is
+      settled, read the six as the options *given today's miss behavior* rather
+      than as a closed set.
+
+      | | What gets loud | What stays quiet | What it costs |
+      |---|---|---|---|
+      | **A. Strict equality** | `==` / `!=` across types, so `$sh.status == 0` refuses and names `:code` | every other consumer of the same equality — a `0` arm on a status, a `0..=255` range arm, `[status(0) 0]:dedup`, `0 in $sh.pipestatus`, `[status(0)]:has(0)`, `[status(0)] == [0]` — all silently flip answer | 8 verified behavior changes, **7 of them silent** (the two plain `match` rows differ: no catch-all yields `""`, a catch-all redirects into `_`). No users to migrate at 0.0.0, so the cost is not a transition — it is that no static check can find the silent seven, so they stay quiet *permanently*; plus rewriting the `$sh.status == 0` and `match $sh.status { 0 => … }` sites throughout `docs/` that A makes wrong. Note it takes `Status` **out of** the numeric class; whether any class then remains depends on the *open* `1 == 1.0` question, so "no more classes" is not a benefit A can claim on its own |
+      | **B. Exhaustive `match`** | any **expression-position** `match` with no unguarded catch-all — and statement-position ones *too*, if that open subdecision goes that way; picking B does not settle it, and requiring it there reverses a recorded exemption (see B's build notes) | every type mismatch in a `match` that **passes** the check, and every non-`match` consumer untouched. Not *"exactly as today"*, which an earlier draft claimed (Codex, #472): a **non-exhaustive** match's mismatch is not quiet under B, it is **rejected**, so that program stops running rather than misdirecting. Verified — `r = match status(0) { "x" => 1 }` yields `""` today and would not compile under B, while `match status(0) { "x" => 1 ; _ => 2 }` yields `2` today and still would. Adding the `_` B demands moves the first into the second's row, so the quiet set *grows back* under the migration B forces. That is D's finding, which stated it for the pair while this row contradicted it | one default arm per site; ~half of the multi-arm examples in `docs/` already have `_` — but the *number* of sites moves with that same subdecision, since the `docs/` figures count expression-position matches and exclude effect-only dispatch. Leaning no-keyword per mikelward, which drops the `partial match …` compatibility question entirely. Open alongside it: whether `else` becomes mandatory on an expression-position `if` by the same argument |
+      | **C. Strict equality, propagated into dispatch** | every *type mismatch*, in every consumer — an arm, an `in`, `:has`, nested `==`, `:dedup`, and list `-` once it lands. **"Every" holds only with a pre-pass in each short-circuiting consumer** — an arm, `in`, `:has`, nested `==` and list `-` all stop at the first answer, so under the cheaper reading this column is "every mismatch the traversal reaches" and its loudness depends on element order, and on *arm* order for a `match`; see the bullet below | **the unhandled case**, exactly as under A and F: `match "x" { "y" => 1 }` is a same-type miss, so C never sees it and it still yields `""`. C covers none of B | **much larger than A's, and mostly not about statuses at all** — C propagates the operator's *existing* cross-type refusal into every consumer, so plain int/string pairs break too: `1 in ["1"]`, `[1]:has("1")`, `[1] == ["1"]` are `false` today and `[1 "1"]:dedup` is 2 elements; all four become errors. Plus A's own, plus every already-unequal status/int pair, plus the arm-abort question — all of it repo-internal, since there are no users. See the bullet below — this is really a second decision |
+      | **D. A and B together** | the union of A's one loud row and B's check, at whatever scope B's statement-position subdecision settles on — but see the finding above; they do **not** cover each other | **the silent consumers that are not `match` sites** — `:dedup`, `in`, `:has`, nested `==` — unchanged, since B never looks at them. The `match` rows split (Codex, #472): the two *non-exhaustive* ones (a lone `0 =>` arm, a lone range arm) are **rejected outright** by B rather than missing silently, so D does eliminate those two — but only until they are given the `_` B demands, at which point they rejoin the silent-redirect row. That is the entry's central finding stated as a migration: B converts a silent miss into a compile error and then the fix converts it back | both costs, no discount for doing them together |
+      | **E. C and B together** | **every *equality-based* type mismatch in every consumer, and every unhandled case** — the most any row in this set covers, and it does so under **two** conditions, one from each half: C taken with the pre-passes (on the cheaper reading an unreached pair stays quiet here too — in `in` and `:has` as much as in nested `==`, and an arm that dispatch never reaches likewise), and B's statement-position subdecision going the *inclusive* way (otherwise an effect-only `match` that hits no arm is still a quiet miss) | **pattern-kind mismatches**, which no row here reaches (Codex, #472). A regex, glob or structural arm misses on *kind or shape* before any equality runs, so C never sees it and B only demands a catch-all for it to fall into. Verified: `match 7 { /x/ => … ; _ => … }`, `match 7 { [n] => … ; _ => … }` and `match 7 { x* => … ; _ => … }` all redirect to `_` at exit 0 — the glob spelled **bare**, since `word_globs` only reads metacharacters in bare text and a quoted `"x*"` is a string literal whose miss *is* an equality mismatch (Codex, #472). So E is not "nothing quiet" — it is nothing quiet *among equality-based mismatches*, subject to both conditions above | C's cost plus B's, with no discount. Added after the first draft offered only five and omitted the strictest coherent policy (Codex, #472): D pairs B with the *weaker* A, so anyone wanting both propagated type errors and exhaustive matches had no row to point at. Note C's own price is conditional — see the bullet below — so this row inherits that conditionality too |
+      | **F. Neither** | — | all of it, as today | none |
+
+      **How each one feels to write.** This is the half that does not show up in
+      a consequence table, and two measurements against the current tree matter
+      more than intuition here:
+
+      - ***A is cheaper than it sounds.*** The reflex it breaks is not actually
+        the everyday spelling: `if $sh.status { … }` is already the idiomatic
+        success test (`DESIGN.md` says so outright), a bare `if cmd { … }` needs
+        no comparison at all, and a stored `s = status(0)` is a condition
+        directly — all three verified. So A's felt cost is one vocabulary item,
+        `:code`, at the places that genuinely want the number. What it really
+        costs is not ergonomics but the *silent* rows: `match $sh.status { 0 =>
+        … }` is the shell reflex, and under A it stops working without saying so.
+      - ***B is more expensive than it sounds.*** Roughly **half** of the
+        realistic multi-arm `match` examples in `docs/` carry no `_` today (7 of
+        14 in `DESIGN.md`, 1 of 3 in `REFERENCE.md`), so this is a real edit
+        across the docs and the test suite, not a formality. In exchange every
+        branch point states its own totality, and `match` stops being able to
+        return `""` for a reason nobody wrote down. mesh reads more like Rust at
+        branch points and less like `case`.
+      - ***C is the strictest and the least shell-like — and still does not
+        finish the job.*** It buys the loudest version of the type mismatch, at
+        the price that a heterogeneous `match` — one subject that might be a
+        status or a string — stops being writable, because an arm that cannot
+        match aborts the whole construct rather than being skipped. **Guards do
+        not rescue it**, which an earlier draft implied (Codex, #472):
+        `eval_match_expr` runs `match_bindings` *before* evaluating an arm's
+        guard (`repl.rs`:7663 and :7672), so an incompatible literal arm aborts
+        before its guard is reached.
+
+        **What C forecloses is narrower than that sentence, though — a
+        heterogeneous *literal-equality* arm, not a heterogeneous `match` as
+        such** (Codex, #472, correcting a claim that the subject binder was the
+        only rewrite). A **constructor pattern** — the `status(P)` shape
+        settled in `DESIGN.md` §Matching, a *type test* rather than a
+        comparison — neither refuses nor aborts:
+
+        ```mesh
+        match f() { status(n) => … ; "x" => … }   # still writable under C
+        ```
+
+        A string skips the `status(n)` arm quietly (wrong variant) and reaches
+        `"x"`, a same-type comparison; a status takes `status(n)` and never
+        reaches the string literal.
+
+        **That last clause is the whole escape, and it only holds under C's
+        cheaper reading** (Codex, #472). "Never reaches" is a statement about
+        *dispatch*, so the escape is worth exactly what dispatch-order is worth:
+        under **reached-arm C** it works as described, and under **full C** it
+        does not exist. The full reading's arm pre-pass inspects every arm
+        before dispatching — that is what makes it full — so it inspects the
+        `"x"` arm against a status subject, finds the same status/string
+        incompatibility, and aborts, with the variant-total `status(n)` arm
+        sitting above it making no difference. Ordering buys nothing once
+        nothing stops early.
+
+        So C's escape hatch is not a property of C, it is a property of the
+        *cheap* C. Under full C a heterogeneous `match` is **unwritable**,
+        constructor pattern or not, and the subject binder is the only way out
+        after all — which is the claim this bullet was corrected *away from*
+        earlier, and is right again for the other reading. Whichever way the
+        pre-pass question below settles therefore also settles whether this
+        escape exists, so the two are one decision rather than two.
+
+        **The per-type arm has to be *variant-total*, and "one constructor arm
+        per type" is not enough** (Codex, #472, tightening the sentence that
+        first replaced the subject-binder claim). `status(n)` and `status(_)`
+        are total over the variant; `status(0)` is not — it also tests the
+        payload, so a `status(1)` subject misses it and falls through to the
+        incompatible `"x"` literal, which aborts under C exactly as before:
+
+        ```mesh
+        match f() { status(0) => … ; "x" => … }   # a status(1) subject still aborts
+        match f() { status(n) => match $n { 0 => … ; _ => … } ; "x" => … }   # writable
+        ```
+
+        So value-specific dispatch has to be **nested inside** the total arm
+        rather than sitting beside it, and a structural list pattern has the
+        same shape of hole — one that can miss on length or element shape is
+        not variant-total either.
+
+        **And the total arm has to be *unguarded*** (Codex, #472). A failed
+        guard is not a taken arm: `eval_match_expr` restores the bindings and
+        `continue`s to the next arm (`repl.rs`:7870-7873), so `status(n) if
+        false` leaves the subject to meet the incompatible literal below it and
+        abort under C, exactly as if the total arm were not there. Verified with
+        a pattern that exists today — `match f() { status(1) if false => … ;
+        "x" => … ; _ => … }` over a `status(1)` subject reaches the `_`, having
+        passed *through* the string arm on the way. This is the same
+        load-bearing word as in option B's check, for the same reason: a guarded
+        total pattern looks total and is not.
+
+        The rewrite is therefore *an **unguarded** variant-total arm per type,
+        ordered before any incompatible literal, with the value tests inside
+        it* — **under reached-arm C only**, per the qualification above; under
+        full C there is no rewrite and the subject binder is the only way out.
+        Where it does apply, binding the subject remains **one** way out rather
+        than the only one. Two caveats stop this making C cheap. The constructor pattern has
+        to be **built** — it does not exist today. And the escape covers only
+        the types that get one: `DESIGN.md` settles the `status(P)` shape as a
+        variant test, so statuses are safe, but whether the **styled** family
+        gets the same pattern is the one-or-two question that entry leaves open,
+        and until it is answered a styled subject beside an incompatible literal
+        has no rewrite at all. An earlier draft made the whole escape
+        conditional on the *variant reading* instead — that reading is settled,
+        and only the coverage question is open (Codex, #472, after mikelward's
+        request to check the knock-on).
+        How far C reaches took **three** corrections, all Codex on #472, and
+        the third reversed the second. A first draft said "loud everywhere"; a
+        second said two consumers were out of reach; a third said one. **The
+        answer is none** — every consumer sits behind a fallible boundary
+        already. Read *consumer of the equality* throughout: C says nothing
+        about a **same-type** miss, so `match "x" { "y" => 1 }` still yields
+        `""` under it, and an earlier draft's bare "everything" / "nothing"
+        implied otherwise (Codex, #472). C covers no part of B.
+
+        - an arm, `in`, and `:has`, the last being `in`'s modifier spelling
+          over the same `values.contains`;
+        - **nested `==`**, since `eval_binary` returns a `Result`
+          (`repl.rs`:8112), so its `Equal` / `NotEqual` paths can run a
+          recursive fallible comparator while `Value::eq` stays total — but
+          **that comparator short-circuits, and C's promise has to be written
+          around it** (Codex, #472). `[0 "x"] == [1 2]` answers `false` at the
+          first pair and never visits the incompatible `"x"`/`2` one, so "every
+          nested mismatch is loud" holds only for the mismatches the traversal
+          actually reaches. Two ways out, and the row has to pick one: narrow
+          the guarantee to *reached* pairs, or buy the full answer the way
+          `:dedup` does below — a compatibility pre-pass over both operands
+          before the equality runs, which costs a second full walk and makes
+          the loudness independent of element order. Left unstated, the row
+          promises a loudness the obvious implementation does not deliver.
+
+          **This is not a fact about nested `==`; it is a fact about every
+          consumer that stops early** (Codex, #472, generalizing the bullet
+          that named only this one). `in` and `:has` are the same shape and
+          were listed in C's loud column as though they were covered: both are
+          `values.contains` — `repl.rs`:8409 and `expand.rs`:2533 — which
+          returns on the first match and never compares the rest. Verified
+          today: `1 in [1 "x"]` is `true`, and `[1 "x"]:has(1)` is `true`,
+          neither one having looked at the `"x"`. Under C the incompatible
+          element is reached only when the match comes *after* it, so the
+          guarantee for these two is order-dependent exactly as it is for
+          nested `==`, and the pre-pass they would need is a second full walk
+          apiece. So the rule for the whole row is: **C's "every" costs a
+          pre-pass in every consumer whose traversal short-circuits** — `in`,
+          `:has`, nested `==`, and list `-` once it lands — and **`:dedup` does not escape
+          either**, though this sentence said it did — and contradicted its own
+          bullet below, which already specifies the pre-pass it needs. A
+          `HashSet` visits every element but only calls `eq` **within a hash
+          bucket**, so `1` and `"1"` hash apart and are never compared at all:
+          visiting is not comparing, and without the pre-pass C leaves that
+          mismatch quiet (Codex, #472). **Nothing escapes** — every consumer
+          of the equality pays a pre-pass under C. An
+          earlier draft specified the pre-pass for nested `==` and `:dedup`
+          alone, which understated C's cost by three consumers and left three
+          advertised guarantees resting on element order.
+
+          **`match` dispatch is the third, and its pre-pass is the expensive
+          one** (Codex, #472). `eval_match_expr` returns the moment an arm wins
+          (`repl.rs`:7876), so an incompatible arm *after* the winner is never
+          compared — `match 1 { 1 => "hit" ; "x" => "later" }` answers `hit`
+          today without ever looking at the string arm, exactly as
+          `1 in [1 "x"]` never looks at the `"x"`. The arm heads C's loud
+          column, so this is the same omission as `in` and `:has`, on the very
+          consumer the row is named for. But its pre-pass is not merely a second
+          walk: arm patterns are **evaluated expressions**, and the constructor
+          entry on this branch establishes that a payload can carry **effects**,
+          so checking every arm for compatibility ahead of dispatch runs code
+          that dispatch would have skipped. No other consumer has that cost —
+          which is why C's guarantee for `match` may have to be written as *the
+          arms dispatch reaches* rather than every arm. **And "runs skipped
+          code" understates it: a pattern can transfer control** (Codex, #472).
+          `match 1 { 1 => "hit" ; (if true { return "escaped" }) => "later" }`
+          answers `hit` today, verified — the escaping pattern is never reached.
+          Under a full pre-pass it *is* reached, so the function returns
+          `escaped` instead: not a lost side effect but a **changed answer**,
+          and the compatibility scan never finishes to deliver the guarantee it
+          was added for. The interpreter already knows this — `arm_may_leave`
+          (`repl.rs`:12532) exists to ask whether an arm can unwind, and its own
+          comment gives `match 1 { (if true { return 1 }) => 2 }` as the case.
+          So full C has to say which it takes: **restrict** patterns that can
+          leave, **isolate** the pre-pass from control flow, or **accept** that
+          some programs answer differently. That is a third thing to decide, not
+          a price to quote;
+        - **list `-`** once built, by that same route — `DESIGN.md` §"Binary
+          `-`" defines list difference over the same equality, and `[status(0)]
+          - [0]` would otherwise silently change what it removes. It is absent
+          from A's verified inventory because it is not implemented (`-` on two
+          lists reports *expected integer* today), so it is a forward
+          obligation rather than a sixth row;
+        - and **`:dedup`**, which two drafts called a structural limit and is
+          not one. `apply_modifier` returns `Result<Value, ExpandError>`
+          (`expand.rs`:1747), so the arm can report; the `Eq`/`Hash` contract
+          constrains *the current implementation* — a `HashSet` used as a
+          filter (`expand.rs`:1881) — not the language operation.
+
+        **So C is the fully loud option *for type mismatches* — and `:dedup`
+        joining it costs less than a further draft claimed.** That draft said a fallible
+        comparison must be O(n²) against the `HashSet`'s O(n). Not so (Codex,
+        #472): a fallible **pre-pass** can check the elements are mutually
+        comparable — O(n) — and then run the existing `HashSet` filter unchanged
+        when they are. **Every input pays, not only the incompatible one**
+        (Codex, #472, correcting the draft that made this point): the pre-pass is
+        how compatibility is *determined*, so it runs first on every `:dedup`,
+        and a compatible list walks twice. The bound stays O(n) — the fix is that
+        C's O(n²) worry was wrong, not that C is free — but the steady-state cost
+        is a second full traversal of every successful `:dedup`, which is what
+        belongs in the comparison against the other options.
+
+        **C's real cost is scope, and it is mostly not about statuses.** C does
+        not merely propagate A's new status/int refusal — it propagates the
+        operator's **existing** cross-type refusal into every consumer, and that
+        refusal was deliberately scoped to the top-level operand pair
+        (`DESIGN.md`: *"`[1] == ["1"]` — false, nested, not an error"*). Undo the
+        scoping and ordinary programs containing no status at all break.
+        Verified on a build:
+
+        ```mesh
+        1 in ["1"]          # false → error
+        [1]:has("1")        # false → error
+        [1] == ["1"]        # false → error
+        [1 "1"]:dedup:len   # 2     → error
+        ```
+
+        **So C is a second decision wearing the first one's clothes** (Codex,
+        #472). Choosing it means reopening *the refusal lives in the operator,
+        not in equality* — a settled rule with its own argument — and the status
+        pair is a small part of what then changes. Weigh it on that basis, not
+        as "A with more of the same". C is also noisier than A in the other
+        direction: an already-unequal pair is a quiet `false` today *and under
+        A* — `status(0) in [1]`, `[status(0)]:has(1)`, `[status(0)] == [1]`, all
+        verified — and an error under C, so it complains about membership tests
+        that were answering "no" for the ordinary reason.
+      - ***D is two taxes with no synergy.*** Given the finding above, the case
+        for D is "both failures are worth catching", not "they reinforce each
+        other" — and it should be chosen on that basis or not at all.
+
+      **A way to read the choice.** A is about *types*: how much mesh insists a
+      status is not a number. B is about *totality*: how much mesh insists you
+      said what happens to everything. A shell that wants to stay terse and
+      forgiving takes F or B; one that wants the language to catch you takes A
+      or D; C is the position that mesh is a typed language wearing a shell's
+      syntax, and E is that position taken all the way — every *equality-based*
+      type mismatch *and* every unhandled case loud, with the pattern-kind
+      mismatches named above out of reach of both halves (Codex, #472 — this
+      closing summary kept the unqualified claim after the table above it was
+      narrowed, which is the third time on this branch a claim stated twice was
+      fixed in only one place). Nothing here is irreversible except the
+      habits each one trains, so the real question is which of those two
+      properties is worth its ceremony.
 
 - [ ] **Should a `"…"` string require braces to introduce an interpolation?**
       Raised by mikelward as "the interpolation syntax is ugly and special-casey",
