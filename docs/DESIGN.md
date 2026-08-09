@@ -4181,7 +4181,11 @@ Decisions:
   alternative — *require* `else` in expression position, lone `if` as statement
   only — was considered and dropped: it buys parse-time "you forgot the else"
   safety but costs the terse `tag = if $root { "[root]" }` one-liner, and
-  interactive brevity wins here.)
+  interactive brevity wins here.) ***Reopened*** — see
+  [Open questions](#open-questions), which holds that the interactive-brevity
+  reason is weak for a construct that lives in configuration files, and that the
+  same question governs [`match`](#matching-match) totality. Lenient remains the
+  shipped behavior until that resolves.
 - **`match`** is the multi-way companion — its own section below.
 
 **Postfix guard.** A single statement may carry a trailing `if` (or `unless`)
@@ -4283,6 +4287,12 @@ Rules:
 - **First match wins**, top to bottom; `_` is the catch-all and conventionally
   last. Whether non-`_`-exhaustive matches must be total is *(open)* — leaning
   lenient (a `match` with no arm hit yields `""`, like a no-`else` `if`).
+  ***Coupled***, and the lean here is not independent: the reopened
+  [`if` question](#open-questions) is the same one wearing another keyword —
+  must a value-producing construct cover every path? — so whichever way that
+  lands, this lands with it, **for matches whose result is used**. A
+  statement-position `match` discards its value, so nothing downstream can
+  receive an empty and it stays outside the coupling either way.
 - **It is an expression**: `x = match … { … }` binds the winning arm's value;
   in statement position the value is discarded and arms run for effect.
 - **A literal arm compares totally, even where `==` refuses.** An arm is
@@ -4913,11 +4923,14 @@ when not root is the *soft channel producing the "nothing" value* — exactly
 parallel to `gets()` producing `false` — and is consistent with fail-loud, which
 governs only *required* positions. The residual edge is stated honestly: `""`-as-
 nothing is indistinguishable from a real empty string and flows downstream under
-[no-null](#variables-and-assignment), so a no-`else` `if` is the one place mesh
-hands you a silent empty that a destructure would refuse. That is the accepted cost
+[no-null](#variables-and-assignment), so a no-`else` `if` hands you a silent empty
+that a destructure would refuse. That is the accepted cost
 of the terse one-liner ([Conditionals](#conditionals-if-is-an-expression),
 "Decided: lenient"); the only lever to close it — requiring `else` in *binding*
-position — was weighed and declined for ergonomics.
+position — was weighed and declined for ergonomics. ***Reopened***, and this
+paragraph used to say "the one place", which was wrong: an unmatched
+[`match`](#matching-match) yields `""` too, and so does a function with
+[no expression to yield](#functions). See [Open questions](#open-questions).
 
 **An ambiguous spelling is an error.** Where one spelling has two genuinely
 plausible readings, mesh refuses rather than picking a winner. The standard the
@@ -6503,7 +6516,8 @@ to avoid" rather than promising the latter as done.
 - **Core surface** (arrays / maps / functions / `if` / `match` / loops / scope /
   tests / isolation) — sketched above. Remaining sub-questions: an infix **`in`**
   operator as a second membership spelling alongside `:has`; whether non-`_` `match`
-  must be **exhaustive** (leaning lenient → `""`); and the **`~` scope** lever (keep it
+  must be **exhaustive** (was leaning lenient → `""`; now ***coupled*** to the
+  reopened `if` question in this section, for value-producing uses only); and the **`~` scope** lever (keep it
   the narrow string-vs-glob/regex predicate, or widen it toward the arm grammar — see
   [Matching](#matching-match)). *(Decided: the `match` **spelling** — prefix
   `match $x { … }`, arms `pattern [if guard] => value | { block }`, mandatory `=>`,
@@ -6955,6 +6969,116 @@ to avoid" rather than promising the latter as done.
   - It adds a third column to the strict/soft table in
     [Error handling](#error-handling): strict (errors), soft-nested (`if`-bind),
     soft-flat (fallback-bind).
+- **Requiring `else` where an `if` yields a value — reopened; no lean, and the
+  obstacle is not the one on record.**
+  [Conditionals](#conditionals-if-is-an-expression) settled this *lenient*: a lone
+  `if` is a valid expression and yields `""` when false.
+  [Error handling](#error-handling) then concedes what that costs — `""`-as-nothing
+  "is indistinguishable from a real empty string and flows downstream under
+  no-null, so a no-`else` `if` is the one place mesh hands you a silent empty that
+  a destructure would refuse." A language whose headline is that
+  [absence is loud](INTRO.md) manufacturing a quiet empty string at all is the
+  case for reopening, and it is the document's own words.
+
+  **"The one place" is wrong, and this document names two more.**
+  [Matching](#matching-match) records that a `match` with no arm hit yields `""`
+  too — "like a no-`else` `if`" — with totality for non-`_`-exhaustive matches
+  left *(open)*; lenient was its position before this, and is now coupled to the
+  question here rather than standing as a current lean of its own.
+  [Functions](#functions) adds a third: a function with **no expression to
+  yield** — an empty body, or a bare `return` *before anything ran* — results in
+  `""` with status `0`, "the same 'nothing produced, nothing failed' answer a
+  no-`else` `if` gives." A bare `return` after something has run is not a case:
+  it carries the result so far, so `func f() { 42; return }` answers `42`.
+
+  **Two of the three are one question; the third is not, and the difference is
+  what the rule should key on.** The `if` and the `match` produce their empty on a
+  path *the author did not write* — a condition that failed, an arm that did not
+  hit. That is one question wearing two keywords: *must a value-producing
+  construct cover every path?* Requiring `else` on `if` while leaving `match`
+  lenient would close half of it and leave the language with two rules for one
+  idea, so whatever answer this gets, the `match` totality question should get the
+  same one and the two are best decided together.
+
+  **The coupling is over *value-producing* uses only.** A statement-position
+  `match` discards its value and runs arms for effect
+  ([Matching](#matching-match)), so an unmatched one produces no empty for
+  anything downstream to receive — exactly as a statement-position lone `if`
+  produces none, which every option here still permits. Coupling the whole
+  totality question would make effect-only dispatch exhaustive as a side effect,
+  which nothing in the silent-empty argument asks for. The rule keys on *is this
+  value used*, in both constructs, or it over-reaches in both.
+
+  The function producer is a different animal, and it splits in two. An **empty
+  body** is visible at the definition rather than hiding on an unwritten branch,
+  so it is already the *asking* half of the
+  [strict/soft pairs](#error-handling) — `func f() { }` is a stub, not a missed
+  case. A **bare `return` before anything ran** is less clear-cut: the author
+  wrote the exit, but "the result so far" is implicit, so the *path* is theirs
+  while the *value* on it is not. `func f(_c) { if $_c { return }; 1 }` answers
+  `""` on one path and `1` on the other, and nothing in the source says the first
+  was intended.
+
+  Neither belongs in *this* fix, and for the second one the reason is not the
+  stub argument: **a totality rule over `if` and `match` would not catch it
+  anyway.** The enclosing `if` there is statement-position, which every option in
+  the table still permits. Catching it needs a different rule — *every path of a
+  value-returning function must produce a value* — which is return-type analysis
+  rather than branch totality, and a materially larger question than the one
+  reopened here. Worth its own entry if it is ever wanted; not a reason to widen
+  this one.
+
+  **The recorded reason for declining is the weak part.** It was interactive
+  brevity — the cost of the terse `tag = if $root { "[root]" }`. But conditional
+  assignment is not really an interactive construct: it lives in configuration
+  files, which are written once and read constantly. On the [goals](#goals)
+  tiebreaker of whichever is better *to use interactively*, this shape barely
+  registers, so brevity should not have carried the decision on those grounds.
+
+  **The real obstacle is that "value position" is not a clean category in mesh.**
+  The rule needs a boundary, and the obvious one — wherever the value is used —
+  is not a syntactic thing here. A `func` body's tail produces the return value, a
+  [`match`](#matching-match) arm's does, and a `for` body's does too, since the
+  loop collects a value per completed pass. So a bare `if` at the end of a loop
+  body is in value position by value-flow, and the rule either fires nearly
+  everywhere or gets scoped syntactically to assignment right-hand sides, where it
+  misses the func-tail and loop-body cases — which is where a silent `""` actually
+  flows.
+
+  The concrete casualty is in [`INTRO.md`](INTRO.md), and it is load-bearing:
+
+  ```
+  $sh.prompt.auth = func() { if not ssh-id-loaded() { style("SSH", fg: yellow) } }
+  ```
+
+  The prompt design *depends* on a lone `if` yielding nothing — that is how a
+  segment omits itself. Under a broad rule every conditional prompt segment grows
+  an `else { "" }`; under a narrow one func tails are carved out and the hole
+  stays open exactly where it matters most.
+
+  | Option | For | Against |
+  | --- | --- | --- |
+  | **Leave it lenient** (today) | The terse one-liner survives; nothing to migrate | Keeps both manufactured silent empties — the no-`else` `if` and the unmatched `match` — in the language whose pitch is that absence is loud |
+  | **Require `else` wherever the value is used** | Closes the `if` half of it — the `match` half needs the totality question answered the same way | "Wherever the value is used" includes func tails, `match` arms and `for` bodies, so it fires far beyond the case it was aimed at, and breaks the documented prompt-segment idiom |
+  | **Require `else` in binding position only** | Narrow, syntactic, and checkable at parse time | Already weighed and declined once under [Error handling](#error-handling); and it misses the func-tail case, so it buys explicitness without closing the hole |
+
+  **What it buys is smaller than it first looks.**
+  `tag = if $root { "[root]" } else { "" }` still produces an empty string
+  indistinguishable from a real one, so nothing downstream improves. The gain is
+  that `""` can no longer be reached by *forgetting a branch* — which is the same
+  shape as the rest of the [strict/soft pairs](#error-handling), where softness is
+  always opt-in. It does not make emptiness reachable only by asking: an empty
+  function body still yields one, and that is fine, since writing an empty body
+  *is* the asking. Real, but it is explicitness at the write site rather than
+  absence-safety.
+
+  **Independent of the flat soft bind above.** That construct is unambiguous with
+  a distinct fallback word whether or not this changes, so the two should not be
+  bundled: deciding a language-wide question about silent empties in order to tidy
+  a corner of one new feature would be the tail wagging the dog. Requiring `else`
+  *would* also disambiguate a fallback spelled `else` — that is why it appears in
+  the other entry's list of ways out — but it should stand or fall on the `""`
+  question alone.
 - **Hook API — decided** ([Hooks and the prompt](#hooks-and-the-prompt)): hook
   points are insertion-ordered maps of named callables (the key is the handler's
   identity → re-source-safe, individually removable). Events `preprompt`,
