@@ -5689,6 +5689,21 @@ entry records what each costs.
       and its signature-grammar-in-raw-text helpers (`body_open_offset`,
       `signature_close`, `params_valid`, `header_awaits_body`) come out with it;
       `parse`'s own `Incomplete` / `Err` split already answers the rest.
+
+      **Do it when the next finding lands, not on a schedule.** The reader's
+      header machinery has now taken eight review findings across two functions —
+      seven inside the deleted name scan, plus one where deleting it went too far
+      and a command-shaped `int func f arg {` lost its block. Every one was the
+      same mistake: answering a question the lexer already answers, from text the
+      lexer has not tokenized. So the trigger is a count, not a calendar. **A
+      ninth finding in `strip_type_marker` / `typed_header_follows` /
+      `func_definition_is_open` means stop patching and do this instead** — at
+      that point another point fix is knowingly buying a defect, and the
+      replacement is smaller than the thing it replaces.
+
+      Until then this stays filed rather than started, because it is not a
+      return-type change and folding it into one would bury it — and because the
+      leaks it fixes are all preexisting, so nothing regresses by waiting.
 - [ ] **Make `:repr` print a function.** Today it refuses one outright —
       `NoLiteral::Function`, "a function has no literal form" (`vars.rs`) — for
       both typed and untyped functions, so the obvious way to ask a *value* what
