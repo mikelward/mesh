@@ -7,7 +7,7 @@
 
 use std::collections::HashMap;
 
-use crate::parser::{Param, ParamKind, Source};
+use crate::parser::{Param, ParamKind, ReturnType, Source};
 use crate::vars::Value;
 
 /// A defined function: its parameters and parsed body.
@@ -34,6 +34,10 @@ pub struct FuncDef {
     /// of the element-wise rule — `Required` receives one element, `Rest` the
     /// collection (`DESIGN.md` §"Modifiers").
     pub subject: Option<Param>,
+    /// The declared return type — the `int` of `int func f() { … }`. `None` for a
+    /// `func` that declares none, which is the meaningful absence: it says the
+    /// function has no value channel rather than that its type is unknown.
+    pub return_type: Option<ReturnType>,
 }
 
 impl FuncDef {
@@ -84,6 +88,14 @@ impl FuncDef {
             }
         }
         let mut help = format!("{usage}\n");
+        // The result is part of the signature a caller reads, and the whole point
+        // of declaring it is that `help` can answer "what does this return?"
+        // without anyone opening the body. A `func` that declares nothing prints
+        // no line rather than "status": absence is what says there is no value
+        // channel, and spelling it out here would read as a promise of one.
+        if let Some(declared) = self.return_type {
+            help.push_str(&format!("\nReturns: {}\n", declared.as_str()));
+        }
         if !arguments.is_empty() {
             help.push_str("\nArguments:\n");
             help.push_str(&arguments);
@@ -167,6 +179,7 @@ mod tests {
             captures: Vec::new(),
             wrapper,
             subject: None,
+            return_type: None,
         }
     }
 

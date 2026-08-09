@@ -2017,6 +2017,7 @@ fn run_executable(
             body,
             wrapper,
             subject,
+            return_type,
         } => {
             // A written name is text the parser read; a computed one is a word
             // evaluated here, which is the whole point of `alias $name = …` --
@@ -2080,6 +2081,7 @@ fn run_executable(
                 captures: captured,
                 wrapper: *wrapper,
                 subject: subject.clone(),
+                return_type: *return_type,
             };
             if subject.is_some() {
                 shell.funcs.define_modifier(name, def);
