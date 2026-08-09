@@ -5130,6 +5130,10 @@ fn eval_expr(
             parameters,
             captures,
             body,
+            // Parsed and carried on the expression; the callable does not hold it
+            // yet, so a typed lambda still behaves as an untyped one at the call.
+            // Narrowing it lands with the rest of the narrowing — `TODO.md`.
+            return_type: _,
         } => {
             let mut captured = Vec::with_capacity(captures.len());
             for name in captures {
@@ -12558,7 +12562,12 @@ fn pending_input(text: &str) -> Pending {
     // it as one: without the strip, a malformed `wrapper func f(') {` was
     // dispatched on the spot and the commands in its body ran at top level,
     // where the plain `func` spelling quarantines them through the closing `}`.
-    let trimmed = strip_wrapper_marker(text.trim_start());
+    //
+    // `int func …` is the same header with a declared return type, and needs the
+    // same strip for the same reason — a malformed typed body would otherwise be
+    // dispatched line by line and *run* at top level. The type is written
+    // outermost, so it comes off first and `wrapper` second.
+    let trimmed = strip_wrapper_marker(strip_type_marker(text.trim_start()));
     let func_header = trimmed.strip_prefix("func").is_some_and(|rest| {
         rest.is_empty() || rest.chars().next().is_some_and(char::is_whitespace)
     });
@@ -12585,6 +12594,37 @@ fn pending_input(text: &str) -> Pending {
 /// marker — matching the parser's own contextual test — so `wrapper = 1`, a
 /// command named `wrapper`, and a `wrapper` on a line of its own are returned
 /// untouched and go on reading as ordinary input.
+/// Drop a leading return-type marker so the `func` header scanners see the header
+/// they know — `int func f() {` reads as `func f() {` here.
+///
+/// The same contextual test the parser makes, in the reader's terms: the word
+/// only comes off when `func` (or `wrapper func`) follows it on the same line, so
+/// `status 5`, `int = 1`, and a command called `list` are all returned untouched.
+/// It runs *before* the wrapper strip because the type is written outermost.
+fn strip_type_marker(text: &str) -> &str {
+    let Some(word) = TYPE_MARKER_WORDS.iter().find(|word| {
+        text.strip_prefix(**word)
+            .is_some_and(|tail| tail.starts_with([' ', '\t']))
+    }) else {
+        return text;
+    };
+    let after = text[word.len()..].trim_start_matches([' ', '\t']);
+    let leads_func = ["func", "wrapper"].iter().any(|lead| {
+        after
+            .strip_prefix(lead)
+            .is_some_and(|tail| tail.starts_with([' ', '\t']))
+    });
+    if leads_func { after } else { text }
+}
+
+/// The type words [`strip_type_marker`] knows, kept beside the parser's own set
+/// rather than derived from it: this reader works on raw text before any token
+/// exists, so it cannot ask `ReturnType`. `float` is included because the parser
+/// recognizes it in the same position — a malformed `float func f() {` has to
+/// stay quarantined so its diagnostic is the reserved-word one rather than
+/// whatever its body would have done at top level.
+const TYPE_MARKER_WORDS: &[&str] = &["status", "int", "str", "bool", "list", "map", "float"];
+
 fn strip_wrapper_marker(text: &str) -> &str {
     let Some(rest) = text.strip_prefix("wrapper") else {
         return text;

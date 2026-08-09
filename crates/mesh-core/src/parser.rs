@@ -1188,6 +1188,11 @@ pub enum Expr {
         /// it (`DESIGN.md` §"Calling for a value, and lambdas").
         captures: Vec<Spanned<String>>,
         body: Source,
+        /// `str func() { … }` — the declared return type, `None` for a lambda
+        /// that declares none. A hook slot needs this to tell a handler with a
+        /// value channel (`$sh.prompt.dir`) from one run for effect
+        /// (`$sh.postcd.fetch`), which is the wrinkle the declaration dissolves.
+        return_type: Option<ReturnType>,
     },
     /// A bare modifier reference — `:stem` — denoting "the function that applies
     /// `:stem`". Written where a callable is wanted, so `$paths:map(:stem)` says
@@ -4151,12 +4156,24 @@ impl Parser<'_> {
         let Some(word) = self.word_text_at(0) else {
             return Ok(None);
         };
-        // `func` must follow, directly or past a `wrapper`, and a definition needs
-        // a name after it — `int func` alone is a command called `int`.
-        let leads = (self.word_at(1, "func") && self.word_text_at(2).is_some())
-            || (self.word_at(1, "wrapper")
-                && self.word_at(2, "func")
-                && self.word_text_at(3).is_some());
+        // `func` must follow, directly or past a `wrapper`, and the header has to
+        // be *complete* through its signature opener: a name and then `(`. The
+        // `(` is what keeps the promise this construct is recognized by, since
+        // without it `int func f arg` — an ordinary call to a command or function
+        // named `int` — would be hijacked into a declaration and rejected for the
+        // paren it never meant to write.
+        //
+        // A modifier declaration's name arrives as several tokens (`_s`, `:`,
+        // `shorten`), so the fixed offset declines rather than matching, and
+        // `int func _s:foo()` reads as a command. That is the same deferral the
+        // narrowing makes for modifiers, which produce a value by construction;
+        // `TODO.md` carries both halves together.
+        let leads =
+            (self.word_at(1, "func") && self.word_text_at(2).is_some() && self.lparen_at(3))
+                || (self.word_at(1, "wrapper")
+                    && self.word_at(2, "func")
+                    && self.word_text_at(3).is_some()
+                    && self.lparen_at(4));
         if !leads {
             return Ok(None);
         }
@@ -6218,6 +6235,25 @@ impl Parser<'_> {
                 body,
             });
         }
+        // A lambda takes the same outermost type marker a definition does —
+        // `str func() { … }` — recognized by the same complete shape, here
+        // `WORD func (` since a lambda has no name.
+        let lambda_type =
+            if self.word_text_at(0).is_some() && self.word_at(1, "func") && self.lparen_at(2) {
+                match self.word_text_at(0) {
+                    Some(word) if RESERVED_TYPE_WORDS.contains(&word) => {
+                        let name = word.to_string();
+                        return Err(self.error(ParseErrorKind::ReservedTypeName(name)));
+                    }
+                    Some(word) => ReturnType::from_word(word),
+                    None => None,
+                }
+            } else {
+                None
+            };
+        if lambda_type.is_some() {
+            self.position += 1;
+        }
         if self.word("func")
             && self
                 .tokens
@@ -6233,6 +6269,7 @@ impl Parser<'_> {
                 parameters,
                 captures,
                 body,
+                return_type: lambda_type,
             });
         }
         // A leading `:name` is a modifier *reference*. A postfix `:name` never
@@ -7319,6 +7356,15 @@ impl Parser<'_> {
     fn word(&self, expected: &str) -> bool {
         matches!(self.peek().map(|t| &t.value), Some(TokenKind::Word(word)) if word.is_bare_text(expected))
     }
+    /// Is the token `offset` ahead a `(`? The signature opener a definition
+    /// header is recognized by, so a lookahead can insist on the *complete*
+    /// shape rather than guessing from a prefix of it.
+    fn lparen_at(&self, offset: usize) -> bool {
+        matches!(
+            self.tokens.get(self.position + offset).map(|t| &t.value),
+            Some(TokenKind::LParen)
+        )
+    }
     /// Is the token `offset` ahead the bare word `expected`? The lookahead a
     /// two-word lead-in needs (`wrapper func`), where [`word`](Self::word) only
     /// sees the cursor.
@@ -8153,6 +8199,47 @@ mod tests {
             panic!("expected a function definition")
         };
         assert_eq!(name, "int");
+    }
+
+    #[test]
+    fn a_typed_definition_needs_its_signature_opener() {
+        // The `(` is the rest of the shape: without insisting on it, `int func f
+        // arg` — an ordinary call to a command or function named `int` — would be
+        // hijacked into a declaration and rejected for a paren it never wrote.
+        // Raised in review as a P2.
+        for source in ["int func f arg", "int func f", "int wrapper func f arg"] {
+            let tree = complete(source);
+            assert!(
+                matches!(tree.statements[0].and_or.first, Executable::Pipeline(_)),
+                "{source} should stay a command"
+            );
+        }
+    }
+
+    #[test]
+    fn a_lambda_takes_the_same_return_type_marker() {
+        // `$sh.prompt.dir = str func() { … }` is how a hook slot's handler
+        // declares the value channel the slot needs, so the lambda has to take
+        // the marker the definition does. Raised in review as a P1.
+        let tree = complete("f = str func() { \"x\" }");
+        let Executable::Assignment { value, .. } = &tree.statements[0].and_or.first else {
+            panic!("expected an assignment")
+        };
+        let Expr::Lambda { return_type, .. } = value else {
+            panic!("expected a lambda")
+        };
+        assert_eq!(*return_type, Some(ReturnType::Str));
+
+        // Same contextual rule: a type word only marks a lambda in front of the
+        // complete `func (` shape.
+        let plain = complete("f = func() { \"x\" }");
+        let Executable::Assignment { value, .. } = &plain.statements[0].and_or.first else {
+            panic!("expected an assignment")
+        };
+        let Expr::Lambda { return_type, .. } = value else {
+            panic!("expected a lambda")
+        };
+        assert!(return_type.is_none());
     }
 
     #[test]
