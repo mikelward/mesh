@@ -4285,9 +4285,10 @@ Arm patterns, in one vocabulary:
 Rules:
 
 - **First match wins**, top to bottom; `_` is the catch-all and conventionally
-  last. Whether non-`_`-exhaustive matches must be total is *(open)* — leaning
-  lenient (a `match` with no arm hit yields `""`, like a no-`else` `if`).
-  ***Coupled***, and the lean here is not independent: the reopened
+  last. Whether non-`_`-exhaustive matches must be total is *(open)*; lenient
+  was the position here until the [`if` question](#open-questions) reopened, and
+  is the shipped behavior meanwhile — a `match` with no arm hit yields `""`, like
+  a no-`else` `if`. ***Coupled***, with no independent lean left: the reopened
   [`if` question](#open-questions) is the same one wearing another keyword —
   must a value-producing construct cover every path? — so whichever way that
   lands, this lands with it, **for matches whose result is used**. A
