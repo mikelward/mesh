@@ -12609,12 +12609,41 @@ fn strip_type_marker(text: &str) -> &str {
         return text;
     };
     let after = text[word.len()..].trim_start_matches([' ', '\t']);
-    let leads_func = ["func", "wrapper"].iter().any(|lead| {
+    if typed_header_follows(after) {
         after
-            .strip_prefix(lead)
-            .is_some_and(|tail| tail.starts_with([' ', '\t']))
-    });
-    if leads_func { after } else { text }
+    } else {
+        text
+    }
+}
+
+/// Does a complete definition header follow — `func NAME(`, or `wrapper func
+/// NAME(`?
+///
+/// The **same shape the parser insists on**, checked here in raw text. Anything
+/// weaker makes the two recognizers disagree: the parser would read
+/// `int func f {` as an ordinary command called `int`, while a reader that
+/// stripped on `func` alone would treat it as an open definition and buffer what
+/// followed into it. The disagreement is masked today — the shell stops on the
+/// syntax error before the difference shows — which is exactly why it is worth
+/// closing rather than leaving for whichever change unmasks it.
+fn typed_header_follows(after: &str) -> bool {
+    let after = match after.strip_prefix("wrapper") {
+        Some(tail) if tail.starts_with([' ', '\t']) => tail.trim_start_matches([' ', '\t']),
+        _ => after,
+    };
+    let Some(tail) = after.strip_prefix("func") else {
+        return false;
+    };
+    if !tail.starts_with([' ', '\t']) {
+        return false;
+    }
+    // A name, then its signature opener. The name is whatever runs up to the
+    // paren; empty means `func (`, which is a lambda rather than a definition.
+    let name = tail.trim_start_matches([' ', '\t']);
+    let Some(open) = name.find('(') else {
+        return false;
+    };
+    open > 0 && !name[..open].contains(char::is_whitespace)
 }
 
 /// The type words [`strip_type_marker`] knows, kept beside the parser's own set
@@ -17969,6 +17998,35 @@ mod tests {
         assert!(!needs_more_input("cd /"));
         assert!(!needs_more_input("puts *"));
         assert!(needs_more_input("puts value |"));
+
+        // A **typed** header is a header, so a malformed body stays quarantined
+        // rather than running its lines at top level — the same reason the
+        // `wrapper` strip exists.
+        for input in [
+            "int func f() {\nputs hi\n",
+            "int wrapper func f(...xs) {\nputs hi\n",
+            "status func f() {\nputs hi\n",
+            // Reserved, and still a header: the diagnostic has to be the
+            // reserved-word one rather than whatever the body would have done.
+            "float func f() {\nputs hi\n",
+        ] {
+            assert!(needs_more_input(input), "expected incomplete: {input:?}");
+        }
+        // …and only on the parser's *complete* shape. Below it, a type word is
+        // an ordinary command word and has to read exactly like any other one,
+        // which is the invariant worth pinning: `int func f {` is a command
+        // called `int` followed by an unclosed block, so it waits for the `}` —
+        // for the block's sake, not a header's — and does so identically to a
+        // word the reader has never heard of. Raised in review as a P2 on the
+        // grounds that the type was being stripped here; it is not, and this
+        // pins the pair together so a future strip cannot start.
+        for shape in ["func f {\nputs after\n", "func {\nputs after\n", "= 1\n"] {
+            assert_eq!(
+                needs_more_input(&format!("int {shape}")),
+                needs_more_input(&format!("zzz {shape}")),
+                "a type word must read as an ordinary command word in {shape:?}"
+            );
+        }
         // An unclosed quote is the same "ran out of input" signal an unclosed
         // brace is, so it waits for the line that closes it rather than failing
         // on sight — which is what a script has always done with the same text.

@@ -5579,6 +5579,24 @@ and the postfix parses cheaper. Build one, then look at it.
       since a line reading `status` there would advertise a value channel the
       function has not got. Reached through `f --help`.)* Still to do: `type` /
       `whence` reporting it alongside the signature.
+- [ ] **Make `:repr` print a function.** Today it refuses one outright —
+      `NoLiteral::Function`, "a function has no literal form" (`vars.rs`) — for
+      both typed and untyped functions, so the obvious way to ask a *value* what
+      it is comes back empty. Asked for directly once the declared type gave
+      `:repr` something worth printing.
+
+      The tension to resolve, since it is why the refusal is there: `:repr` means
+      **the literal form you could write back**, and a function body is not
+      reproducible as one. So either `:repr` widens to "how this value prints for
+      a human" — which is a change to what the modifier means, and reaches every
+      other type's `:repr` as a question — or a function's repr is a *signature*
+      rather than a literal (`func(a, b) -> int`, say) and the modifier's contract
+      grows an explicit exception. Pick deliberately; the second is smaller and
+      the first is more honest about what people use `:repr` for.
+
+      Whichever wins, the declared return type is the part worth showing, and a
+      func without one should say so rather than print `status` — the same rule
+      `help` follows.
 - [ ] **Migrate the docs and the ported configs.** `TOUR.md`, `REFERENCE.md`,
       `INTRO.md` and `prelude.mesh` all contain funcs written under the union.
       Most are typeless and stay as they are; the ones whose value is taken need a
