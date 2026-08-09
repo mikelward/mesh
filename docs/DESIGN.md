@@ -6808,8 +6808,8 @@ to avoid" rather than promising the latter as done.
   - **Map patterns are out of scope here** — `[name: _n] = $m` is
     [deferred on its own terms](#destructuring), and a signature can only follow
     wherever that lands.
-- **A flat soft bind — open; leaning `= … else { … }`, with the dangling-`else`
-  question below to answer for whichever spelling wins.** The
+- **A flat soft bind — open; leaning a bare bind with a *distinct* fallback word,
+  `[a b] = expr otherwise { … }`.** The
   [strict/soft pairs](#error-handling) give a soft bind, but only as a
   **condition**, so each one costs a level of nesting and the body drifts right:
 
@@ -6823,8 +6823,8 @@ to avoid" rather than promising the latter as done.
   }
 
   for line in $(cmd):lines {                       # the proposal
-    [_key _val]   = $line:match(/(\w+): (.*)/) else { continue }
-    [_host _port] = $_val:match(/(.*):(\d+)/)  else { continue }
+    [_key _val]   = $line:match(/(\w+): (.*)/) otherwise { continue }
+    [_host _port] = $_val:match(/(.*):(\d+)/)  otherwise { continue }
     ...                                            # flat, and both binds are live
   }
   ```
@@ -6832,44 +6832,85 @@ to avoid" rather than promising the latter as done.
   The borrow is Swift's `guard let` and Rust's `let … else`: a bind that escapes
   into the **current** scope on success, where the failure block must *diverge*.
 
-  | Option | For | Against |
-  | --- | --- | --- |
-  | **`[a b] = expr else { … }`** *(leaning)* | No new keyword — `else` is already in the language, and this is Rust's `let … else` minus the `let` mesh does not have; reads as "bind these, else do that"; stays in the postfix grain of the [guard modifier](#conditionals-if-is-an-expression) | `else` appears with no preceding `if`, which has to be parsed and taught; an assignment statement grows a trailing block, which nothing else does. *(The dangling `else` below is a cost of the construct, not of this spelling — the `guard` row carries it too.)* |
-  | **`guard [a b] = expr else { … }`** | The keyword announces the diverging form *before* a long RHS, so it cannot hide at the end of the line; Swift precedent | A new keyword for something the plain form already spells; this document already uses *guard* for the postfix `if` / `unless` modifier, so the word would name two different things |
-  | **Elixir-style `with`, many binds and one `else`** | One block handles any of N failures — the flattest form for a parse-this-record function | A whole new block construct; the `else` cannot say *which* bind failed without inspecting; furthest from anything else in the language |
-  | **Skip it** | Nested `if`-binds already work and are already soft | Rightward drift on the parse-a-line loop, which is the exact shape [`INTRO.md`](INTRO.md) advertises |
+  **Two independent axes, which an earlier draft of this entry collapsed into
+  one.** Swift and Rust each write a prefix *and* spell the fallback `else`, so
+  copying either wholesale hides that these are separate choices:
 
-  **The dangling `else`, which neither spelling escapes.** A lone `if`
-  is a valid expression and yields `""` when false
-  ([Conditionals](#conditionals-if-is-an-expression), *decided: lenient*), so in
+  | Axis | Options |
+  | --- | --- |
+  | **Prefix** | a `guard` keyword, or nothing |
+  | **Fallback word** | `else`, or a word of its own |
+
+  Everything difficult about this construct lives on the **second** axis, and the
+  first matters only through it: with a distinct fallback word the prefix is a
+  readability preference and nothing more, while with `else` a
+  *mandatory*-fallback prefix becomes one of the ways to disambiguate — at a cost
+  set out below.
+
+  | Fallback word | For | Against |
+  | --- | --- | --- |
+  | **A distinct word — `otherwise`** *(leaning)* | The construct is unambiguous everywhere: no association rule, no restriction on what the right-hand side may be, no reversal of a decided call. Costs one keyword in the language and **nothing at the use site**, since it is typed exactly where `else` would have been | One more word to learn, and a longer one, on a construct meant to be terse |
+  | **`else`** | No new keyword — it is already in the language, and this is Rust's `let … else` minus the `let` mesh has not got; reads as "bind these, else do that" | Collides with `if`'s own `else`, and the collision has to be paid for somewhere — see the four ways out below |
+
+  On the **prefix** axis, `guard` buys one thing — it announces the diverging form
+  before a long right-hand side rather than letting it arrive at the end of the
+  line — and costs two: a keyword for something the bare form already spells, and
+  a second meaning for a word this document already uses for the postfix `if` /
+  `unless` modifier. Once the fallback word is distinct the bare form is already
+  unambiguous, so the keyword is paying for readability alone. *Lean: no prefix.*
+
+  **The dangling `else`, which is the whole of the second axis.** A lone `if` is a
+  valid expression and yields `""` when false
+  ([Conditionals](#conditionals-if-is-an-expression) — the shipped behavior, and
+  [reopened](#open-questions) below, though the ambiguity here holds either way:
+  it needs a lone `if` to be *legal*, which requiring `else` would end), so if the
+  fallback is *also* spelled `else`:
 
   ```
   [x] = if $cond { [v] } else { continue }
   ```
 
   the `else` can complete the right-hand `if` **or** be the soft-bind fallback,
-  and both readings parse. That is precisely the shape
-  [*an ambiguous spelling is an error*](#error-handling) refuses to resolve by
-  picking a winner, so the `else` option is not free: it needs an explicit
-  association rule, or a grouping requirement on a right-hand side that could take
-  an `else` of its own. Rust meets the same wall with `let … else` and answers by
-  restricting what the right-hand side may be.
+  and both readings parse. They are not equivalent: under the first the bind is
+  strict, so a wrong shape is a hard error; under the second a wrong shape quietly
+  runs `continue`. Identical text, error against silent skip. That is precisely
+  the shape [*an ambiguous spelling is an error*](#error-handling) refuses to
+  resolve by picking a winner.
 
-  **The keyword does not escape this**, which is worth writing down because
+  **A prefix does not help *by itself***, which is worth writing down because
   assuming it does is the natural mistake:
-  `guard [x] = if $cond { [v] } else { continue }` is ambiguous in exactly the
-  same way. A leading keyword marks where the construct *starts*, not where its
-  right-hand side *ends*, so the trailing `else` is still contested between the
-  inner `if` and the fallback. Requiring an `else` after every `guard` does settle
-  it — with one `else` present it has to be the guard's — but that *is* an
-  association rule, and one with a sharp edge: it silently takes the `else` a
-  reader wrote for the inner `if`. So the dangling `else` has to be answered for
-  **either** spelling, and the choice between them turns on the other rows of the
-  table rather than on this one.
+  `guard [x] = if $cond { [v] } else { continue }` reads both ways too, since a
+  leading keyword marks where a construct *starts*, not where its right-hand side
+  *ends*. Making the fallback **mandatory** after `guard` does settle it — the
+  competing parse would leave the guard without its required fallback, so it is
+  invalid, and the form becomes syntactically determined. But that is
+  disambiguation bought with an association rule, and the rule silently captures
+  an `else` a reader wrote for the inner `if`. The ambiguity turns into a wrong
+  answer rather than a refusal, which is the trade the distinct word never has to
+  make.
+
+  Keeping `else` therefore means choosing one of these, every one of which the
+  distinct word avoids outright:
+
+  | Way out | Cost |
+  | --- | --- |
+  | **Refuse the combination** — `[x] = if … else …` is an error naming both rewrites | Most in keeping with the house rule, and nearly free since splitting the statement is always available; but it is a rule that fires rarely and so is easily forgotten |
+  | **Restrict the right-hand side** (Rust's answer) — parens when it could take its own `else` | The parens are not grouping, they are a parser hint wearing grouping's clothes, against this document's position that parens keep meaning grouping; and the same expression is legal bare one line up, so they appear because of what *follows* it |
+  | **An association rule** — the trailing `else` always belongs to the bind | Silently takes the `else` a reader wrote for the inner `if` |
+  | **Require `else` on every value-position `if`** | Disambiguates by making the lone `if` illegal, but that is a language-wide call about silent empties, tracked as its own question below — and the legal form becomes `… else { [w] } else { continue }`, which parses only if you already know the rule |
+
+  **Which word, if it is distinct.** `otherwise` is the lean. `missing` is shorter
+  and echoes this document's own *absence is loud* framing, but it names the wrong
+  condition for one of the two failures it would catch: a length mismatch
+  (`[a b] = $three_items`) is a wrong shape, not an absence, and a keyword that
+  lies about what it detects is worse than a longer honest one. **`or` is out**
+  despite reading well: it already combines values and statuses, so
+  `[x] = foo() or { continue }` re-creates the same ownership question one axis
+  over.
 
   Consequences worth stating:
 
-  - **The `else` block must diverge** — `return`, `fail`, `break`, `continue`,
+  - **The fallback must diverge** — `return`, `fail`, `break`, `continue`,
     `exit`. If it can fall through, execution reaches the next line with the names
     unbound, which is the silent empty mesh refuses everywhere else. Swift and Rust
     both require it. **But checking the *form* is not the guarantee it looks
@@ -6881,17 +6922,39 @@ to avoid" rather than promising the latter as done.
     exists to prevent. So either the fallback is restricted to forms that cannot
     fail that way, or a fallback that *completes* is itself an error. That choice
     is part of the proposal, not an implementation detail under it.
+  - **It catches exactly what the `if`-bind catches, and no more.** That test is
+    *truthy* **and** *shape fits*
+    ([Conditionals](#conditionals-if-is-an-expression)), so the fallback fires on
+    either half: a **value-level failure** — a `false`, a failed command, a
+    nonzero `Status` — or a **shape miss**, including a non-list right-hand side,
+    which `pattern_bindings` already treats as a plain no-match rather than an
+    error, and a missed [`:match`](#destructuring).
+
+    It inherits the binding asymmetry with it: a `false` binds nothing, while a
+    nonzero `Status` **does** bind, since a status is a result rather than an
+    absence. So `s = build() otherwise { puts "build failed: $s" }` can read `$s`
+    in the fallback, exactly as the `else` of `if s = build() { … }` can.
+
+    What it does **not** catch is a failure in *evaluating* the right-hand side:
+    `[a b] = 1 + "x" otherwise { … }` aborts, because the type error happens
+    before there is anything to test, and a type error is a channel-2
+    interruption with [no soft twin](#error-handling), listed there beside
+    div-by-zero and undecodable text. The line is *the test failed* against *the
+    right-hand side never produced a value*. The flat form is the *flat spelling
+    of the nested one*, so the two must catch the same set; if they diverged there
+    would be two soft binds with different semantics, which is worse than the
+    two-spellings problem this construct is trying to avoid.
   - **It applies to binding forms, not to lookups.** `[k v] = $s:match(…)` and a
     plain list destructure are the candidates. `$xs[i]` and `$m.key` already have
     `:get(…, default)` as their soft twin, and giving them a second one would be
     the two-spellings problem for no gain.
   - **It does not overlap the postfix guard.** `return unless $args:len > 0`
     *tests* and skips a statement; this *binds* and guards the rest of the block.
-    Same instinct, different scale — which is the argument for keeping `guard` as
-    the postfix modifier's name and spelling this one with `else`.
+    Same instinct, different scale — and keeping the fallback word off `else` and
+    off `guard` leaves both existing spellings meaning exactly what they mean now.
   - It adds a third column to the strict/soft table in
     [Error handling](#error-handling): strict (errors), soft-nested (`if`-bind),
-    soft-flat (`else`-bind).
+    soft-flat (fallback-bind).
 - **Hook API — decided** ([Hooks and the prompt](#hooks-and-the-prompt)): hook
   points are insertion-ordered maps of named callables (the key is the handler's
   identity → re-source-safe, individually removable). Events `preprompt`,
