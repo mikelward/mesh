@@ -18081,6 +18081,18 @@ mod tests {
         // on sight — which is what a script has always done with the same text.
         assert!(needs_more_input("puts 'unterminated"));
         assert!(!needs_more_input("puts 'closed'"));
+        // A `\`-newline joins this line to one that has not arrived, so it is
+        // incomplete for the same reason an open brace is. The lexer reports it
+        // rather than the reader deriving it — a trailing backslash could be a
+        // literal, an escape, or string content, and only the lexer knows which.
+        // Raised in review as a P2: `int \` then `func f() { 1 }` dispatched the
+        // `int` on its own and defined an *untyped* func, where the same text in
+        // a script defined `int func f()`.
+        assert!(needs_more_input("int \\\n"));
+        assert!(needs_more_input("puts a \\\n"));
+        assert!(!needs_more_input("int \\\nfunc f() { 1 }\n"));
+        // An escaped backslash is not a continuation: `puts a\\` is complete.
+        assert!(!needs_more_input("puts a\\\\\n"));
     }
 
     #[test]
