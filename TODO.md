@@ -1948,6 +1948,32 @@ all under "Beyond M3 — External tool integration".
       follow, with `$paths:map(:ancestors)` for the nesting. A relative path stops
       at its first component rather than stepping off the front into the empty
       path, and the empty string walks nothing.
+- [ ] **`pwd` disagrees with every other `pwd`, and not only about flags.** Three
+      separate gaps, found while moving a shell config's `$(pwd)` captures onto
+      `pwd()`. They are listed together because a single answer — the logical cwd
+      — closes the first two, and it is worth knowing that until it lands the
+      *default* spelling is the incompatible one, not just the flag nobody types.
+  - [ ] **The default is physical where POSIX makes it logical.** `cd link; pwd`
+        answers the resolved path; bash, zsh, dash and fish all answer `link`,
+        because POSIX makes `-L` the default and only `-P` resolves. `pwd()` and
+        `$env.PWD` follow `pwd` here, so mesh is self-consistent and consistently
+        different — which is the shape that bites, since nothing looks wrong until
+        a path is compared against one a different shell produced.
+  - [ ] **`-P` and `-L` are refused as `pwd: too many arguments`.** The message
+        names an arity problem, so it reads as a bug in the caller rather than a
+        flag mesh does not have yet. `-P` is *already* what mesh does, so it could
+        be accepted as a no-op today and only `-L` wait for the logical cwd —
+        or both could be refused with a diagnostic that says which, and names
+        `command pwd -P` for the external. What it should not keep saying is
+        "too many arguments".
+  - [ ] **An inherited `$env.PWD` can disagree with `pwd` until the first `cd`.**
+        Launch mesh from a shell sitting in a symlinked directory and `$env.PWD`
+        holds the parent's logical path while `pwd` reads `getcwd`. The
+        "both spellings read one `working_directory`, so they cannot drift apart"
+        note above is about `pwd` and `pwd()`; the environment variable is a third
+        reader and is not covered by it. Whether entry should re-stamp `$env.PWD`,
+        adopt it when it resolves to the same directory, or leave the two to
+        disagree is the decision.
 - [ ] **Should the cwd have a variable form too — `$sh.pwd` or `$sh.cwd`?** Three
       spellings already answer this question (`pwd`, `pwd()`, `$env.PWD`), and the
       case for a fourth is **interpolation**: a prompt segment is mostly a string,
