@@ -3425,7 +3425,11 @@ Rules:
   bare and `status(5)` in an expression are its two spellings, by the usual
   mode rule — and bare `return X` keeps meaning the value `X`. What follows
   describes the shipped two-channel behavior, which the revision leaves intact
-  except that `fail N` becomes sugar for `return status(N)`.)* A function has
+  except that `fail N` becomes sugar for `return status(N)`. A second revision,
+  the [return-type decision](#open-questions), gates the value channel on the
+  declaration: a `func` that declares no return type has none, so the table below
+  is what a `func` that declares one does, and `return $v` in one that does not
+  becomes an error rather than a value.)* A function has
   three outputs, not two: the **bytes** it writes to stdout, the **value** it
   returns, and its **exit status**. `return` fills the value channel; `fail`
   fills the status channel. Neither is derived from the other:
@@ -3661,6 +3665,13 @@ A `func` has two outputs — the **bytes** it writes to stdout (composes in pipe
 like any command) and the **value** it returns (last expression / `return val`,
 a rich list/map/scalar). Which you get is chosen by **how you write the call**,
 and that choice is really a choice of **mode**:
+
+*(**The value channel is becoming opt-in** — see the [return-type
+decision](#open-questions). A `func` that declares no return type will have no
+value channel at all, and its result will be a `Status`; what this section
+describes is every `func` that declares one. The **mode** rule below is
+unaffected, and deliberately so: which channel a call reads stays the caller's
+choice.)*
 
 | Mode | Form | You get | Idiomatic args |
 | --- | --- | --- | --- |
@@ -6613,101 +6624,253 @@ to avoid" rather than promising the latter as done.
   `func` body uses, so all three agree: a block streams unless something explicitly
   captures or calls it, and its value is the last thing that produced one. `$(…)` is
   the thing that means "capture".)*
-- **A `proc` / `func` split — open; leaning add `proc` only and leave `func`
-  alone.** The split already exists; it is at the **call site** rather than the
-  declaration. [Calling for a value](#calling-for-a-value-and-lambdas) chooses by
-  mode — `f arg` takes words, streams stdout, and its result is a status; `f(arg)`
-  takes expressions and its result is the return value; `:capture` is there for
-  when you genuinely want both channels. The open question is whether that choice
-  belongs to the **caller** or to the **declaration**. YSH (Oils) puts it at the
-  declaration: a `proc` takes words and answers with a status, a `func` takes typed
-  arguments and answers with a value. Tcl's `proc` is already cited
-  [above](#functions) for its signature vocabulary, so the word arrives with the
-  right connotation — a procedure, run for its effect.
-
-  Two shapes land on opposite sides, which is the argument in one screen: `ips()`
-  in [`INTRO.md`](INTRO.md) writes with `puts` and has no return value anyone
-  wrote, while a string-building helper returns a value and writes nothing.
+- **A `proc` / `func` split — decided: no second keyword. A `func` may declare a
+  return type, and a `func` that declares none has no value channel.** The
+  distinction the question asked for is real; reaching for a keyword to spell
+  it was the mistake. `proc` / `func` answers "does this return a value?" with a
+  boolean and costs a word. A declared return type answers the same question with
+  strictly more information, costs no word, and — the part that decided it — makes
+  a class of mistake checkable before the body runs.
 
   ```
-  proc ips() {                          # words in, bytes out, a status back
-    for line in $(ip -o a sh up primary scope global):lines {
-      [_ _iface _afam _addr ..._rest] = $line:words
-      puts $_iface $_addr if $_afam ~ inet*
-    }
-  }
-
-  func path-string() {                  # values in, a value out
+  func ips() { ... }                    # declares nothing — its result is a Status
+  status func ips() { ... }             # the same function, said out loud
+  str func path-string() {              # declares a value channel
     return $env.PATH:join(":")
   }
   ```
 
-  **"No return value anyone wrote" is not the same as none, and the gap is itself
-  an argument for the split.** `ips()` ends in a `for`, and a `for` collects a
-  value per completed pass into a list — `eval_for_passes` and
-  `run_ast_for_passes` in `repl.rs`, deliberately, so that a `for`'s result is the
-  aggregate rather than its last pass. Calling it for a value therefore hands back
-  a list of per-pass results, not nothing. Nobody wrote that aggregate and nothing
-  names it. Under the union **every** function carries a value channel whether or
-  not its author meant to fill one, so "what does this return?" has no answer
-  short of reading the body down to its last statement — which is precisely what a
-  declaration keyword would answer in one word.
+  **The narrowing is the decision, and it is a break.** Today every `func`
+  carries a value channel whether or not its author filled one, which is what
+  made `ips()` above hand back a list of per-pass `for` results nobody wrote
+  (`eval_for_passes` / `run_ast_for_passes` in `repl.rs`). After this, `ips()`
+  returns a `Status` and that aggregate is out of reach. The migration lands on
+  the *minority* of functions — the ones that genuinely return values get a type —
+  where the `proc` / `func` rename would have landed on the majority.
+
+  **Only the value channel narrows; the status is untouched.** The two have always
+  been independent ("neither is derived from the other", [above](#functions)), so
+  a `status func` whose body ends in a `for` answers with the status that `for`
+  already had — the last pass's, `0` for a loop that ran no pass
+  (`run_ast_for_passes` opens at `0` and updates per pass). Nothing about a
+  declared type computes a *new* status. What changes is that the aggregate
+  alongside it stops being bindable, so `x = ips()` gets a `Status` and a warning
+  rather than a meaningless list that looks like it worked. That the collection
+  could then be skipped outright for a func with no value channel is a plausible
+  consequence, not a designed one.
+
+  **The two motivating shapes are helped from opposite ends, which is worth
+  separating.** `ips()` has a value that is *wrong*, and the declaration removes
+  it. The `$sh.postcd.fetch` handler has a value that was already right — a bare
+  background statement records its launch `Status` as its result — so nothing is
+  removed there; what the declaration buys is at the **slot**, which can now say
+  it needs a value channel (`$sh.prompt.dir`) or not (`$sh.postcd.fetch`). One
+  case is about deleting an accident, the other about letting the receiver state
+  its requirement.
+
+  **Spelling — open, leaning the prefix `int func f()`.** A word before `func` is
+  already how a definition takes a marker (`wrapper func`, `fork func`), so the
+  prefix arrives in a slot the grammar has, and `parser.rs` already reads exactly
+  that shape — `self.word("wrapper") && self.word_at(1, "func")`. The postfix
+  `func f() int` is Go's form and mesh's declaration is already Go's minus the
+  type. Two arguments were considered and rejected: `func f(): int` collides with
+  `:int`, which everywhere else in the language *converts* a string to an integer
+  rather than declaring anything, and `func f() -> int` spends punctuation on a
+  form neither Go nor any shell uses.
+
+  The prefix costs one thing the postfix does not, and it should be settled with
+  the spelling rather than discovered later: **every type name becomes a
+  contextual keyword.** `status(N)` is already an ordinary builtin
+  ([above](#functions)), so `status func f() { … }` puts a live command word in
+  the lead position of a definition, and `status 5` has to keep working. That is
+  the `fork` problem again, and `fork`'s solution applies unchanged — recognize
+  the *shape* (`WORD func NAME (`), never the bare word — but it means the set of
+  type names must be **closed and known to the parser**. The postfix form claims
+  nothing: the slot between `)` and `{` currently takes only `with (…)` or the
+  block, so a type there collides with no existing word at all.
+
+  **The narrowing reaches `wrapper func`, which is a scope finding rather than a
+  spelling one.** A wrapper returns rich values today —
+  `wrapper func g(...xs) { return $xs }` called as `g(--foo.bar=v)` yields a list,
+  and `wrapper func w(...rest) { $rest:join("|") }` a string
+  (`crates/mesh/tests/cli.rs`) — so wrappers are inside the migration and each
+  needs a way to declare one. Whichever spelling wins has to say how a type and a
+  `wrapper` / `fork` marker sit together, and the answer has to be written down
+  rather than discovered by whoever builds it.
+
+  **The alias case needs nothing, and that is the uniform rule rather than an
+  exception for wrappers.** `alias` desugars to a `wrapper func`, an alias
+  forwards to a command, and a command's result is a `Status` — so a bare wrapper
+  around a bare func or an external is status in, status out, with nothing to
+  declare at either end. Worth stating because the tempting shortcut — "a
+  `wrapper func` implies `status`" — would be an exception that only restates what
+  bare already means everywhere else, and it would cost the wrappers that
+  legitimately return values. Wrappers take a type like anything else; they just
+  rarely want one.
+
+  **A wrapper cannot inherit its callee's type, for the same reason it cannot
+  validate its flags.** A wrapper "does not know the callee's grammar"
+  ([above](#functions)), which is why flag checking is *relocated* to the wrapped
+  call rather than dropped. A return type is the same shape of problem: the body
+  is arbitrary, and an `alias $n = …` resolves its command where the definition
+  runs, so there is nothing static to inherit. **A partial application is the
+  opposite case, and the contrast is the useful part** — `&pad(width: 8)` names
+  its target, so a partial of an `int func` is knowably an `int func`. The two sit
+  on opposite sides of "is the callee knowable?", which is exactly why one could
+  propagate a declared type and the other cannot. `TODO.md` carries partial
+  application as unweighed sugar; this is a consideration it did not have.
+
+  *Recorded because it was briefly argued the other way:* **this is not an
+  argument for the postfix.** The prefix orders a type against the markers
+  (`int wrapper func f()` or `wrapper int func f()`); the postfix orders it
+  against the [capture list](#calling-for-a-value-and-lambdas)
+  (`func f() int with ($x)` or `func f() with ($x) int`), since `with (…)` already
+  occupies the slot between the parens and the block. That is the same decision on
+  both sides, made once and written into the grammar either way — not a recurring
+  cost, and not a tiebreaker. The prefix order also has a defensible default that
+  "neither is obviously right" overstated: `int wrapper func f()` reads as "an
+  int-returning wrapper func", adjectives stacking before the noun. **The
+  contextual-keyword point above is the real asymmetry** and does not need this
+  one propping it up.
+
+  **What it makes statically checkable — the argument that decided it against
+  `proc`.** A declared return type is checkable where a keyword would only have
+  been documentation, and the tractable set is *local to one definition*, needing
+  no resolver pass — which matters, because TODO.md §"Beyond M3 — Static checks"
+  works through why mesh cannot have one: `env.mesh` and `source` bind names
+  outside any tree being checked, and `mesh -n` deliberately does not run startup
+  files.
+
+  | Check | Where | Needs |
+  | --- | --- | --- |
+  | `return $v` in a func declaring no type | parse | the declaration and the body — nothing else |
+  | `return` bare, or a body whose tail is a command, in a func declaring a type | parse | the same; a command's result is a `Status(n)`, never an `int` |
+  | `return "hi"` against a declared `int` | parse | the same, *and only where the operand is a literal* |
+  | `x = f()` where `f` declares no type | run | the callee — see the resolver limit above |
+  | a typeless lambda assigned to a value-taking hook slot | dispatch | the slot's declared kind |
+
+  **The boundary is the important part, and it is not a type checker.** mesh has
+  no typed variables and no typed parameters — `GRAMMAR.md` §Definitions has
+  `parameter = name | name "=" value-expression | flag-name | "..." name`, with
+  nowhere for a type to go. So what the declaration makes checkable is the
+  **shape of a function's exits**, not the types flowing through its body:
+  `return $x` against a declared `int` is unanswerable until `$x` has a type, and
+  giving it one is a separate and much larger decision. Calling this "type
+  checking" would promise the second thing while delivering the first. It is
+  **channel checking** — every path out of this function either produces a value
+  or does not, and the declaration says which is intended.
+
+  **It resolves the hook-slot wrinkle, which the keyword version could not.**
+  Under a `proc` / `func` split, `$sh.prompt.dir = func() { … }` (returns a styled
+  string) and `$sh.postcd.fetch = func(_previous) { vcs auto-fetch & }` (runs for
+  effect) are two *kinds* of value, so either procs become first-class the way
+  funcs are, or every hook point declares which kind its slot takes — recorded
+  below as the sharpest question the split raised. The annotation dissolves it.
+  There is one keyword and one kind of value; a lambda declares a type or does
+  not, and the slot checks for a value channel at assignment rather than at the
+  first prompt render:
+
+  ```
+  $sh.prompt.dir  = str func() { ... }              # a value channel, declared
+  $sh.postcd.fetch = func(_previous) { vcs auto-fetch & }   # none, and none wanted
+  ```
+
+  **What it does not answer: argument grammar.** [Calling for a
+  value](#calling-for-a-value-and-lambdas) chooses by mode — `f arg` takes words
+  and yields a status, `f(arg)` takes expressions and yields the return value —
+  and that choice stays with the **caller**. The correction recorded below
+  established that the axis the split was really about is argument grammar, and a
+  return type says nothing about it. So this closes the *result* half and leaves
+  the other half where it is, deliberately: a function still reads as a command at
+  the prompt and as a function in an expression, which was the affordance the
+  declaration split would have spent.
+
+  **The warning — leaning warn at the call, not at the definition.** The narrowing
+  fails *silently* where it bites: `x = f()` against a typeless `f` does not
+  error, it binds a `Status`, and the confusion surfaces somewhere else entirely.
+  That is an argument for a warning, but not for warning on every typeless
+  definition — no type *is* the default and the majority case, so that nags the
+  common case forever in exchange for nothing, and a `status func` written to
+  silence a warning is noise rather than intent. Warning where the **value is
+  taken** fires only where the meaning actually changed, and names both fixes
+  (declare a type, or stop taking the value). Per the table above that check is a
+  runtime one.
+
+  **The vocabulary is `status`, `int`, `str`, `bool`, `list`, `map`, and `float`
+  is reserved.** Short forms throughout: `int` is already the language's word
+  (`:int` parses one), so `str` follows it and `string` would be the odd one out
+  beside it. **`float` is reserved now and not implemented** — `f64` exists as a
+  value ([Arithmetic](#arithmetic)), but declaring one is later work, and claiming
+  the word today is what keeps that a *feature* rather than a break: a script may
+  not use `float` for anything else in the meantime. Adding the type later may
+  still invalidate scripts written against its absence, and that is accepted.
+
+  **A closed set is the point, not a limitation to be lifted. User-defined types
+  are not a goal.** The set above covers the kinds mesh values actually come in,
+  and a shell that lets a config declare its own is a shell whose `help` output
+  and error messages have to explain a vocabulary the reader has never seen. This
+  is the boundary that keeps the whole feature a *check* rather than a type
+  system, and it is also what makes the closed set the prefix spelling needs
+  affordable to state.
+
+  **Open sub-questions this decision creates and does not settle:**
+
+  - **Compound kinds and an escape hatch.** Whether `list` can say a list of
+    *what*, and whether there is a spelling for "returns a value, unspecified".
+    The prefix spelling needs the set closed before it can parse; the postfix does
+    not.
+  - **Whether parameters follow.** A declared return with undeclared arguments is
+    an asymmetry a reader will notice immediately. It is the obvious next step and
+    a much larger one — it is where "channel checking" would have to become type
+    checking — so it is named here rather than assumed. `TODO.md` carries the
+    exploration.
+  - **The nullable encoding.** `false | T` is a real and useful duality
+    ([above](#functions)); how a declaration spells it is unaddressed.
+
+  ---
+
+  *The keyword options, recorded so the case is not reopened from scratch.* The
+  split already existed at the **call site** rather than the declaration, and the
+  question was whether that choice belongs to the caller or the callee. YSH (Oils)
+  puts it at the declaration: a `proc` takes words and answers with a status, a
+  `func` takes typed arguments and answers with a value. Tcl's `proc` is cited
+  [above](#functions) for its signature vocabulary, so the word would have arrived
+  with the right connotation — a procedure, run for its effect.
 
   | Option | For | Against |
   | --- | --- | --- |
-  | **Keep mode-at-call-site** (today) | One definition serves both — `co main --amend` at the prompt and `x = co(main, amend: true)` in a script; nothing to rename; the caller asks for the channel it needs | The two argument grammars stay a *mode*, which is exactly the comma question [below](#open-questions); the `:capture` "doing two jobs at once" smell is a lint a reader notices, not something the language knows |
-  | **Split at the declaration** (both keywords narrow) | Argument grammar becomes a property of the callee — decided once, printable by `help`; `return` / `fail` divide cleanly along the two channels; a func with no byte channel is the tractable subset for the [static checks](../TODO.md) a resolver pass currently cannot do | `func` **narrows**, so most existing `func`s are procs — a rename across `TOUR.md`, `REFERENCE.md`, this file, and every ported config; loses the one-definition-two-ways affordance; two keywords where there was one, against *concise* |
-  | **Add `proc`, leave `func` the union** *(leaning)* | Purely additive — nothing existing breaks and no doc has to be renamed on day one; names the majority case (writes bytes, returns no value) and every external; `func` narrows by attrition as value-returning ones get written deliberately; if the split does not earn its keep the cost was one keyword, not a restructuring | For a while two spellings overlap, which is the redundancy [the `echo` / `read` question](#open-questions) calls the worst of its three outcomes — the difference is that this one is a *migration* with an end state, not a permanent pair |
+  | **Keep mode-at-call-site** (the status quo it replaced) | One definition serves both — `co main --amend` at the prompt and `x = co(main, amend: true)` in a script; nothing to rename | Leaves "what does this return?" answerable only by reading the body to its last statement, which is the whole complaint |
+  | **Split at the declaration** (both keywords narrow) | Argument grammar becomes a property of the callee — decided once, printable by `help`; `return` / `fail` divide cleanly | `func` **narrows**, so most existing `func`s are procs — a rename across `TOUR.md`, `REFERENCE.md`, this file, and every ported config; two keywords where there was one, against *concise* |
+  | **Add `proc`, leave `func` the union** *(the standing leaning)* | Purely additive — nothing breaks on day one; `func` narrows by attrition | Two spellings overlap for a long while, the redundancy [the `echo` / `read` question](#open-questions) calls the worst of its three outcomes; and it buys no check, since a union `func` still promises nothing |
 
   *Rejected spelling: `sub` / `fun`.* `sub` is Perl's and Raku's word for the
   **value-returning** thing, so it inverts the intended meaning for a reader
   arriving from either.
 
-  **"Purely additive" holds only if `proc` is a *contextual* keyword.** Today the
-  word is an ordinary name: `func proc(..._args) { … }` is a legal definition and
-  `proc x` a legal call, so claiming it unconditionally the way `func` is claimed
-  would turn that call into declaration syntax or an error — a compatibility break,
-  which is exactly what the option is chosen for avoiding. mesh already has the
-  mechanism, and **`fork` is the precedent to copy** — the subshell keyword only
-  before a block, an ordinary command word otherwise, so `func fork() { … }` stays
-  reachable and `type fork` reports the function beside the keyword. `global` /
-  `unset` / `export` are *not* precedents here, though they read like ones: as
-  [`:kind`](#modifiers) sets out above, each claims the word wherever an
-  assignment does not follow, so no literal `global x` ever reaches a function.
-  They are keywords that merely look contextual. `proc` has to work the way `fork`
-  does — recognizing a complete declaration shape rather than the bare word — and
-  that requirement belongs in the option rather than being assumed by it.
+  *`proc` would have had to be contextual, which is the cost the "purely additive"
+  framing hid.* The word is an ordinary name today: `func proc(..._args) { … }` is
+  a legal definition and `proc x` a legal call, so claiming it unconditionally the
+  way `func` is claimed would turn that call into declaration syntax or an error.
+  `fork` was the precedent to copy — the keyword only before a block, an ordinary
+  command word otherwise. `global` / `unset` / `export` are *not* precedents,
+  though they read like ones: as [`:kind`](#modifiers) sets out, each claims the
+  word wherever an assignment does not follow, so no literal `global x` ever
+  reaches a function. They are keywords that merely look contextual. **This cost
+  did not disappear with `proc`** — it moved to the prefix type-name spelling
+  above, for exactly the same reason.
 
-  **An argument for the split that does not survive, recorded so it is not made
+  *An argument for the split that does not survive, recorded so it is not made
   again: "an external would simply be a proc, so `grep(foo)` stops being an
-  exception."** The [status decision](#open-questions) already got there without
-  any split — an external's result *is* a `Status`, so `grep(foo)` answers
-  `Status(1)` rather than erroring, and `f` / `$(f)` / `f()` mean the same three
-  things for an external as for a function
-  ([Calling for a value](#calling-for-a-value-and-lambdas)). That removes a reason
-  to split. **The uniformity is on the *result* side only, though, and the limit
-  is the interesting part:** a function takes a bare list as one typed positional
-  where an external still needs it spread or joined, so an external's *arguments*
-  are words in a way a func's are not. So "an external is a proc you did not
-  write" is a fair shorthand for the result channel and an overstatement anywhere
-  else — and what survives the correction is an **argument-grammar** asymmetry,
-  which is the axis the split is actually about.
-
-  **The wrinkle to resolve before `func` could ever narrow: hook slots hold both
-  kinds.** `$sh.prompt.dir = func() { … }` returns a styled string — a genuine
-  func. `$sh.postcd.fetch = func(_previous) { vcs auto-fetch & }` runs for effect
-  and has no return value anyone wrote — the same incidental channel as `ips()`
-  above, since a bare background statement records its launch `Status` as the
-  result (`run_recorded` in `repl.rs`: "for anything else — a command, a
-  background statement — the status *is* the result"). A proc by nature, stored in
-  a variable. *(The parameter is
-  not decoration: `postcd` supplies the previous directory and the binder is
-  exact, so a zero-parameter handler is rejected at dispatch — see
-  [`HOOKS.md`](HOOKS.md), which works through that same line.)* So either procs are
-  first-class values the way funcs are, or each hook point declares which kind its
-  slot takes and `$sh.prompt.*` and `$sh.postcd.*` answer differently. That is the
-  sharpest question the split raises. It does **not** block adding `proc`, which is
-  why the leaning is to add it and defer the rest.
+  exception."* The [status decision](#open-questions) already got there without any
+  split — an external's result *is* a `Status`, so `grep(foo)` answers `Status(1)`
+  rather than erroring, and `f` / `$(f)` / `f()` mean the same three things for an
+  external as for a function ([Calling for a
+  value](#calling-for-a-value-and-lambdas)). **The uniformity is on the *result*
+  side only, though, and the limit is the interesting part:** a function takes a
+  bare list as one typed positional where an external still needs it spread or
+  joined, so an external's *arguments* are words in a way a func's are not. What
+  survives the correction is an **argument-grammar** asymmetry — which is why the
+  decision above closes the result half and explicitly leaves that one open.
 - **Destructuring in a signature — open; leaning yes, positionals only.**
   [Destructuring](#destructuring) binds a list's elements to names at an
   assignment and the *same* pattern grammar drives a [`match`](#matching-match)

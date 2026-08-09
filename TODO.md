@@ -5439,6 +5439,196 @@ thing a reader takes on trust.*
       as it always did, just as an interactive session. Nothing a prompt would
       decorate with leaks into a piped run, so output stays byte-exact.
 
+## Beyond M3 — Declared return types (`int func f()`)
+
+Decided in design discussion; see `docs/DESIGN.md` §"Open questions", the
+`proc` / `func` entry. Nothing here is built. A `func` may declare a return
+type; one that declares none has **no value channel** and its result is a
+`Status`. This is the next implementation task after the design PR that recorded
+it.
+
+**The spelling to build is the prefix, `int func f()`** — a word before `func` is
+the slot `wrapper func` and `fork func` already use. The postfix `func f() int`
+is the fallback if the prefix turns out badly in the hand; the design entry
+records what each costs, and the honest summary is that the prefix reads better
+and the postfix parses cheaper. Build one, then look at it.
+
+- [ ] **The type vocabulary is `status`, `int`, `str`, `bool`, `list`, `map`** —
+      short forms, since `int` is already the language's word (`:int` parses one)
+      and `string` would be the odd one out beside it. The prefix form recognizes
+      `WORD func NAME (`, so the parser needs this set closed up front; the
+      postfix form would not. **`status` is the awkward member**: `status(N)` is
+      already an ordinary builtin, so `status func f() { … }` leads a definition
+      with a live command word and `status 5` has to keep working. That is
+      `fork`'s problem exactly and `fork`'s solution applies — match the shape,
+      never the bare word.
+      - [ ] **Reserve `float` in the same change that closes the set, without
+            implementing it.** `f64` exists as a value; declaring one is later
+            work. Claiming the word now is what keeps that later addition a
+            feature instead of a break — nothing else may take the name in the
+            meantime. Reserving costs one entry and a diagnostic saying the type
+            is not available yet. Adding it later may still invalidate scripts
+            written against its absence; that is accepted, so do not design
+            around it.
+      - [ ] Still open: whether a compound kind is writable at all (`list`, or a
+            list of what), and whether there is a "returns a value, unspecified"
+            escape hatch.
+      - [ ] **User-defined types are not a goal** — the set is closed on purpose.
+            Recorded here so the next reader treats it as the boundary that keeps
+            this a check rather than a type system, not as a gap to fill.
+- [ ] **Settle where the type sits relative to what already shares its slot —
+      decide this before writing the parser, not during.** Wrappers return rich
+      values today (`wrapper func g(...xs) { return $xs }` yields a list through
+      `g(--foo.bar=v)`; `wrapper func w(...rest) { $rest:join("|") }` a string,
+      both in `crates/mesh/tests/cli.rs`), so the narrowing reaches them and each
+      needs a spelling.
+
+      **Both forms have this decision, so it does not choose between them.** The
+      prefix orders the type against the markers — `int wrapper func f()` or
+      `wrapper int func f()`, with `fork func` behind it; the postfix orders it
+      against the capture list — `func f() int with ($x)` or
+      `func f() with ($x) int`, since `with (…)` already sits between the parens
+      and the block. Pick one order, write it into the grammar, done. Leaning:
+      type outermost on the prefix (`int wrapper func f()` reads as "an
+      int-returning wrapper func"), type before `with` on the postfix (the type is
+      part of the interface; `with` is about the environment).
+- [ ] **Parse the marker.** `parser.rs` `executable()` already reads a two-word
+      lead-in for `wrapper` (`self.word("wrapper") && self.word_at(1, "func")`);
+      a type name is the same test against the closed set above, extended to
+      whatever the item above settles. Carry it on `Executable::Function` beside
+      `wrapper` / `subject`, and on `FuncDef` in `funcs.rs`. A lambda takes it
+      too — `str func() { … }` — since the hook-slot resolution below depends on
+      it.
+- [ ] **Narrow the value channel.** A `func` with no declared type results in a
+      `Status`; the last expression stops being its value. This is what kills the
+      `for`-aggregate nobody wrote (`eval_for_passes` / `run_ast_for_passes` in
+      `repl.rs`), and it is the breaking half of the change.
+- [ ] **Static check: `return $v` in a func that declares no type.** Local to one
+      definition, so no resolver pass — which is the point, per §"Beyond M3 —
+      Static checks" below on why mesh cannot have one. The diagnostic names the
+      fix: declare a type.
+- [ ] **Static check: a declared type the body cannot produce.** A bare `return`,
+      or a tail that is a command, in a func that declares a type. Same locality.
+      **Scope the rejection to types a `Status` does not satisfy** — a command
+      tail produces exactly a `Status(n)`, so it is right for a declared `status`
+      and wrong only for an `int`, a `str`, and the rest. Getting this backwards
+      would make `status func ips() { … }` unwritable, which is the very
+      equivalence the design entry opens with.
+- [ ] **Static check: a literal `return` operand against the declared type.**
+      `int func f() { return "hi" }`. **Only where the operand is a literal** —
+      `return $x` is unanswerable while variables are untyped, and that limit is
+      the boundary of the whole feature. See the caution below.
+- [ ] **Runtime warning where the value is taken.** `x = f()` against a typeless
+      `f` binds a `Status` rather than erroring, so the narrowing fails silently
+      exactly where it bites. Warn there — not on every typeless definition, which
+      nags the default and the majority case forever. It has to be a runtime check
+      because it needs the callee.
+- [ ] **Hook slots check at assignment *and* at dispatch.** `$sh.prompt.dir =
+      func() { … }` with no declared type can be rejected when it is assigned
+      rather than at the first prompt render, and `$sh.postcd.fetch =
+      func(_previous) { … }` stays typeless and correct. This is what the design
+      entry means by the annotation dissolving the hook-slot question that blocked
+      the `proc` split.
+
+      **The eager check cannot be the only one, because a slot may hold an
+      `&name`.** A reference is late bound — it holds the name and resolves when
+      *called*, so redefining the target changes what an already-registered
+      reference runs (`docs/REFERENCE.md` §"Function references"). The slot checks
+      the *name* at assignment, which is existence, not channel: `$sh.prompt.dir =
+      &render` passes while `render` declares a type, and a later typeless
+      `func render()` then feeds the prompt a `Status` with no assignment to catch
+      it. So validate the resolved definition's return channel at dispatch too.
+      A lambda has no such gap — it is the body it was written with — which is
+      why the eager check is still worth having.
+- [ ] **`help` and `type` print the declared type.** It is part of the signature a
+      caller reads; `FuncDef::help` builds the `Usage:` line and completion is
+      built from that text.
+- [ ] **Migrate the docs and the ported configs.** `TOUR.md`, `REFERENCE.md`,
+      `INTRO.md` and `prelude.mesh` all contain funcs written under the union.
+      Most are typeless and stay as they are; the ones whose value is taken need a
+      type. The count is the real measure of whether the migration lands on the
+      minority, as the design entry claims it does.
+
+**Not in scope, and worth saying out loud before someone starts:** this does not
+make parameters typed. `GRAMMAR.md` §Definitions has nowhere for a type to go in
+a `parameter`, and adding one is where this stops being a check on the *shape of
+a function's exits* and becomes a type checker — a much larger decision, explored
+in the section below rather than assumed by this task. Every check listed above
+is answerable from one definition; if a task here starts needing to know the type
+of a *variable*, it has crossed that line.
+
+## Beyond M3 — Past channel checking: typed parameters and variables
+
+Exploration, not committed work. The section above builds declared return types;
+this one asks what the next step would be and what it would cost. Nothing here
+should be started before that lands, because most of it only becomes answerable
+once there is a type vocabulary in the language to reason with.
+
+**How the current proposal works, in one paragraph.** A `func` may declare a
+return type drawn from a closed set (`status`, `int`, `str`, `bool`, `list`,
+`map`, with `float` reserved). Declaring none means no value channel: the result
+is a `Status`, and the body's last expression stops being its value. The type
+rides on the definition, so `help` can print it and a caller can read it without
+opening the body.
+
+**What it buys.**
+
+- "What does this return?" is answerable from the declaration instead of by
+  reading the body down to its last statement.
+- The incidental value channel goes away — a typeless body ending in a `for` no
+  longer hands back an aggregate of per-pass results that nobody wrote.
+- `return $v` in a func declaring no type becomes an error, at parse time.
+- A declared type the body cannot produce becomes an error, at parse time.
+- Hook slots check a value channel rather than needing a per-slot kind
+  declaration, which is what dissolved the wrinkle that blocked the `proc` split.
+- `help` and completion can show the signature's result, not just its arguments.
+
+**Where it stops, and why that line is exactly here.** Every check above is
+answerable from *one definition* — the declaration plus the shape of its body's
+exits. None of them needs to know what any variable holds. That is why they need
+no resolver pass, which matters because §"Beyond M3 — Static checks" below works
+through why mesh cannot have one. `return $x` against a declared `int` is
+unanswerable today and stays so: `$x` has no type to check against.
+
+**So the whole of the next step is one question — do bindings carry types?**
+Everything below follows from it, and none of it is worth starting piecemeal.
+
+- [ ] **Typed parameters.** `GRAMMAR.md` §Definitions has `parameter = name |
+      name "=" value-expression | flag-name | "..." name`, with nowhere for a type
+      to go, so this is a grammar change before it is a checking one. Worth
+      exploring first because it is the asymmetry a reader notices immediately —
+      a declared result over undeclared arguments — and because it is the smallest
+      step that starts paying: an arity error already fires at the call, so a type
+      error could too, without any flow analysis at all.
+- [ ] **Typed variables / bindings.** The real crossing. `x: int = 5`, or
+      inference from the initializer, or something else — and immediately the
+      questions a shell makes harder than a language does: `$env.FOO` is always a
+      string, `$(cmd)` is always bytes, and a `for` binder takes whatever the
+      iterable held. Explore what fraction of a real config could be checked
+      before the annotation burden exceeds what it catches.
+- [ ] **What new checks it would actually buy.** Enumerate them *before*
+      designing the mechanism, so the mechanism is chosen against a real list
+      rather than the idea of one. `return $x` against a declared return is the
+      obvious one; argument types at the call site is the next; whether anything
+      beyond that pays for itself in a shell is the open part.
+- [ ] **The gradual-typing question.** mesh would be adding types to a language
+      whose existing scripts have none, so every rule needs an answer for
+      untyped code — is an unannotated binding `any`, is it an error in a checked
+      region, is checking opt-in per file? The cheapest-to-undo shape is what to
+      look for, since this is the decision that would be hardest to reverse.
+- [ ] **The resolver-pass blocker applies here and not above.** Anything that
+      checks a *name* against its definition needs to resolve names, and
+      §"Beyond M3 — Static checks" explains why mesh cannot: `env.mesh` and
+      `source` bind outside any tree being checked, and `mesh -n` deliberately
+      does not run startup files. Whatever this explores has to say which of its
+      checks live at parse, which at run, and which are simply not available.
+
+**The boundary that does not move:** user-defined types are not a goal. The
+vocabulary stays a closed set the language ships. A config declaring its own
+kinds is a config whose `help` output and diagnostics describe a vocabulary the
+reader has never seen, and that cost lands on every reader of every error message
+rather than on the author who wanted the type.
+
 ## Beyond M3 — Static checks
 
 Things a reader of the source could know before the shell runs a line, that mesh
@@ -5992,6 +6182,14 @@ not.
       re-evaluated per call (the lambda-capture question again). Nothing is blocked —
       a lambda already expresses every case — so this is sugar, to think about rather
       than schedule.
+
+      **A consideration this did not have, from the return-type decision:** a
+      partial is the one construct that could *propagate* a declared return type.
+      `&pad(width: 8)` names its target, so a partial of an `int func` is knowably
+      an `int func` — where a `wrapper func` cannot inherit anything, its body
+      being arbitrary and its callee possibly computed. That is a point in
+      partial's favor which the "a lambda already expresses every case" summary
+      misses, since a lambda wrapper would have to redeclare the type by hand.
 
 ## Beyond M3 — Lambda capture (`with (…)`) and the `for` binder
 
