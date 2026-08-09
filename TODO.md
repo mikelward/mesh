@@ -5656,17 +5656,39 @@ entry records what each costs.
       reconstructed definition, `int func answer()`, and `whence::shape` answers
       `a function returning str` for a lambda held in a variable. Reached through
       `f --help` and `type f`.)*
-- [ ] **A malformed multiline *lambda* body runs at top level.** Found in review
-      of the typed-header work and **preexisting** — `x = func() { puts "\z"`
-      followed by `puts LEAKED` prints `LEAKED` on `origin/main`, and the typed
-      spelling (`x = str func() { …`) behaves identically, so this is not
-      something the declaration introduced. `pending_input` quarantines a
-      malformed body by recognizing a *named* `func` header and brace-scanning it;
-      a lambda has no name, so nothing recognizes it and each body line is
-      dispatched as a top-level command. Fixing it means the reader treating an
-      unterminated lambda as an open construct the way it treats a definition,
-      which reaches every lambda rather than only typed ones — which is why it is
-      filed here rather than folded into the return-type branch.
+- [ ] **A malformed multiline body runs at top level for every construct except
+      a named `func`.** Found in review of the typed-header work and
+      **preexisting**. Each of these prints `LEAKED` on `origin/main`:
+
+      ```
+      if true { puts "\z"        ⏎ puts LEAKED
+      for x in [1 2] { puts "\z" ⏎ puts LEAKED
+      while true { puts "\z"     ⏎ puts LEAKED
+      x = func() { puts "\z"     ⏎ puts LEAKED
+      ```
+
+      `func f() { puts "\z"` is the only one that quarantines, and the typed
+      spelling behaves identically to the untyped one throughout, so none of this
+      came from the declaration.
+
+      The cause is the shape of the mechanism, not a gap in it. `pending_input`
+      quarantines a malformed body by **recognizing a named `func` header** in
+      raw text and brace-scanning from it — so a construct with no such header is
+      invisible, and there are four of them. Widening the recognizer to `if` /
+      `for` / `while` / lambda would be four more hand-written scanners, which is
+      the mistake this same code already made seven times over inside the name
+      scan (see `c67d909`, where it was deleted rather than fixed an eighth time).
+
+      **The fix is to stop recognizing constructs.** A hard lexical error is
+      "dispatch" only when nothing encloses it; if a block was open when
+      tokenizing gave up, the input is incomplete whatever construct opened it.
+      The lexer already knows — it tracks brace depth and owns the quote, escape,
+      raw-string, and comment rules the reader keeps restating — so it should
+      report the open-block depth alongside the error, and `pending_input` should
+      ask that instead of asking what the line looks like. `func_definition_is_open`
+      and its signature-grammar-in-raw-text helpers (`body_open_offset`,
+      `signature_close`, `params_valid`, `header_awaits_body`) come out with it;
+      `parse`'s own `Incomplete` / `Err` split already answers the rest.
 - [ ] **Make `:repr` print a function.** Today it refuses one outright —
       `NoLiteral::Function`, "a function has no literal form" (`vars.rs`) — for
       both typed and untyped functions, so the obvious way to ask a *value* what
