@@ -11676,13 +11676,11 @@ fn yields_status(declared: Option<ReturnType>) -> bool {
 /// attributes are rendering-only, so refusing it here would split a type the
 /// rest of the language deliberately does not split.
 ///
-/// The kinds still with no word — a glob, a stream handle, a flag, and the flag
-/// terminator — can only be declared `any`. All four are returnable: `x = --force`
-/// binds a flag and `return $x` hands it back. A regex and a function value were
-/// in that list until `regex` and `func` joined; the rest stay out under the same
-/// rule, which admits a kind when a boundary declares one rather than when the
-/// runtime has one — and for the two flag kinds a word would also prejudge
-/// whether `Flag` survives at all (`docs/TYPES.md` §8).
+/// Every kind the runtime has now has a word except a flag and the flag
+/// terminator, which wait on the open question of whether `Flag` survives at all
+/// (`docs/TYPES.md` §8). `glob` is the odd one: it is declarable but not yet
+/// satisfiable, since a glob is only a value inside a match operand — so a
+/// `glob func` warns until that gap closes, which is filed rather than hidden.
 fn declared_matches(declared: ReturnType, value: &Value) -> bool {
     match declared {
         ReturnType::Value => true,
@@ -11694,6 +11692,8 @@ fn declared_matches(declared: ReturnType, value: &Value) -> bool {
         ReturnType::Map => matches!(value, Value::Map(_)),
         ReturnType::Job => matches!(value, Value::Job(_)),
         ReturnType::Regex => matches!(value, Value::Regex(_)),
+        ReturnType::Glob => matches!(value, Value::Glob(_)),
+        ReturnType::Stream => matches!(value, Value::Stream(_)),
         ReturnType::Func => matches!(value, Value::Function(_)),
     }
 }
@@ -12854,7 +12854,8 @@ fn typed_header_follows(after: &str) -> bool {
 /// stay quarantined so its diagnostic is the reserved-word one rather than
 /// whatever its body would have done at top level.
 const TYPE_MARKER_WORDS: &[&str] = &[
-    "status", "int", "str", "bool", "list", "map", "job", "regex", "func", "any", "float",
+    "status", "int", "str", "bool", "list", "map", "job", "regex", "glob", "stream", "func", "any",
+    "float",
 ];
 
 fn strip_wrapper_marker(text: &str) -> &str {

@@ -17,10 +17,10 @@ argument of record rather than as an open question, and it is written in the
 | §5 argued | Shipped | Why |
 |---|---|---|
 | `string func` | **`str func`** | short forms throughout, since `int` is already the language's word |
-| `any func` | **`any func`** | argued as `any`; shipped first as **`value func`** — `any` "reads as a claim about a type system this deliberately is not", and `value` is the design's own word for the channel — then reversed back to `any`, because `value` is *also* `return`'s channel word: `return value func() { … }` read the marker as the channel and produced an untyped lambda in silence. Confirmed by the repo owner: `any` is **kept**. `job`, `regex` and `func` took away the gap-filling for every previously unnameable kind the declared-type harvest observed, so its main use is now "a value channel, kind not the point" — but it is still the only way to declare a glob, a stream handle, a flag or the flag terminator, and the only honest answer for a polymorphic identity function |
+| `any func` | **`any func`** | argued as `any`; shipped first as **`value func`** — `any` "reads as a claim about a type system this deliberately is not", and `value` is the design's own word for the channel — then reversed back to `any`, because `value` is *also* `return`'s channel word: `return value func() { … }` read the marker as the channel and produced an untyped lambda in silence. Confirmed by the repo owner: `any` is **kept**. `job`, `regex` and `func` took away the gap-filling for every previously unnameable kind the declared-type harvest observed, so its main use is now "a value channel, kind not the point" — `glob` and `stream` have since joined too, so what is left for `any` is a flag (pending §8), and the only honest answer for a polymorphic identity function |
 
 The vocabulary is a **closed set** — `status`, `int`, `str`, `bool`, `list`,
-`map`, `job`, `regex`, `func`, `any` — with `float` reserved in the declaration position only.
+`map`, `job`, `regex`, `glob`, `stream`, `func`, `any` — with `float` reserved in the declaration position only.
 `job` was added on the repo owner's decision, which also settled the rule that
 keeps the set closed: a kind joins **on use at a function boundary**, not on
 existing in the runtime. `any` is kept, for a value channel whose kind is not
@@ -1194,7 +1194,8 @@ With that correction, the four items:
 Costs, stated plainly:
 
 - **A vocabulary of type names becomes claimable in declaration position.**
-  `status`, `int`, `str`, `bool`, `list`, `map`, `job`, `regex`, `func`, `any` and `float` have to
+  `status`, `int`, `str`, `bool`, `list`, `map`, `job`, `regex`, `glob`, `stream`,
+  `func`, `any` and `float` have to
   be recognized before `func`, contextually, the way `fork` is recognized only
   before a block — so `func int() { … }` stays a legal definition of a function
   named `int`. That is more surface than one `proc` would have claimed, and it

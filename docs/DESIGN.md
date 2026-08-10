@@ -6816,7 +6816,7 @@ to avoid" rather than promising the latter as done.
   runtime one.
 
   **The vocabulary is `status`, `int`, `str`, `bool`, `list`, `map`, `job`,
-  `regex`, `func`, `any`, and `float` is reserved.** Short forms throughout: `int` is already the language's word
+  `regex`, `glob`, `stream`, `func`, `any`, and `float` is reserved.** Short forms throughout: `int` is already the language's word
   (`:int` parses one), so `str` follows it and `string` would be the odd one out
   beside it. **`float` is reserved now and not implemented** — `f64` exists as a
   value ([Arithmetic](#arithmetic)), but declaring one is later work, and claiming
@@ -6842,11 +6842,12 @@ to avoid" rather than promising the latter as done.
   was doing two jobs: standing in for kinds the vocabulary could not name, and
   saying "a value channel, kind not the point". `job`, `regex` and `func` took
   the first job away *for every kind the harvest observed* — but not entirely:
-  a glob, a stream handle, a flag and the flag terminator have no concrete type,
-  so a function returning any of them still declares `any`, and so does a
-  polymorphic identity function, which no word can reach. The two flag kinds are
-  a separate case again: a word for them would prejudge whether `Flag` survives
-  at all, which §8 of `docs/TYPES.md` has open. What the decision rests on is the second job, which
+  a flag and the flag terminator have no concrete type, so a function returning
+  either still declares `any`, and so does a polymorphic identity function, which
+  no word can reach. The flag kinds are a separate case from the rest: a word for
+  them would prejudge whether `Flag` survives at all, which §8 of
+  `docs/TYPES.md` has open. (`glob` and `stream` were in this list until they
+  joined, below.) What the decision rests on is the second job, which
   is honest wherever it is used. Most of the sites that reach for it
   are test fixtures that need a value channel and are testing something else
   entirely; re-typing those to `int` or `str` would assert something the test
@@ -6880,6 +6881,21 @@ to avoid" rather than promising the latter as done.
   least visible. `func` is therefore as silent about what it returns as `list`
   is about its elements, and the compound-kind question stays open as one
   deliberate choice covering `func`, `list` and `map` together.
+
+  **`glob` and `stream` joined next, and `glob` is the first word added ahead of
+  the capability it names** *(decided by the repo owner)*. A stream handle is
+  narrow but real: `Value::Stream` has no constructor, so the only ones that
+  exist are `$sh.stdin`, `$sh.stdout` and `$sh.stderr`, and `stream func` says
+  "hands back one of those three" rather than "makes a stream". A glob is the
+  awkward one — `Expr::Glob` is built only inside a match operand, so in value
+  position `*.rs` runs as a command or expands to a file list, and **every `glob
+  func` warns today**. That was accepted knowingly: naming the kind puts the gap
+  where a reader will meet it, instead of leaving the word and the limitation
+  both absent. The gap is filed in `TODO.md`.
+
+  With those two the vocabulary names every value kind the runtime has except a
+  flag and the flag terminator, which wait on whether `Flag` survives at all
+  (§8 of `docs/TYPES.md`) — minting a word first would settle that sideways.
 
   The original argument for it is kept below rather than overwritten, because it
   is what the reversal is against.

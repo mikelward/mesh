@@ -34407,3 +34407,51 @@ fn a_function_value_can_be_declared_as_func_func() {
     assert_eq!(String::from_utf8_lossy(&named.stdout), "7\n");
     assert!(named.stderr.is_empty());
 }
+
+/// `stream` names one of the shell's own streams. Narrow by nature:
+/// `Value::Stream` has no constructor, so the only ones that exist are
+/// `$sh.stdin`, `$sh.stdout` and `$sh.stderr` — the word says "hands back one
+/// of those three" rather than "makes a stream".
+#[test]
+fn a_stream_handle_can_be_declared_and_is_checked() {
+    let honest = run_with_input("stream func out() { $sh.stdout }\ns = out()\nputs done\n");
+    assert_eq!(honest.status.code(), Some(0));
+    assert!(
+        honest.stderr.is_empty(),
+        "unexpected warning: {}",
+        String::from_utf8_lossy(&honest.stderr)
+    );
+
+    let dishonest = run_with_input("stream func out() { 42 }\ns = out()\nputs done\n");
+    assert_eq!(
+        String::from_utf8_lossy(&dishonest.stderr),
+        "mesh: warning: out: declared `stream`, returned an int\n"
+    );
+}
+
+/// `glob` is declarable but **not yet satisfiable**, and this pins that rather
+/// than leaving it to be discovered. `Expr::Glob` is built only inside a match
+/// operand, so in value position a pattern is a command word or a file-list
+/// expansion — a `glob func` therefore warns whatever its body does. The word
+/// was added ahead of the capability deliberately; `TODO.md` carries the gap.
+#[test]
+fn a_glob_is_declarable_but_nothing_yet_produces_one() {
+    // A body ending in a bare pattern runs it as a command, so the call answers
+    // with that command's status rather than a pattern.
+    let pattern_body = run_with_input("glob func sources() { *.rs }\ng = sources()\nputs done\n");
+    assert!(
+        String::from_utf8_lossy(&pattern_body.stderr)
+            .contains("declared `glob`, returned a status"),
+        "stderr was: {}",
+        String::from_utf8_lossy(&pattern_body.stderr)
+    );
+
+    // And binding one outside a match expands it, so no value carries the kind.
+    let bound = run_with_input("p = *.rs\nputs $p:repr\n");
+    assert_eq!(bound.status.code(), Some(0));
+    assert!(
+        !String::from_utf8_lossy(&bound.stdout).contains('*'),
+        "a bare pattern still bound as a pattern: {}",
+        String::from_utf8_lossy(&bound.stdout)
+    );
+}
