@@ -5822,6 +5822,62 @@ entry records what each costs.
 
             The cost of leaving it: `if $p { $n + 1 } else { "s" }` is silent,
             which is a real disagreement the check would otherwise catch.
+
+            **Since written, the sentinel has a second spelling — decided, and
+            for reads still unbuilt.** `DESIGN.md`'s stream-absence decision
+            makes a read with nothing left answer a nonzero `Status` rather than
+            `false`, and the presence-bind refuses a failing status exactly as it
+            refuses a `false` — *that* half shipped. The read half has **not**:
+            `eval_gets` still maps `LineRead::End` to `Value::Boolean(false)`,
+            pinned by its own test, and the entry is marked "not yet built" on
+            purpose. So option 2's precondition is **decided rather than met**,
+            and the `gets()` work is outstanding rather than done — do not read
+            this note as closing it.
+
+            What a user can write today is the sentinel by hand, which is all
+            the examples below show. Both end the loop and leave `n=3`:
+
+            ```
+            any func nxt(_n) { if $_n < 3 { $_n + 1 } else { false } }
+            any func nxt(_n) { if $_n < 3 { $_n + 1 } else { status(1) } }
+            ```
+
+            Neither warns today, so nothing is newly broken — but **not for the
+            same reason, and the difference is the whole of what this adds.**
+            `status(1)` is a `parser::Expr::Call`, and a call is
+            `Yields::Unknown` because names are late-bound, so the check never
+            sees it; `puts hi` in that branch is equally silent. The status is
+            not being recognized as a sentinel. Written in the **channel form**,
+            which *is* statically visible, it warns — **inside a func and
+            invoked**, which the example has to show: at the prompt
+            `return status 5` cannot unwind, and the classifier suppresses the
+            disagreement rather than reporting one it knows is unreachable, so
+            the bare snippet demonstrates nothing.
+
+            ```
+            any func e(_x) { if $_x { 1 } else { return status 5 } }
+            r = e(true)                → if branches disagree: `int` and `status`
+
+            any func f(_x) { if $_x { 1 } else { false } }
+            r = f(true)                → if branches disagree: `int` and `bool`
+            ```
+
+            So the two spellings do diverge, and **all three options have to
+            cover both**: option 1's exemption is worded "a `false` sentinel
+            beside any other kind" and would exempt `false` while still warning
+            on `return status N`. Option 2 gets easier to argue and narrower in
+            scope — the channel it wanted is decided, but only where the
+            operation *reads*, so it is no answer for a predicate, and it is not
+            built yet either. Option 3 is unaffected.
+
+            **And a caution for whoever picks option 1**, since the obvious
+            tidy statement of it is unsound: "a branch yielding an absent value
+            does not disagree with anything" reads absence off the *value*,
+            which [the absence rule](docs/DESIGN.md) refuses — the encoding is
+            contextual, and a `bool func` answering `false` is a complete
+            result. The presence-bind may key on the value because it *defines*
+            a runtime behavior; a check asserting the branches agree is
+            inferring intent, which is a different claim.
       - [ ] **`match` arms are not compared, only `if` branches.** The two sit
             next to each other in both evaluators — `Executable::Match` delegates
             to `eval_match_expr` exactly as `Executable::If` delegates to
