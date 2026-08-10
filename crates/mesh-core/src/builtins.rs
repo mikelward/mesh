@@ -474,12 +474,12 @@ const SYNTAX: &[(&[&str], &str, &str)] = &[
     ),
     (
         &["func"],
-        "func NAME(PARAMS) { … }",
-        "Define a function; call it by name",
+        "[TYPE] func NAME(PARAMS) { … }",
+        "Define a function; TYPE is `int`, `str`, `list`, `map`, …",
     ),
     (
         &["wrapper"],
-        "wrapper func NAME(…ARGS) { … }",
+        "[TYPE] wrapper func NAME(…ARGS) { … }",
         "Define a function that parses no flags of its own",
     ),
     (
@@ -1591,6 +1591,7 @@ mod tests {
         is_command_keyword, is_literal, is_value_call, name_of, names, overview, path_line,
         reads_options, rename_note, rendered_for_output, syntax_help, syntax_words, usage_options,
     };
+    use crate::parser::ReturnType;
     use std::ffi::OsStr;
     use std::os::unix::ffi::OsStrExt;
 
@@ -1598,6 +1599,28 @@ mod tests {
     fn path_line_preserves_non_utf8_bytes() {
         // A 0xff byte must survive verbatim, not become U+FFFD.
         assert_eq!(path_line(OsStr::from_bytes(b"/x\xffy")), b"/x\xffy\n");
+    }
+
+    #[test]
+    fn the_func_syntax_line_names_only_real_return_types() {
+        // The line lists a sample of the vocabulary rather than all of it, so
+        // nothing pairs it with `ReturnType::ALL` by length. What must hold is
+        // that every word it does name is one a `func` can actually declare —
+        // a `help` line advertising a type the parser refuses is worse than one
+        // naming fewer.
+        let (_, form, summary) = SYNTAX
+            .iter()
+            .find(|(names, ..)| names.contains(&"func"))
+            .expect("a `func` syntax row");
+        assert!(form.starts_with("[TYPE] func"), "{form}");
+        let named: Vec<&str> = summary.split('`').skip(1).step_by(2).collect();
+        assert!(!named.is_empty(), "{summary}");
+        for word in named {
+            assert!(
+                ReturnType::ALL.iter().any(|ty| ty.as_str() == word),
+                "`{word}` is not a return type: {summary}"
+            );
+        }
     }
 
     #[test]
