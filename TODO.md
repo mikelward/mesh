@@ -5391,6 +5391,569 @@ thing a reader takes on trust.*
       `T | Status(n≠0)` cannot leave a `Status` in, say, a `str`-typed name.
       A **successful** status is still an ordinary value and binds.
 
+      - [ ] **Reading a rejected code back costs something whichever way you
+            reach for it**, and what the complete routes cost is either
+            interception or knowing both absence spellings in advance. Five
+            routes are shipped and **three** of them cover every case. Four
+            drafts of this entry have been wrong in the same direction — no
+            route at all, then only `:capture` complete, then `$sh.status`
+            not a route, then `$sh.status` incomplete — and each correction
+            narrowed the gap further. It was filed to say something was
+            missing; what is missing keeps turning out smaller, and the
+            honest version of the complaint is now about **ergonomics**
+            rather than capability.
+
+            | | code from a `Status` | value on success | code from a `false` | costs |
+            |---|---|---|---|---|
+            | `$sh.status` in the rejected `else`, with a `match` on it | yes — since `6cf6a4f` | **yes** — the `if` yields it from the true arm | **yes** — a `0` *there* can only be a `false`, and the `match` turns it into a code | read it as the arm's first act; a chained `\|\|` stops firing, as below |
+            | `f():code` | yes | **no** — *requires a status* | no | a chained `\|\|` stops firing — below |
+            | `t = f()` then `if kept = $t { … } else { $t:code }` | yes | **yes** — `kept` holds it | no — same refusal | two binds |
+            | …with the `else` arm `match $t { false => 1 ; _ => $t:code }` | yes | yes | yes — but the `1` is *written*, not read | two binds and a `match` |
+            | `f():capture` | yes | yes | yes — `.status` is `1` | four, below, **plus the same `\|\|`** |
+
+            **The first row is the cheapest thing here and the newest**, so it
+            leads: `if s = f() { … } else { puts $sh.status }` reads the code
+            the bind was rejected on, with no second bind and no modifier.
+
+            **Bare, though, it identifies the absence rather than coding it.**
+            For a `false` that spelling prints `0`, not the `1` the rest of
+            this entry uses — so the raw read tells you *which* absence
+            happened and the `match` beside it is what turns that into a code.
+            Raised in review, against a row that credited the bare form with
+            the `match`'s work.
+
+            **With the `match` it is complete, because of where it is read.**
+            The `0` for a `false` is only ambiguous in general; *inside
+            the rejected `else`* a success cannot be there — it took the other
+            branch — so `0` means `false` and nothing else:
+
+            ```
+            any func fb() { return false }    ; any func fs() { return status 7 }
+            any func ok() { return "hi" }
+            r = if v = fb() { $v } else { match $sh.status { 0 => 1 ; _ => $sh.status:code } }   # 1
+            r = if v = fs() { $v } else { match $sh.status { 0 => 1 ; _ => $sh.status:code } }   # 7
+            r = if v = ok() { $v } else { match $sh.status { 0 => 1 ; _ => $sh.status:code } }   # "hi"
+            ```
+
+            Raised in review, twice, and the second round is what makes this
+            entry's complaint what it is. The first said the branch carries
+            what the channel is missing, at the cost of binding `$sh.status`
+            before the next statement overwrote it. The second showed the
+            save is unnecessary when the `else` reads the channel as its
+            first act — so this is **value-or-code in one expression**, the
+            thing option 1 was filed to add. What option 1 would add is a
+            *shorter spelling* of a route that already works.
+
+            The one cost that survives is the written `1`, which every
+            complete route pays: a `false` carries no code, so somebody has
+            to choose the number that stands for it.
+
+            **Extracting the code changes what a chained `||` does**, and it
+            is not a modifier quirk — it is charged to every route that
+            extracts *in the same expression*. The assignment's status comes
+            from the value bound, and each of those hands over something
+            successful: `:code` an int, `:capture` a record, and the
+            `if`/`match` an int of its own. So the failure stops reaching the
+            chain:
+
+            ```
+            any func f() { return status 5 }
+            r = f()          || fallback     # fallback runs
+            r = f():code     || fallback     # skipped — r is 5, an int
+            r = f():capture  || fallback     # skipped — r is a record
+            r = if v = f() { $v } else { match $sh.status { 0 => 1 ; _ => $sh.status:code } } || fallback
+                                             # skipped — r is 5, an int
+            ```
+
+            **The two-bind routes are exempt, and the exemption is the reason
+            they are worth keeping in the table**: the first bind takes the
+            call plainly, so the chain still sees the failure and the status
+            survives in the name for the second step to read.
+
+            ```
+            t = f() || fallback     # fallback runs
+            $t:code                 # 5 — still there afterwards
+            ```
+
+            Raised in review three times — against calling `:code` free, then
+            against charging the modifiers alone, then against charging the
+            two-bind routes too. What is left is a rule about *where* the
+            extraction happens rather than about which spelling does it:
+            **converting a failure into a value you can read, in the same
+            expression the chain branches on, is what stops it being acted
+            on.**
+
+            Any spelling option 1 adds inherits that unless it preserves a
+            failing `Step` — **not** merely by republishing to `$sh.status`,
+            which would change nothing: `run_and_or` branches on the `Step`
+            that `run_recorded` returns and never reads the channel, as
+            option 2 below says in full. Raised in review, against an earlier
+            sentence here that offered republishing as the way out.
+
+            **The bottom two reach every absent answer as well**, and the
+            three complete routes differ only in where the `1` comes from:
+            `:capture` projects `false` onto the status channel, while the
+            `match` arm and the `$sh.status` route above both have the author
+            type the number, since a `false` carries no code to read.
+            Measured:
+
+            ```
+            str func f() { return false }    ; str func g() { return status 7 }
+            t = f(); match $t { false => 1 ; _ => $t:code }   # 1
+            t = g(); match $t { false => 1 ; _ => $t:code }   # 7
+            ```
+
+            Raised in review, against a draft calling `:capture` the only such
+            route. Neither this nor the `$sh.status` route costs redirection
+            or a wait, and between them the `$sh.status` one is cheaper — one
+            bind rather than two, and it reads the code where the branch has
+            already told you the answer is absent.
+
+            That is what this entry's gap is really about: three routes work,
+            and the **two `match` ones** take an author who knows both
+            absence spellings by heart — the arm naming `false` is written by
+            hand, so a reader who has not met that spelling omits it and the
+            route silently covers half of what it looks like it covers.
+            `:capture` is the exception and it is exactly what it buys:
+            projecting either spelling into `.status` is done for you. It
+            pays elsewhere, in the four interception costs below. Raised in
+            review, against charging the knowledge cost to all three.
+
+            **`:capture` is not total**, though, and the word is avoided
+            deliberately: it fails outright on non-UTF-8 output (below), so it
+            covers the success/failure axis `:code` does not while failing on
+            an axis `:code` never touches. That limit is `:capture`'s alone —
+            it comes from decoding the streams, which the `match` route above
+            never touches.
+
+            ```
+            str func f() { return status 5 }
+            r = f():capture            # r.status → 5, r.value → 5
+
+            str func h() { puts "noise"; return "hi" }
+            r = h():capture            # r.value → "hi", and r.out → "noise\n"
+            ```
+
+            **What it costs is both streams of the whole invocation.**
+            `:capture` redirects stdout into `.out` **and stderr into `.err`**,
+            and it installs that redirection before the callee is resolved and
+            the arguments are evaluated — so it catches output from computing
+            the *call*, not only from the function's body:
+
+            ```
+            str func side()  { puts "from-argument"; return "x" }
+            str func takes(a) { return "got $a" }
+            r = takes(side()):capture      # r.out → "from-argument\n"
+            ```
+
+            `capture_covers_the_whole_invocation_including_its_arguments` pins
+            that, and it widens the re-emission burden past what a reader would
+            guess: a caller has to re-emit side effects of code it did not
+            write and may not know is there. Raised in review.
+
+            **And it can block.** If anything in the invocation leaves a
+            background process holding stdout or stderr, the capture waits for
+            that process to exit or close them —
+            `a_capture_waits_for_a_background_child_that_holds_the_channel`
+            pins it, and `REFERENCE.md` gives redirecting the child as the
+            workaround. Measured: a call that returns immediately without
+            `:capture` took **4.0s** with it, waiting on a backgrounded
+            `sleep 4`.
+
+            That is a different kind of cost from the two above and the one
+            most likely to be discovered in production: interception changes
+            what a caller sees, this changes whether the call returns. Raised
+            in review.
+
+            **And it is not even total, which is the sharpest of the four.**
+            `with_channels_captured` reads both pipes with `read_to_string`, so
+            an invocation whose output is not valid UTF-8 fails loudly and
+            returns **no record at all** — neither `.status` nor `.value`:
+
+            ```
+            any func f() { sh -c r'printf "\377\376"'; return status 5 }
+            x = f()            # runs fine; the bytes go to the terminal
+            r = f():capture    # mesh: stream did not contain valid UTF-8
+                               # mesh: r: unbound variable
+            ```
+
+            So the route fails **because** it intercepted the output, on a call
+            that works without it, and it takes the status down with the bytes
+            — the one thing the caller was reaching for. Any function that
+            shells out to a byte-producing program is in this class. Raised in
+            review, and `REFERENCE.md` documents the loud error.
+
+            The stderr half is the dangerous one and is easy to miss, because
+            it silently swallows diagnostics nobody wrote — including mesh's
+            own:
+
+            ```
+            str func h() { warn "x"; return "hi" }
+            x = h()            # mesh: command not found: warn   ← reaches the terminal
+            r = h():capture    # r.err holds it; the terminal shows nothing
+            ```
+
+            So "wrap the call in `:capture` to get the code" is advice that
+            hides errors unless `.err` is re-emitted too. Raised in review
+            against a version of this paragraph that costed stdout alone, and
+            `capture_returns_a_record_of_every_channel` pins the behavior.
+
+            That is a real cost rather than a quibble — it is the difference
+            between reading a result and intercepting a side effect — but it
+            is a much smaller gap than the one this entry was filed for, and
+            the entry says so rather than keeping its original framing.
+
+            The rest stands, and is why this is still open: `:capture` is an
+            explicit spelling a reader can see, so it distinguishes deliberate
+            handling from a forgetful `t = f()` — but nothing *directs* anyone
+            to it, and `$sh.status` is the thing people reach for first. That
+            reach now succeeds in a binding position, which changes the shape
+            of what is left rather than closing it.
+
+            **`$sh.status` became a route while this entry was open**, and it
+            is the largest correction here — the version of this text written
+            against `b13ebd1` said it was not one, and two commits since have
+            made it one in the positions that matter: `c3edfdb` has a plain
+            assignment publish a bound status, and `6cf6a4f` has a condition
+            publish its own. Re-measured against `15bcfb3`:
+
+            | | `$sh.status` |
+            |---|---|
+            | `f()` — statement form, `f` fails with 3 | `3` |
+            | `s = f()` — value form, `f` fails with 3 | **`3`** |
+            | `if s = f() { } else { … }` — rejected bind | **`3`** |
+            | `x = $(sh -c "exit 3")` — capture tail | `3` |
+            | `s = g()` — value form, succeeds | `0` |
+            | `x = false` | `0` |
+            | `false` | `1` |
+            | `puts (f())` — `f` fails with 3 | `0` |
+            | `if x = fb() { } else { … }` — `fb` returns `false` | `0` |
+
+            **So the surprise this entry opened with is fixed.** The repo
+            owner expected `if s = f() { … } else { $sh.status }` to read the
+            rejected code, and it now does. What is left is two holes, and
+            they are narrower and sharper than the story they replace.
+
+            **Hole 1: a `false` absence carries no code.** The last row reads
+            `0` — the same thing a success reads — so on the channel a
+            `false`-returning callee is indistinguishable from one that
+            worked. That is not an oversight in the publishing change: a
+            `false` has no code to publish, which is the same fact that makes
+            `:code` refuse it. It is an argument about the *absence spelling*
+            rather than about the channel, and it belongs with the entry that
+            picks one.
+
+            **Hole 2: a nested call whose value the enclosing statement
+            *replaces*.** Two corrections got it here. It is not "only a
+            binding position publishes" — statement position has always
+            published — and it is not every nested call either, because **the
+            status follows the value**. Where the enclosing expression hands
+            the same value on, the code survives; where it produces a
+            different one, the code goes with the old one. Measured:
+
+            ```
+            any func f() { return status 3 }
+            $env:get(UNSET, f())        # 3 — `:get` hands the default back unchanged
+            x = $env:get(UNSET, f())    # 3 — so the assignment binds a status and publishes it
+            t = [f()]:first             # 3 — same reason
+            puts (f())                  # 0 — `puts` answers its own success, and the 3 is gone
+            ```
+
+            So the uncovered shape is an operand whose value is **consumed**:
+            `puts (f())`, an argument to a command, anything that computes
+            something else out of it. Raised in review twice — first against
+            "the two binding forms", which would have recorded statement
+            position as needing a change it does not; then against listing
+            `$env:get(K, f())` as uncovered, which is shipped behavior. That
+            is what is left of option 2 below, and it is narrower than the
+            general rule it is filed under.
+
+            **The returned status is now published, which retires the old
+            rule.** Every draft of this entry before the rebase said the
+            *returned* status is never published and what survives is whatever
+            ran last inside the body. That was true and is not any more —
+            measured from the `else` of `if x = h() { } else { $sh.status }`:
+
+            ```
+            any func h() { sh -c "exit 6"; return status 5 }   # 5
+            any func h() { false;          return status 5 }   # 5
+            any func h() { y = 1;          return status 5 }   # 5
+            any func h() {                 return status 5 }   # 5
+            ```
+
+            All four now answer the *returned* code rather than the body's
+            last publisher, so the trap that made this worth filing — a caller
+            reading a plausible number that came from something else — is gone
+            with it. Raised in review, against text that had been correct at
+            the commit it was written against and became wrong under the
+            rebase; it is the reason the entry is dated to `15bcfb3`.
+
+            **One mechanism now, not two.** `assignment_status_of` publishes
+            the code of a bound `Value::Status` for any non-append assignment,
+            so the capture tail is no longer the exception — it is one of
+            several ways the same rule fires:
+
+            ```
+            x = $(sh -c "exit 3")     # 3 — capture tail
+            x = sh("-c", "exit 3")    # 3 — the same command, called for its value
+            sh("-c", "exit 3")        # 3 — the same call as a statement
+            ```
+
+            And a rejected presence-bind no longer depends on what ran inside
+            the callee: `if c = sh("-c", "exit 5")` and `if c = f()` both read
+            the code they were rejected on, where they used to answer `5` and
+            `0`.
+
+            **What is left is a plain assignment**, which every doc that
+            mentions it describes as the *price* rather than as the idiom:
+
+            ```
+            t = f()
+            if kept = $t { … } else { $t:code }
+            ```
+
+            **The two-bind form is not `f():code` written longer.** It has the
+            success column `:code` lacks — `str func f() { return "ok" }` takes
+            the true branch with `kept` holding `"ok"`, where `f():code` raises
+            *requires a status*. So it is already the value-or-code form for a
+            `Status` failure, and the one column it misses is `false`:
+
+            ```
+            str func f() { return false }
+            t = f(); if kept = $t { … } else { $t:code }   # :code: requires a status, not a boolean
+            f():code                                       # the same refusal
+            f():capture                                    # .status → 1, .value → false
+            t = f(); match $t { false => 1 ; _ => $t:code } # 1, and 7 for a `return status 7`
+            ```
+
+            **That column is reachable without `:capture`**, by branching on
+            the absence spelling in the `else` arm — the last line, and the
+            reason the two bottom rows of the table are both complete. What it
+            costs is not redirection but knowledge: the author supplies the
+            `1`, so the route only works if they already know a `false` is the
+            other way a call can come back empty-handed.
+
+            That leaves `:capture`'s own claim narrower than it was written —
+            it *derives* the code where the `match` arm hard-codes it — and
+            worth keeping in the list for that rather than for exclusivity.
+
+            And it narrows what is missing more than any other correction here:
+            the two-bind form already does value-or-code for a `Status`, so the
+            undecided spelling is **that, in one expression, plus `false`** —
+            not a capability nothing has. Raised in review twice, once in each
+            direction: a draft had the two-bind form covering less than it does
+            (this), and an earlier one had it covering more (the bare `if $t`).
+
+            **The second bind is required, not stylistic** — `if $t` raises
+            *a string is not a condition* the moment `f` succeeds with one, so
+            the bare-condition form only appears to work for the kinds that are
+            conditions. `reading_a_failed_codes_value_takes_a_plain_assignment`
+            and `REFERENCE.md` both carry the two-bind form; an earlier draft of
+            this entry carried the bare one, which is a workaround that does not
+            work. Raised in review.
+
+            That is the problem this entry exists for: the shape above is also
+            exactly what someone writes having forgotten to test, so the
+            deliberate case and the accident are the same line and no
+            diagnostic can separate them.
+
+            **Shipped already** — the two spellings above, restated here with
+            what each is good for, so the undecided list below is only
+            undecided things:
+
+            - **`f():code`**, the spelling option 1 was going to propose,
+               already built:
+
+               ```
+               str func h() { puts "noise"; return status 5 }
+               r = h():code       # 5, and "noise" still reaches the terminal
+               ```
+
+               No redirection, no wait, explicit enough for a reader to see —
+               but not free, since the int it yields is a success and a
+               `|| fallback` chained off the assignment stops firing (above).
+
+               **Its limit is the value type, not success or failure** —
+               `Modifier::Code` rejects a non-status, so it is already
+               **total for a status-valued callee**: `status func s()`
+               answering `status 0` gives `0`, not an error. What it cannot do
+               is answer for a **value** func that might succeed with a domain
+               value:
+
+               ```
+               status func s() { return status 0 }
+               r = s():code       # 0
+               str func g() { return "hi" }
+               r = g():code       # mesh: :code: requires a status, not a string
+               ```
+
+               Raised in review twice: once against an option list that
+               proposed inventing it, and once against calling it partial "on
+               success", which overstates it.
+            - **`f():capture`** — answers for both outcomes where `:code`
+               answers for one, and reads a `false` where neither `:code` nor
+               the unextended two-bind form does, and charges for it: both
+               streams of the whole invocation, a wait on any background child
+               holding them, a loud failure on output that is not valid
+               UTF-8, and the same disarmed `|| fallback` `:code` has. The
+               `match`-extended form reaches the same column for none of that,
+               so what `:capture` uniquely buys is deriving the code rather
+               than having the author write it.
+
+            **Undecided**, none picked:
+
+            1. **A shorter spelling of the one-expression form** — which is
+               all that is left once the table above is read honestly. Not a
+               new capability, and no longer even a missing *shape*: the
+               `if`-`else` with a `match` on the channel already does
+               value-or-code in one expression, covering both absence
+               spellings, so what a modifier would add is brevity. Judge it
+               as ergonomics, which is a real thing to want and a much
+               weaker case than "this cannot be written". If it
+               takes the name `:status`, one cost is easy to miss:
+               **taking the name reserves it**. `status` is available to
+               declared modifiers today, and `modifier_definition_name_problem`
+               refuses every name added to `is_builtin_modifier`, so an
+               existing `func _s:status()` would start being **refused when
+               the declaration runs** — modifier vocabulary is resolved at run
+               time, so it parses either way and the rejection is on the
+               definition path in `repl.rs`, not in the parser. Measured:
+               `func _s:status()` is accepted now where `func _s:upper()` is
+               refused as a built-in, and a `func _s:upper()` inside an
+               unexecuted `if false { … }` raises nothing at all. Recording
+               the phase matters — an earlier draft said "stop parsing", which
+               would point an implementation at the parser. Raised in review, against calling this
+               merely a narrowing of existing machinery.
+            2. **Make `$sh.status` mean it — half shipped, and the half that
+               shipped is the half this entry asked for.** The repo owner's
+               expectation was "the last call in any form"; statement position
+               already did it, and `c3edfdb` and `6cf6a4f` added the two
+               binding positions — a plain assignment and a condition. What is
+               left of the option is the **consumed** case: a call whose value
+               the enclosing expression replaces with its own — `puts (f())`,
+               an argument to a command — stops being overwritten by that
+               statement's success. A nested call whose value is *forwarded*
+               already publishes, `$env:get(UNSET, f())` and `[f()]:first`
+               among them, so the remaining work is smaller than "every
+               nested call". Raised in review.
+
+               Against it: the status channel would then carry an inner
+               expression's outcome as well as the statement's, so
+               `puts (f())` would report `3` while plainly having printed
+               something successfully. Worth costing before writing, since it
+               changes what every `$sh.status` in an existing script means
+               rather than adding a reading where there was none.
+
+               **It would not touch `&&` / `||`**, and an earlier draft of this
+               entry said it would. `run_and_or` branches on the status carried
+               by the `Step` that `run_recorded` returns, and never reads the
+               status channel — so `puts (f()) || fallback` goes on seeing
+               `puts`'s `0` whatever `$sh.status` holds. Raised in review, and
+               it makes this option meaningfully cheaper than it was recorded:
+               the blast radius is scripts that *read* `$sh.status`, not every
+               chain in the language. Changing what a chain branches on would
+               be a **separate** proposal, and one worth keeping separate.
+            2b. **Warn on a plain `t = f()` from a value-typed callee** — the
+               thing this entry is actually about, and a **separate** proposal
+               rather than a consequence of any spelling above. An earlier
+               draft had it trailing option 1 as though adding a modifier
+               produced it; it does not, and it needs its own semantics before
+               it can be costed:
+
+               - **When it fires** — at the assignment, on a callee whose
+                 declared type is a **value** type. A `status func` callee
+                 never fires, its status being the ordinary result.
+
+                 **The expression boundary is unspecified and has to be
+                 settled first**, because a wrapper preserves the semantics
+                 exactly. Measured:
+
+                 ```
+                 any func fs() { return status 5 }
+                 any func fb() { return false }
+                 any func ok() { return "hi" }
+                 t = [fs()]:first     # $t:code → 5, and $sh.status → 5
+                 t = [fb()]:first     # false, $sh.status → 0
+                 t = [ok()]:first     # "hi",  $sh.status → 0
+                 ```
+
+                 Identical to `t = fs()` in value and in published status. So
+                 **direct-shape-only** hands anyone a semantics-preserving way
+                 to shut the warning up — which is a hole, not an opt-out,
+                 since it silences the diagnostic without marking the
+                 handling. **Recursing into the right-hand side** closes it
+                 and makes `t = [f()]` noisy too, widening the compatibility
+                 cost below past what that bullet claims. Raised in review,
+                 and it is the reason this option cannot be costed as written:
+                 the two readings have different blast radii and neither is
+                 picked here.
+               - **What silences it** — nothing shipped does, and that is a
+                 finding rather than a gap in the write-up. `f():code` is not
+                 an opt-out on the callee this fires for: where that callee
+                 succeeds with a value, `:code` raises *requires a status* and
+                 leaves the name unbound, so rewriting to silence the warning
+                 changes what the program does on the success path. Neither is
+                 the two-bind route, which *opens* with the very `t = f()`
+                 being warned on. So the deliberate case has no
+                 semantics-preserving way to *say so* until option 1's
+                 spelling exists. Raised in review, against listing today's
+                 `:code` as the opt-out.
+
+                 **Under direct-shape-only there is a way to *evade* it** —
+                 the `[f()]:first` wrapper above — and the distinction is the
+                 point rather than a quibble: an opt-out marks the handling
+                 as deliberate where an evasion just hides the warning, so a
+                 reader learns nothing from it and neither does a later
+                 reader of the same line. Raised in review, against "nothing
+                 shipped silences it" read as though nothing could.
+               - **What it costs** — every existing plain assignment from a
+                 value func is noisy until rewritten, and until an opt-out
+                 exists there is nothing to rewrite it to. Under the
+                 recursing reading add every assignment that *contains* such
+                 a call, which is a wider set than the bullet used to imply.
+               - **What it requires** — resolving the callee **late**, at the
+                 call rather than from the syntax. A variable-held callee is
+                 not a blind spot, but it reaches its type by **two different
+                 paths**, and an implementation that knows only the first
+                 would miss half of them:
+
+                 ```
+                 g = int func() { return "not an int" }; x = $g()
+                                    # warning: g: declared `int`, returned a string
+                 int func f() { return "not an int" }
+                 g = &f; x = $g()   # warning: f: declared `int`, returned a string
+                 ```
+
+                 A **stored lambda** carries its type in the value —
+                 `FuncValue::return_type` answers from the `Callable::Lambda`
+                 arm. A **stored `&name`** does not: that same method returns
+                 `None` for `Callable::Named`, and the type appears only once
+                 the name is resolved, which is why the second warning is
+                 against `f` rather than `g`. So the warning has to read the
+                 declaration **after** resolution rather than off the value it
+                 was handed. Raised in review, twice: recording a
+                 variable-held callee as a limit would have built the narrow
+                 version for no reason, and citing `return_type` alone would
+                 have built one that skips every `&name`.
+
+               Listed after the spellings because it **waits on** one
+               existing — that is what the opt-out bullet above amounts to —
+               not because it follows from one.
+            3. **A second binding**, Go-style — `t, code = f()`. mesh has no
+               multi-assignment today (`t, c = f()` is *command not found*),
+               so this is the largest of the three and would want its own
+               entry.
+
+            The comparison worth making first is with Go and with exceptions,
+            since a failing status from a value func is doing that job.
+            Go's error sits **beside** the value, so the value is never lost
+            and the compiler nags an unused `err`. An exception **propagates**
+            until caught, so ignoring it is not the default. mesh's failing
+            status does neither: it arrives *instead of* the value, in the same
+            slot, and binds quietly. That is the gap, and it is why the
+            option-type spelling in the parallel entry does not close it
+            either — `none` would land in `s` just as silently.
+
       Scoped by `capture_tail`, the same syntax-only test the assignment
       *statement* uses to pick between its own `0` and the capture's status, so
       `if out = $(diff a b)` keeps branching on the diff. And the presence test
