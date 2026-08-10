@@ -14271,7 +14271,7 @@ fn help_lists_the_keywords_and_the_shape_of_a_line() {
         "while COND { … }",
         "loop { … }",
         "break",
-        "func NAME(PARAMS) { … }",
+        "[TYPE] func NAME(PARAMS) { … }",
         "return [VALUE]",
         "fork { … }",
         "cmd << END … END",
@@ -19538,12 +19538,31 @@ fn help_explains_the_alias_shorthand() {
 }
 
 #[test]
+fn help_shows_the_return_type_a_definition_can_lead_with() {
+    // `int func f()` is a declaration a reader can write, so the form `help`
+    // prints has to show the slot — and name enough of the vocabulary that they
+    // know what goes in it.
+    let out = run_with_input("help func\n");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("Syntax: [TYPE] func NAME(PARAMS) { … }"),
+        "{stdout}"
+    );
+    for word in ["`int`", "`str`", "`list`", "`map`"] {
+        assert!(stdout.contains(word), "{word}: {stdout}");
+    }
+    assert!(out.stderr.is_empty(), "{:?}", out.stderr);
+}
+
+#[test]
 fn help_explains_the_wrapper_marker() {
     // A word the parser takes and `help` does not know is a reader being told,
     // falsely, that the word they just used is not syntax.
     let out = run_with_input("help wrapper\n");
     assert!(
-        String::from_utf8_lossy(&out.stdout).contains("wrapper func NAME(…ARGS) { … }"),
+        // The type word is read before `wrapper`, so `str wrapper func w()` is
+        // as writable as `str func f()` — and the form says so.
+        String::from_utf8_lossy(&out.stdout).contains("[TYPE] wrapper func NAME(…ARGS) { … }"),
         "{:?}",
         out.stdout
     );
