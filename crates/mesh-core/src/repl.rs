@@ -11678,8 +11678,8 @@ fn yields_status(declared: Option<ReturnType>) -> bool {
     matches!(declared, None | Some(ReturnType::Status))
 }
 
-/// The type a branch's tail **literally is**, where syntax alone settles it —
-/// `None` for everything else, which is most things.
+/// What a branch's tail **literally is**, where syntax alone settles it —
+/// unknown for everything else, which is most things.
 ///
 /// Deliberately narrow. A bare word in value position is a *command*, not a
 /// string, so only a quoted word is a `str`; a bare one is a literal only when
@@ -11687,46 +11687,80 @@ fn yields_status(declared: Option<ReturnType>) -> bool {
 /// guard, or a background `&` is skipped, because its type depends on what
 /// happens at run time and this has to answer from the source alone. That is
 /// what keeps the check clear of late binding: it never needs to resolve a name.
-fn literal_type(body: &parser::Source, unwinds: bool) -> Option<ReturnType> {
+///
+/// It answers in [`Yields`] rather than a bare kind because a branch that can
+/// only error is not a branch whose kind is merely unknown. Flattening the two
+/// here made every all-failing compound look like a value — `not (if $q
+/// { :capture } else { not 7 })` was handed a `bool` though either value of `$q`
+/// fails. The same conflation as everywhere else in this check, one level up.
+/// Raised in review.
+fn body_yields(body: &parser::Source, unwinds: bool) -> Yields {
     // **What leaves the branch first wins, not what is written last.** Anything
     // after an unconditional `return` is unreachable, so reading the syntactic
     // tail of `{ return 7; return "seven" }` reported `str` for a branch that
     // only ever yields an int — a disagreement that cannot happen. Raised in
     // review.
-    let (tail, rest) = body.statements.split_last()?;
+    let Some((tail, rest)) = body.statements.split_last() else {
+        return Yields::Unknown;
+    };
     for statement in rest {
         match leaves(statement, unwinds) {
             Leaves::No => {}
-            Leaves::Always(kind) => return kind,
+            Leaves::Always(left) => return left,
             // Something ahead of the tail *might* leave, so whether the tail
             // runs at all is a run-time fact — the same thing this refuses to
             // guess at everywhere else.
-            Leaves::Maybe => return None,
+            Leaves::Maybe => return Yields::Unknown,
         }
-    }
-    // Nothing left early, so the tail is what the branch yields. **An explicit
-    // `return` is the same tail said out loud**, and the shape most likely to
-    // carry a declared type it can contradict:
-    // `int func pick(p) { if $p { return 7 } else { return "seven" } }`.
-    if let Leaves::Always(kind) = leaves(tail, unwinds) {
-        return kind;
     }
     // `a && b` and `cmd &` decide their value at run time, so neither is literal.
     if !tail.and_or.rest.is_empty() || tail.background {
-        return None;
+        return Yields::Unknown;
     }
+    // Nothing left early, so the tail is what the branch yields — and each shape
+    // is asked **once**. Routing the tail through `leaves` first and then
+    // classifying it walked the same expression twice, which doubles per level
+    // of nesting: 16 nested `if`s took four seconds. The answers agree anyway —
+    // a compound that leaves carries the kind it would have yielded — so asking
+    // one of them is not a shortcut. Raised in review, with measurements.
     match &tail.and_or.first {
         parser::Executable::Expression { expression, guard } => {
             // A guard (`7 if $p`) can decline to produce the value at all.
             if guard.is_some() {
-                return None;
+                return Yields::Unknown;
             }
-            literal_expr_type(expression, unwinds)
+            // **An operand can leave before the operator around it runs.** In
+            // `(if $q { return 1 } else { return 2 }) == 1` the `==` never
+            // happens, so reporting its `bool` names a value no run produces.
+            // Unknown rather than impossible: the branch does yield something,
+            // by leaving, and what that is depends on which exit was taken.
+            // Raised in review.
+            if operand_may_leave(expression, unwinds) {
+                return Yields::Unknown;
+            }
+            reported_yields(expression, unwinds)
         }
         // A nested `if` is a branch tail like any other, and one whose own
-        // branches all agree has a kind of its own — see [`compound_type`].
-        parser::Executable::If(node) => compound_type(node, unwinds),
-        _ => None,
+        // branches all agree has a kind of its own — see [`compound_yields`].
+        parser::Executable::If(node) => compound_yields(node, unwinds),
+        // **An explicit `return` is the same tail said out loud**, and the shape
+        // most likely to carry a declared type it can contradict:
+        // `int func pick(p) { if $p { return 7 } else { return "seven" } }`.
+        // **An operand leaves before the `return` around it does**, the same
+        // way it does before an operator: `return (if $q { return 1 } else
+        // { return 2 }) == 1` never reaches the outer exit. Raised in review.
+        parser::Executable::Control { value, .. }
+            if value
+                .as_ref()
+                .is_some_and(|value| operand_may_leave(value, unwinds)) =>
+        {
+            Yields::Unknown
+        }
+        parser::Executable::Control { .. } => match leaves(tail, unwinds) {
+            Leaves::Always(left) => left,
+            _ => Yields::Unknown,
+        },
+        _ => Yields::Unknown,
     }
 }
 
@@ -11739,8 +11773,12 @@ enum Leaves {
     No,
     /// Might leave, so whether what follows runs is a run-time fact.
     Maybe,
-    /// Always leaves, carrying this kind — `None` where it carries no value.
-    Always(Option<ReturnType>),
+    /// Always leaves, carrying this answer. It is a [`Yields`] rather than a
+    /// kind because an exit that can only error — `return not 7`, `fail 0` — is
+    /// not one whose kind is merely unknown, and flattening the two let an
+    /// operator around the branch hand it a value the exit never produced.
+    /// Raised in review.
+    Always(Yields),
 }
 
 /// Which of the three [`Leaves`] a statement is.
@@ -11770,8 +11808,23 @@ fn leaves(statement: &parser::Statement, unwinds: bool) -> Leaves {
             // rather than producing the value written. `unwinds` is the same
             // pair of tests the runtime makes, passed in rather than repeated,
             // so the two cannot answer differently. Raised in review.
+            // Nothing unwinds, so the branch **errors** rather than leaving
+            // with the value written — which is `Never`, not "left with no
+            // kind".
             if !unwinds {
-                return Leaves::Always(None);
+                return Leaves::Always(Yields::Never);
+            }
+            // **The operand can leave before this exit does.** `return (if $q
+            // { return 1 } else { return 2 }) == 1` leaves with the inner
+            // value, so the branch does leave — but with a kind this statement
+            // does not settle. The same guard `body_yields` puts on a tail,
+            // here for every channel, since `fail` and `return status` read
+            // their operands too. Raised in review.
+            if value
+                .as_ref()
+                .is_some_and(|value| operand_may_leave(value, unwinds))
+            {
+                return Leaves::Always(Yields::Unknown);
             }
             // **`fail` is the status channel's `return`**, and it produces a
             // value like one: `fail 3` yields `status(3)` and a bare `fail`
@@ -11784,7 +11837,7 @@ fn leaves(statement: &parser::Statement, unwinds: bool) -> Leaves {
             // `break` and `continue` leave without a value, as does a bare
             // `return` — so they end the branch carrying no kind.
             if !matches!(kind, parser::ControlKind::Return) {
-                return Leaves::Always(None);
+                return Leaves::Always(Yields::Unknown);
             }
             // `return status 5` yields a **status**, whatever its operand
             // spells — the kind is settled by the channel, and reading the
@@ -11793,26 +11846,29 @@ fn leaves(statement: &parser::Statement, unwinds: bool) -> Leaves {
             if matches!(channel, Some(parser::Channel::Status)) {
                 return Leaves::Always(status_exit_type(value.as_ref(), 0..=255, unwinds));
             }
-            Leaves::Always(
-                value
-                    .as_ref()
-                    .and_then(|value| literal_expr_type(value, unwinds)),
-            )
+            // **A `return` reads its operand exactly as a tail does**, failure
+            // included: `return not 7` leaves with nothing, so a `not` around
+            // the branch has no bool to read. A bare `return` carries no kind,
+            // which is unknown rather than impossible.
+            Leaves::Always(match value.as_ref() {
+                Some(value) => reported_yields(value, unwinds),
+                None => Yields::Unknown,
+            })
         }
         // **A compound that returns down every path leaves too**, and anything
         // after it is unreachable: `{ if $q { return 1 } else { return 2 };
         // return "s" }` never yields that `str`. Raised in review, where reading
         // past it produced exactly that false warning.
         parser::Executable::If(node) if leaves_always(node, unwinds) => {
-            Leaves::Always(compound_type(node, unwinds))
+            Leaves::Always(compound_yields(node, unwinds))
         }
         other if may_leave(other, unwinds) => Leaves::Maybe,
         _ => Leaves::No,
     }
 }
 
-/// `status` for an exit that can produce one, `None` where a **written** operand
-/// rules it out — `codes` being the range that exit accepts.
+/// `status` for an exit that can produce one, [`Yields::Never`] where a
+/// **written** operand rules it out — `codes` being the range that exit accepts.
 ///
 /// A literal the channel cannot carry — `return status "bad"`, `return status
 /// 999`, `fail 0` — is an **error** rather than a value, so there is no kind to
@@ -11827,95 +11883,1214 @@ fn status_exit_type(
     value: Option<&parser::Expr>,
     codes: std::ops::RangeInclusive<i64>,
     unwinds: bool,
-) -> Option<ReturnType> {
+) -> Yields {
     // A bare `fail` means 1. `return status` requires an operand, so only the
     // former reaches this.
     let Some(expression) = value else {
-        return Some(ReturnType::Status);
+        return Yields::Known(ReturnType::Status);
     };
-    if never_yields(expression) {
-        return None;
-    }
-    match literal_expr_type(expression, unwinds) {
-        Some(ReturnType::Int) => literal_integer(expression)
+    match reported_yields(expression, unwinds) {
+        Yields::Never => Yields::Never,
+        Yields::Known(ReturnType::Int) => literal_integer(expression)
             .filter(|code| codes.contains(code))
-            .map(|_| ReturnType::Status),
+            .map_or(Yields::Never, |_| Yields::Known(ReturnType::Status)),
         // A string, a list, a func: the channel refuses them all.
-        Some(_) => None,
+        Yields::Known(_) => Yields::Never,
         // **A word written out is a literal here even when it isn't elsewhere.**
         // In value position a bare word is a *command*, which is why
-        // `literal_expr_type` declines it — but a status operand is read as a
+        // [`reported_yields`] declines it — but a status operand is read as a
         // number, so `return status bad` and `return status 007` are known-bad
         // codes rather than unknown values, and warning about the branch would
         // come ahead of the error saying it produces nothing. Raised in review.
-        None if written_word(expression) => None,
+        Yields::Unknown if written_word(expression) => Yields::Never,
         // A variable or a call: only the run can say, and when it says anything
         // it says `status`.
-        None => Some(ReturnType::Status),
+        Yields::Unknown => Yields::Known(ReturnType::Status),
     }
-}
-
-/// Can this range endpoint be one? Absent counts from zero; anything written
-/// out that is not an integer is *range endpoints must be integers*, an error
-/// rather than a list.
-fn endpoint_runs(endpoint: Option<&parser::Expr>, unwinds: bool) -> bool {
-    let Some(expression) = endpoint else {
-        return true;
-    };
-    reads_as(expression, ReturnType::Int, unwinds)
 }
 
 /// Can this operand be read as `kind` — or is it **written out** as something
 /// else, and so an error rather than a value?
 ///
-/// Two ways to be written out, and both count. `literal_expr_type` names the
-/// kind of the ones it can (`"a"` is a `str`), but it also declines a bare word,
-/// which in *this* position is not the command it would be in value position:
-/// inside a group or after `..`, `(007)` and `(a)` are strings, and the runtime
-/// says so — *a string is not a condition*, *range endpoints must be integers*.
-/// Reading that decline as "only the run can say" warned about branches that
-/// could never produce the kind named. Raised in review, twice, which is what
-/// made it one predicate rather than two.
+/// Two ways to be written out, and both count. [`yields`] names the kind of the
+/// ones it can (`"a"` is a `str`), but it also declines a bare word, which in
+/// *this* position is not the command it would be in value position: inside a
+/// group or after `..`, `(007)` and `(a)` are strings, and the runtime says so —
+/// *a string is not a condition*, *range endpoints must be integers*. Reading
+/// that decline as "only the run can say" warned about branches that could never
+/// produce the kind named. Raised in review, twice, which is what made it one
+/// predicate rather than two.
 ///
 /// Anything genuinely waiting on the run — a variable, a call — is left alone.
 fn reads_as(expression: &parser::Expr, kind: ReturnType, unwinds: bool) -> bool {
-    if never_yields(expression) {
+    match yields(expression, unwinds) {
+        Yields::Never => false,
+        Yields::Known(actual) => actual == kind,
+        Yields::Unknown => !written_word(expression),
+    }
+}
+
+/// What an expression yields, read from the source alone.
+///
+/// The three answers are genuinely different, and conflating any two of them
+/// caused a false warning at some point in review: an expression that can only
+/// **error** is not one whose kind is merely **unknown**, and neither is one
+/// whose kind is **known**.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Yields {
+    /// Can only error, so there is no value and no kind — `:capture` alone,
+    /// `1 == "1"`, `[[]: 1]`, an open-ended range.
+    Never,
+    /// Certainly this kind, whatever the run does.
+    Known(ReturnType),
+    /// Only the run can say: a call, a variable, a glob.
+    Unknown,
+}
+
+/// The **one** walk over an expression, answering all three questions at once.
+///
+/// It has to be one walk. Asking "can this only error?" and "what kind is this?"
+/// as two recursive functions that each consult the other visits every subtree
+/// twice per level, which is exponential in depth: a chain of 24 additions took
+/// 12s before this, and 26 did not finish. Measured and raised in review.
+fn yields(expression: &parser::Expr, unwinds: bool) -> Yields {
+    match expression {
+        parser::Expr::Group(inner) => yields(inner, unwinds),
+        // The expression spelling of the nested case `body_yields` handles.
+        // **A compound that cannot pick a branch yields nothing**, which its
+        // `None` cannot say on its own — that answer also covers branches this
+        // simply cannot read, so mapping every `None` to unknown let a
+        // surrounding operator hand a kind to `not (if 7 { true } else
+        // { false })`. The same three-way distinction as everywhere else here,
+        // missed in the first version of this walk. Raised in review.
+        parser::Expr::If(node) => compound_yields(node, unwinds),
+        // **An operator that answers a question is a bool** — a comparison, a
+        // match, `in`, `and` / `or` — and arithmetic is integer-only, since
+        // *expected integer* is what `"a" + "b"` gets. Either way the kind does
+        // not depend on the operands; whether the operator can run at all
+        // does, and [`operands_fit`] is that question.
+        parser::Expr::Binary { op, left, right } => {
+            // **`~` compiles a bare glob on its right**, which is the one place
+            // an operator does — `"z" ~ a[` is *invalid glob pattern*. The glob
+            // itself carries no failure (see its arm above), so the rule sits
+            // with the operator that performs the compile. Raised in review.
+            if matches!(op, parser::BinaryOp::Match | parser::BinaryOp::NotMatch)
+                && glob_refused(right)
+            {
+                return Yields::Never;
+            }
+            let left = yields(left, unwinds);
+            let right = yields(right, unwinds);
+            if left == Yields::Never || right == Yields::Never || !operands_fit(op, left, right) {
+                return Yields::Never;
+            }
+            Yields::Known(match op {
+                parser::BinaryOp::Add
+                | parser::BinaryOp::Subtract
+                | parser::BinaryOp::Multiply
+                | parser::BinaryOp::Divide
+                | parser::BinaryOp::Remainder => ReturnType::Int,
+                _ => ReturnType::Bool,
+            })
+        }
+        // `not` answers a question and takes a bool to do it — `not 7` is *an
+        // int is not a condition*. `-` is arithmetic. `...` spreads whatever it
+        // is given, so it has no kind of its own.
+        parser::Expr::Unary { op, expression } => {
+            let operand = yields(expression, unwinds);
+            let (wants, gives) = match op {
+                parser::UnaryOp::Not => (ReturnType::Bool, ReturnType::Bool),
+                parser::UnaryOp::Negate => (ReturnType::Int, ReturnType::Int),
+                // **`...` is transparent where a value is read** — `...7` is 7
+                // and `...[1 2]` is that list — so it passes the whole answer
+                // through, failure included. Returning plain "unknown" dropped
+                // both halves: `not (...:capture)` was handed a kind, and so was
+                // `not (...7)`, which is *an int is not a condition*. Raised in
+                // review. (Exploding a list into call arguments is the other
+                // reading of `...`, and it is not this position.)
+                parser::UnaryOp::Spread => return operand,
+            };
+            match operand {
+                Yields::Known(kind) if kind != wants => Yields::Never,
+                Yields::Never => Yields::Never,
+                _ => Yields::Known(gives),
+            }
+        }
+        // A range is a list of the integers it spans — `..3` counts from zero.
+        // An open *end* cannot be counted to, an endpoint written as something
+        // other than an integer is *range endpoints must be integers*, and
+        // `1..=` the largest integer there is overflows counting past it.
+        parser::Expr::Range {
+            start,
+            end,
+            inclusive,
+        } => {
+            let Some(end) = end else {
+                return Yields::Never;
+            };
+            // An absent start counts from zero; anything written takes the same
+            // reading a condition does — see [`reads_as`].
+            let endpoint = |endpoint: Option<&parser::Expr>| {
+                endpoint.is_none_or(|endpoint| reads_as(endpoint, ReturnType::Int, unwinds))
+            };
+            if !endpoint(start.as_deref()) || !endpoint(Some(end)) {
+                return Yields::Never;
+            }
+            if *inclusive && literal_integer(end) == Some(i64::MAX) {
+                return Yields::Never;
+            }
+            Yields::Known(ReturnType::List)
+        }
+        // A container is only as good as what is in it.
+        parser::Expr::List(items) => {
+            let bad = items.iter().any(|item| match item {
+                parser::ListItem::Value(item) | parser::ListItem::Spread(item) => {
+                    yields(item, unwinds) == Yields::Never
+                }
+            });
+            if bad {
+                Yields::Never
+            } else {
+                Yields::Known(ReturnType::List)
+            }
+        }
+        parser::Expr::Map(items) => {
+            let bad = items.iter().any(|item| match item {
+                parser::MapItem::Pair(key, value) => {
+                    !map_key(yields(key, unwinds)) || yields(value, unwinds) == Yields::Never
+                }
+                // **Only a map can be spread into a map** — `[a: 1, ...7]`
+                // says so by name, where a list happily takes `...7` as an
+                // element. Raised in review.
+                parser::MapItem::Spread(item) => !matches!(
+                    yields(item, unwinds),
+                    Yields::Known(ReturnType::Map) | Yields::Unknown
+                ),
+            });
+            if bad {
+                Yields::Never
+            } else {
+                Yields::Known(ReturnType::Map)
+            }
+        }
+        // A lambda is a function value whatever its body does, and nothing about
+        // that is deferred to run time.
+        parser::Expr::Lambda { .. } => Yields::Known(ReturnType::Func),
+        // **A reference is a function value without resolving anything** — `&f`
+        // binds the name, it does not look it up, so `&nosuchthing` is a `func`
+        // just as `&puts` is. That is why late binding does not bar this one:
+        // the kind is settled here, and only *calling* it asks who `f` is.
+        parser::Expr::FuncRef(_) => Yields::Known(ReturnType::Func),
+        // Same for a modifier, except `:capture`, which applies to a call and
+        // alone is an error rather than the function value its siblings are.
+        parser::Expr::ModifierRef(name) => {
+            if name == "capture" {
+                Yields::Never
+            } else {
+                Yields::Known(ReturnType::Func)
+            }
+        }
+        // **An interpolation is evaluated to build the word**, so a piece that
+        // can only error takes the whole word with it: `"${:capture}"` is
+        // *:capture applies to a call* rather than a string. `scalar_kind`
+        // answers `None` for any word carrying one, which says *unknown* — and
+        // that let an operator hand `not ("${:capture}")` a kind. Raised in
+        // review.
+        parser::Expr::Scalar(word) => {
+            let failing = word.value.pieces.iter().any(|piece| match piece {
+                parser::WordPiece::Value { expression, quote } => {
+                    match yields(&expression.value, unwinds) {
+                        Yields::Never => true,
+                        // **Only a double-quoted piece is turned into text** —
+                        // that is the one `interpolated_value` guards — and a
+                        // list, a map or a func has no text form to turn into.
+                        // Raised in review.
+                        Yields::Known(kind) => {
+                            matches!(quote, parser::QuoteMode::Double)
+                                && matches!(
+                                    kind,
+                                    ReturnType::List | ReturnType::Map | ReturnType::Func
+                                )
+                        }
+                        Yields::Unknown => false,
+                    }
+                }
+                _ => false,
+            });
+            if failing {
+                return Yields::Never;
+            }
+            match scalar_kind(word) {
+                Some(kind) => Yields::Known(kind),
+                None => Yields::Unknown,
+            }
+        }
+        // **A pattern that cannot compile matches nothing** — it is *invalid
+        // regex* rather than a value, so a branch built on one has no kind. The
+        // question is put to `expand::compile_regex`, which is what the match
+        // itself uses, rather than answered a second way here. Raised in review.
+        // **A bare glob is not compiled to be built.** `eval_expr` hands back a
+        // `Value::Glob` holding the text and nothing else, so `x = (a[)` binds
+        // the string `a[` rather than failing — unlike the regex above, which
+        // `eval_expr` compiles on the spot. Calling an uncompilable glob a
+        // failure *here* claimed it fails everywhere and cost real warnings
+        // wherever nothing goes on to compile it. The compile belongs to the two
+        // places that perform one — [`glob_refused`]. Raised in review.
+        parser::Expr::Glob(_) => Yields::Unknown,
+        // **A modifier cannot rescue a subject that cannot run.** `/[/:i`
+        // evaluates the literal before `:i` sees it, so the invalid regex is
+        // what happens; reading the wrapper as unknown let an operator hand it a
+        // kind. What a modifier *returns* is still unknown — that depends on
+        // which modifier — so only the failure passes through. Raised in review.
+        // **Its arguments are evaluated too**, and checking only the subject
+        // left `"a":split(:capture)` looking like a value. Raised in review.
+        parser::Expr::Modifier {
+            value,
+            name,
+            arguments,
+        } => {
+            // **`:capture` wraps a call rather than transforming a value**, so
+            // a subject that is not literally one is *:capture applies to a
+            // call* — the same nothing a bare `:capture` is. The rule is
+            // `eval_expr`'s own, down to refusing arguments and to a grouped
+            // call not counting. Raised in review.
+            if name == "capture"
+                && (arguments.is_some() || !matches!(value.as_ref(), parser::Expr::Call { .. }))
+            {
+                return Yields::Never;
+            }
+            let failing = |argument: &parser::Argument| match argument {
+                parser::Argument::Positional(argument)
+                | parser::Argument::Named(_, argument)
+                | parser::Argument::Spread(argument) => never_yields(argument, unwinds),
+            };
+            if never_yields(value, unwinds) || arguments.iter().flatten().any(failing) {
+                Yields::Never
+            } else {
+                Yields::Unknown
+            }
+        }
+        parser::Expr::Regex { pattern, extended } => {
+            let value = vars::RegexValue {
+                pattern: pattern.clone(),
+                case_insensitive: false,
+                multi_line: false,
+                dot_matches_new_line: false,
+                ignore_whitespace: *extended,
+            };
+            if crate::expand::compile_regex(&value).is_err() {
+                Yields::Never
+            } else {
+                Yields::Unknown
+            }
+        }
+        // **A `$(…)` is a string when its body runs** — `capture_source` trims
+        // the trailing newlines off the output and hands back a `Value::String`,
+        // whatever ran inside. Reading it as unknown let `not $(cmd)` pass for a
+        // condition, which is *a string is not a condition*; reading it as a
+        // string unconditionally then let `$(x = not 7)` pass for one, since a
+        // body that can only error captures nothing. Both raised in review.
+        parser::Expr::Capture(body) => {
+            if body_fails(body, unwinds) {
+                Yields::Never
+            } else {
+                Yields::Known(ReturnType::Str)
+            }
+        }
+        // **A loop reads its iterable and a `match` reads its subject before
+        // anything else happens**, so one that can only error is what happens
+        // instead: `for x in :capture { … }` is *:capture applies to a call*.
+        // What either yields is still the run's business. Raised in review.
+        parser::Expr::For {
+            bindings, iterable, ..
+        } => {
+            if !iterates(bindings, yields(iterable, unwinds)) {
+                Yields::Never
+            } else {
+                Yields::Unknown
+            }
+        }
+        parser::Expr::Match(node) => {
+            if match_fails(node, unwinds) {
+                Yields::Never
+            } else {
+                Yields::Unknown
+            }
+        }
+        // **Subscripting cannot rescue a subject or a subscript that cannot
+        // run** — `:capture[0]` is *:capture applies to a call* before anything
+        // is indexed — while what comes back out depends on what was in there.
+        // Raised in review.
+        parser::Expr::Index { value, index } => {
+            let subject = yields(value, unwinds);
+            if subject == Yields::Never || !indexable(subject, index, unwinds) {
+                Yields::Never
+            } else {
+                Yields::Unknown
+            }
+        }
+        // **A member access needs a map** — *member access .x requires a map* —
+        // so a subject of any other known kind produces nothing. Raised in
+        // review.
+        parser::Expr::Member { value, .. } => {
+            if matches!(
+                yields(value, unwinds),
+                Yields::Known(ReturnType::Map) | Yields::Unknown
+            ) {
+                Yields::Unknown
+            } else {
+                Yields::Never
+            }
+        }
+        // **A call evaluates its callee and every argument**, so one of those
+        // that can only error is what happens instead of the call:
+        // `status(:capture)` is *:capture applies to a call*. What the call
+        // *returns* stays unknown — late binding means this never resolves a
+        // name. Raised in review.
+        parser::Expr::Call { callee, arguments } => {
+            let failing = |argument: &parser::Argument| match argument {
+                parser::Argument::Positional(argument) | parser::Argument::Named(_, argument) => {
+                    never_yields(argument, unwinds)
+                }
+                // **A spread argument is unpacked, not passed** — *a spread
+                // argument must be a list (of positionals) or a map (of
+                // options)* — so a scalar is refused before the call happens.
+                // Raised in review.
+                parser::Argument::Spread(argument) => !matches!(
+                    yields(argument, unwinds),
+                    Yields::Known(ReturnType::List | ReturnType::Map) | Yields::Unknown
+                ),
+            };
+            if !callable(callee, unwinds) || arguments.iter().any(failing) {
+                Yields::Never
+            } else {
+                Yields::Unknown
+            }
+        }
+        _ => Yields::Unknown,
+    }
+}
+
+/// Can this callee be called?
+///
+/// **A word in callee position is a name, not a value**, resolved when the call
+/// runs — `true()` runs the `true` command and `7()` is *command not found: 7*,
+/// so a word's scalar kind says nothing at all about whether the call can
+/// happen. A callee written as anything else *is* a value, and one that is not a
+/// function is *call target: value is not callable*: `(7)()`, `[1 2]()`. The
+/// distinction is the whole content of this, and it is why the kind cannot
+/// simply be read off either way. Raised in review.
+fn callable(callee: &parser::Expr, unwinds: bool) -> bool {
+    match callee {
+        parser::Expr::Scalar(_) => !never_yields(callee, unwinds),
+        value => matches!(
+            yields(value, unwinds),
+            Yields::Known(ReturnType::Func) | Yields::Unknown
+        ),
+    }
+}
+
+/// Can this subject take this subscript?
+///
+/// The rules are `eval_index`'s own, and only a **known** subject or subscript
+/// is judged by them — a variable is left alone as everywhere else here.
+///
+/// | | |
+/// |---|---|
+/// | anything but a list or a map | *cannot index a scalar value*, whatever the subscript |
+/// | a map, sliced | *cannot slice a map value* — only a list has an order to cut |
+/// | a list, subscripted | *expected integer*, so a string or a bool is out — `["0"]` too |
+/// | a map, subscripted | a scalar becomes a key; *map key must be a string* refuses the rest |
+///
+/// **A range subscript is a slice, not a value**, which is the one place an open
+/// end is fine: `$xs[1..]` cuts to the end where a bare `1..` has nothing to
+/// count to. Its endpoints still have to be integers.
+fn indexable(subject: Yields, index: &parser::Expr, unwinds: bool) -> bool {
+    match index {
+        parser::Expr::Group(inner) => indexable(subject, inner, unwinds),
+        parser::Expr::Range { start, end, .. } => {
+            let endpoint = |endpoint: Option<&parser::Expr>| {
+                endpoint.is_none_or(|endpoint| reads_as(endpoint, ReturnType::Int, unwinds))
+            };
+            endpoint(start.as_deref())
+                && endpoint(end.as_deref())
+                && matches!(subject, Yields::Known(ReturnType::List) | Yields::Unknown)
+        }
+        _ => match (subject, yields(index, unwinds)) {
+            (_, Yields::Never) => false,
+            (Yields::Known(ReturnType::List), key) => {
+                matches!(key, Yields::Known(ReturnType::Int) | Yields::Unknown)
+            }
+            (Yields::Known(ReturnType::Map), key) => !matches!(
+                key,
+                Yields::Known(ReturnType::List | ReturnType::Map | ReturnType::Func)
+            ),
+            (Yields::Known(_), _) => false,
+            _ => true,
+        },
+    }
+}
+
+/// Can this `match` only error?
+///
+/// Three things are reached whatever the subject turns out to be: the subject
+/// itself, the **first** arm's first pattern — `match "a" { /[/ => 1 }` is
+/// *invalid regex* — and, when that pattern matches anything at all, its guard:
+/// `match 1 { _ if not 7 => 1 }` is *an int is not a condition*. Everything past
+/// those is tried only because something before it failed to match, so it cannot
+/// be counted on. Raised in review, once per member.
+fn match_fails(node: &parser::MatchExpr, unwinds: bool) -> bool {
+    let subject = yields(&node.value, unwinds);
+    if subject == Yields::Never {
+        return true;
+    }
+    // **A pattern is only compiled against a string subject.** `match_bindings`
+    // reaches `glob::Pattern::new` inside its `Value::String` arm and answers
+    // "did not match" for every other kind, so an invalid glob is fatal only
+    // when the subject can be a string. A regex literal is not conditional this
+    // way — `eval_expr` compiles it to build the value, before the subject is
+    // consulted at all — which is why only the glob asks. Raised in review.
+    let string_subject = matches!(subject, Yields::Known(ReturnType::Str) | Yields::Unknown);
+    let first = node.arms.first();
+    let mut patterns = Vec::new();
+    if let Some(arm) = first {
+        evaluated_patterns(&arm.pattern, subject, unwinds, &mut patterns);
+    }
+    // An arm that matches anything is the one whose guard is certain to run —
+    // and, when there is no guard to turn it away, whose **body** is certain to
+    // run too. That body is the `match`'s own answer, so one that can only error
+    // is what the whole expression does. Raised in review, one round after the
+    // guard.
+    let certain = first.filter(|arm| always_matches(&arm.pattern));
+    let guard = certain.and_then(|arm| arm.guard.as_ref());
+    let body = certain
+        .filter(|arm| arm.guard.is_none())
+        .map(|arm| &arm.body);
+    patterns
+        .iter()
+        .any(|pattern| never_yields(pattern, unwinds) || (string_subject && glob_refused(pattern)))
+        || guard.is_some_and(|guard| never_yields(guard, unwinds))
+        || body.is_some_and(|body| match body {
+            parser::MatchBody::Value(value) => never_yields(value, unwinds),
+            parser::MatchBody::Block(body) => body_fails(body, unwinds),
+        })
+}
+
+/// Can this arm carry a control out of the branch, other than through a block
+/// body?
+///
+/// **A pattern is an expression too** — `match 1 { (if true { return 1 }) => 2 }`
+/// returns while deciding whether the arm matches — and so is a guard, and so is
+/// an arm written as a value. Every arm counts here where only the first counts
+/// for [`match_fails`]: this answers *may*, and a later arm is reached whenever
+/// the ones before it failed to match. Raised in review, once per member.
+fn arm_may_leave(arm: &parser::MatchArm, unwinds: bool) -> bool {
+    fn pattern_may_leave(pattern: &parser::MatchPattern, unwinds: bool) -> bool {
+        match pattern {
+            parser::MatchPattern::Value(value) => operand_may_leave(value, unwinds),
+            parser::MatchPattern::Alternation(alternatives) => alternatives
+                .iter()
+                .any(|alternative| pattern_may_leave(alternative, unwinds)),
+            parser::MatchPattern::Binding(_) | parser::MatchPattern::Wildcard => false,
+        }
+    }
+    pattern_may_leave(&arm.pattern, unwinds)
+        || arm
+            .guard
+            .as_ref()
+            .is_some_and(|guard| operand_may_leave(guard, unwinds))
+        || match &arm.body {
+            parser::MatchBody::Block(_) => false,
+            parser::MatchBody::Value(value) => operand_may_leave(value, unwinds),
+        }
+}
+
+/// Can this iterable be looped over with this many bindings?
+///
+/// *a loop needs a list, not an integer* rules out every scalar, and the two
+/// shapes that are collections are told apart by the bindings: *map iteration
+/// requires `for key, value in map`* and *two loop bindings require a map
+/// value*. A range is a list of the integers it spans, which the walk already
+/// says. Raised in review.
+fn iterates(bindings: &[parser::BindingPattern], iterable: Yields) -> bool {
+    // **The binders are checked before the iterable is evaluated** —
+    // `for [x x] in …` is *duplicate binding `x`* whatever it was going to
+    // loop over — and the question is put to `validate_patterns`, which is what
+    // `eval_for_expr` calls. Raised in review.
+    if validate_patterns(bindings).is_err() {
         return false;
     }
-    match literal_expr_type(expression, unwinds) {
-        Some(actual) => actual == kind,
-        None => !written_word(expression),
+    let bindings = bindings.len();
+    match iterable {
+        Yields::Never => false,
+        Yields::Known(ReturnType::List) => bindings == 1,
+        Yields::Known(ReturnType::Map) => bindings == 2,
+        Yields::Known(_) => false,
+        Yields::Unknown => true,
+    }
+}
+
+/// Does this pattern match whatever the subject is, so an arm's guard is
+/// certain to run?
+///
+/// `_` and a plain name bind anything. A destructuring list only matches a list
+/// of the right shape, so it can fall through to the next arm — and a bare word
+/// is a *glob* in this position rather than a binding, which is why so few
+/// patterns qualify.
+fn always_matches(pattern: &parser::MatchPattern) -> bool {
+    match pattern {
+        parser::MatchPattern::Wildcard => true,
+        parser::MatchPattern::Binding(
+            parser::BindingPattern::Name(_) | parser::BindingPattern::Ignore,
+        ) => true,
+        // **Any alternative matching anything is enough**, not just the first:
+        // `2 | _` tries `2`, falls through, and `_` takes it — so the arm is
+        // certain even though the alternative that decides it is second. An
+        // earlier alternative that can only *error* is a different question, and
+        // [`first_pattern`] is the one that asks it. Raised in review.
+        parser::MatchPattern::Alternation(alternatives) => alternatives.iter().any(always_matches),
+        parser::MatchPattern::Binding(_) | parser::MatchPattern::Value(_) => false,
+    }
+}
+
+/// The one pattern a `match` always evaluates.
+///
+/// A binding and `_` match anything without evaluating a thing, so neither can
+/// fail; an alternation tries its alternatives in order, and only the first of
+/// those is reached whatever the subject is.
+fn evaluated_patterns<'a>(
+    pattern: &'a parser::MatchPattern,
+    subject: Yields,
+    unwinds: bool,
+    into: &mut Vec<&'a parser::Expr>,
+) -> bool {
+    match pattern {
+        parser::MatchPattern::Value(value) => {
+            into.push(value);
+            might_match(value, subject, unwinds)
+        }
+        // **Every alternative before the first that could match is evaluated
+        // too**, because trying one is what discovers it does not match:
+        // `match 1 { "a" | :capture => … }` really does reach `:capture`, since
+        // a string can never equal an int. Reading only the first alternative
+        // stopped short of that. Raised in review, a round after the *matching*
+        // half of the same asymmetry.
+        parser::MatchPattern::Alternation(alternatives) => alternatives
+            .iter()
+            .any(|alternative| evaluated_patterns(alternative, subject, unwinds, into)),
+        parser::MatchPattern::Binding(_) | parser::MatchPattern::Wildcard => true,
+    }
+}
+
+/// Could a pattern written here match this subject at all?
+///
+/// `match_bindings` compares the pattern's value against the subject, and mesh
+/// compares like with like: `match 1 { "a" => 1; _ => 2 }` answers 2 rather than
+/// reporting anything, so a kind mismatch is a *failed try*, not an error. Only
+/// two **known** and different kinds rule a match out — a glob, a regex or
+/// anything the run decides has no kind here and so is left alone.
+fn might_match(pattern: &parser::Expr, subject: Yields, unwinds: bool) -> bool {
+    match (subject, yields(pattern, unwinds)) {
+        (Yields::Known(subject), Yields::Known(pattern)) => subject == pattern,
+        _ => true,
+    }
+}
+
+/// Is a bare glob written here one that will not compile?
+///
+/// Asked only where something actually compiles one: the right operand of `~`
+/// / `!~`, and a `match` pattern tried against a **string** subject. Against any
+/// other kind `match_bindings` never reaches the compile and the arm simply does
+/// not match — `match 1 { a[ => 1; _ => 2 }` answers 2 rather than reporting
+/// *invalid glob pattern*.
+///
+/// **Written as a bare glob, with no parentheses peeled.** `(a[)` is not this
+/// pattern: grouping evaluates the glob to a value, and `"z" ~ (a[)` is *use
+/// `re(…)` for a string pattern* rather than *invalid glob pattern*. What a
+/// group yields there is the run's business, the same as a variable or a call —
+/// `r = re("z")` makes `"z" ~ $r` work — so none of the three is judged here.
+fn glob_refused(expression: &parser::Expr) -> bool {
+    match expression {
+        parser::Expr::Glob(pattern) => glob::Pattern::new(pattern).is_err(),
+        _ => false,
+    }
+}
+
+/// The environment entry this write names, when the source settles it.
+///
+/// A spelled-out `$env.KEY` is the name. A subscript is usually the run's
+/// business — `$env[$n]` depends on `$n` — but a **quoted literal** subscript is
+/// not: `$env["A=B"]` names that entry in every run. `expand::subscript_key` is
+/// what the write itself resolves with, so it decodes here too, and the one
+/// branch of it that reads a variable is the one excluded. Raised in review.
+fn env_key_written(key: &parser::EnvKey) -> Option<String> {
+    match key {
+        parser::EnvKey::Literal(name) => Some(name.clone()),
+        parser::EnvKey::Computed(subscript) if !subscript.starts_with('$') => {
+            crate::expand::subscript_key(subscript, &vars::Vars::new()).ok()
+        }
+        parser::EnvKey::Computed(_) => None,
+    }
+}
+
+/// Can this write *into* an environment entry — `$env.PATH[0] = …` — land at
+/// all?
+///
+/// `assign_into_env_member` reads the entry, changes one element and serializes
+/// the whole thing back, and three things have to hold before any of that works.
+/// Each is asked of the code that owns it:
+///
+/// - the entry's **name** has to be one the environment can hold
+///   (`environ::check_name`), which the write checks before it reads;
+/// - the entry has to be a **path** variable (`environ::is_path_var`), since
+///   that is the only kind that reads as a list — `$env.X[0] = "z"` on a string
+///   entry is *cannot assign into a string*, and an unset one is *not set*;
+/// - the element written has to render as a path entry, which is
+///   `environ::join_path`'s rule one value at a time — `$env.PATH[0] = [1]` is
+///   *a path entry must be a string, not a nested value*, while `= 7` is fine.
+///
+/// The target is raw reference text, so `resolve_path` splits it rather than
+/// this doing its own parse. That resolution can need the variable store for a
+/// computed subscript; passing an empty one means such a target simply declines
+/// to be judged, which is the answer this check gives for anything the run
+/// settles. Raised in review.
+fn env_member_write_fails(target: &str, value: &parser::Expr, unwinds: bool) -> bool {
+    let Ok((_, steps)) = resolve_path(target, "assign to", &vars::Vars::new()) else {
+        return false;
+    };
+    let Some((PathStep::Member(key) | PathStep::Subscript(key), rest)) = steps.split_first() else {
+        return false;
+    };
+    // **And the path *below* the entry has one shape that can land**: a single
+    // subscript into the list the entry reads as, with an index `list_offset`
+    // can parse. `$env.PATH[bad]` is *list index must be an integer* and
+    // `$env.PATH[0][0]` is *cannot assign into a string*, since a component
+    // already is one. Whether the index is in range depends on the list at run
+    // time, so only the parse is asked here. Raised in review.
+    let lands = match rest {
+        [PathStep::Subscript(index)] => index.parse::<i64>().is_ok(),
+        // The parser requires an access under the entry, so this cannot arise;
+        // declining rather than claiming failure is the safe reading of a shape
+        // this does not recognize.
+        [] => true,
+        _ => false,
+    };
+    crate::environ::check_name(key).is_err()
+        || !crate::environ::is_path_var(key)
+        || !lands
+        || matches!(
+            yields(value, unwinds),
+            Yields::Known(ReturnType::List | ReturnType::Map | ReturnType::Func)
+        )
+}
+
+/// Can a value of this kind cross into the environment under this name?
+///
+/// **The environment carries bytes**, so `environ::serialize` refuses a list, a
+/// map and a func — *only strings cross into the environment* — while an int, a
+/// bool, a status and a string all render. It states its own exception, and this
+/// asks `environ::is_path_var` for it rather than listing the names again: a
+/// **path** variable joins a list with `:`, so `export MANPATH=(["/a" "/b"])`
+/// really does work where `export X=([1 2])` cannot.
+///
+/// A name only the run knows — `$env[$n] = …` — might be one of those, so it is
+/// left alone, the same as any other kind this walk cannot see.
+fn crosses_into_environment(key: Option<&str>, value: &parser::Expr, unwinds: bool) -> bool {
+    match yields(value, unwinds) {
+        Yields::Known(ReturnType::List) => key
+            .is_none_or(|key| crate::environ::is_path_var(key) && path_entries_fit(value, unwinds)),
+        Yields::Known(ReturnType::Map | ReturnType::Func) => false,
+        _ => true,
+    }
+}
+
+/// Can every element **written out** in this list cross as a `:`-joined path
+/// entry?
+///
+/// The path-variable exception is not a blanket one: `environ::join_path`
+/// renders a string, an int, a bool, a status and a flag, and refuses anything
+/// nested — *a path entry must be a string, not a nested value*. So
+/// `export PATH=([[1]])` fails where `export PATH=(["/a"])` does not, and the
+/// exception has to be read one level deeper than its outer kind. Raised in
+/// review, immediately after the exception itself was added.
+///
+/// Only a list written here can be looked into; a spread contributes elements
+/// that are not written out, and a variable or a call is the run's business, so
+/// both are left alone.
+fn path_entries_fit(expression: &parser::Expr, unwinds: bool) -> bool {
+    match expression {
+        parser::Expr::Group(inner) => path_entries_fit(inner, unwinds),
+        // `export PATH=(...[[1]])` spreads the elements of what follows, so the
+        // entries are one level in — the same reading a spread *inside* a list
+        // gets below, arriving by the other spelling.
+        parser::Expr::Unary {
+            op: parser::UnaryOp::Spread,
+            expression,
+        } => path_entries_fit(expression, unwinds),
+        parser::Expr::List(items) => items.iter().all(|item| match item {
+            parser::ListItem::Value(item) => !matches!(
+                yields(item, unwinds),
+                Yields::Known(ReturnType::List | ReturnType::Map | ReturnType::Func)
+            ),
+            // **A spread contributes the elements of what it spreads**, so a
+            // list written out there is read one level further in — `...[[1]]`
+            // puts a nested list into the entry just as `[[1]]` does. A spread
+            // of a variable or a call is still the run's business. Raised in
+            // review.
+            parser::ListItem::Spread(item) => match yields(item, unwinds) {
+                // A list is flattened, so *its* elements become the entries.
+                Yields::Known(ReturnType::List) => path_entries_fit(item, unwinds),
+                // A map or a func is not flattened — it arrives whole, as one
+                // element, and that is the nested value `join_path` refuses.
+                // A scalar spreads as itself and renders fine. Raised in review.
+                Yields::Known(ReturnType::Map | ReturnType::Func) => false,
+                _ => true,
+            },
+        }),
+        _ => true,
+    }
+}
+
+/// Is a redirect's target one `plan_redirects` will refuse outright?
+///
+/// A duplication names a **descriptor**, not a path: `2>&1` is a number and
+/// `2>&-` closes. Anything else written out is *the target of a duplication
+/// must be a descriptor*, or *a descriptor cannot be negative* — both settled by
+/// the text, so `puts 2>&bad` can only error. The rules are `plan_redirects`'
+/// own, down to `-` being a meaning rather than a number that failed to parse.
+///
+/// Only a target written as plain text is judged; one built from `${…}` or a
+/// variable is expanded at run time and left alone. Raised in review.
+fn redirect_refused(item: &parser::CommandItem) -> bool {
+    let parser::CommandItem::Redirect { kind, target, .. } = item else {
+        return false;
+    };
+    if !matches!(
+        kind,
+        parser::RedirectKind::DuplicateOut | parser::RedirectKind::DuplicateIn
+    ) {
+        return false;
+    }
+    let mut text = String::new();
+    for piece in &target.value.pieces {
+        match piece {
+            parser::WordPiece::Text { text: part, .. } => text.push_str(part),
+            _ => return false,
+        }
+    }
+    text != "-" && !text.parse::<i32>().is_ok_and(|from| from >= 0)
+}
+
+/// Every command argument written with a leading `...`, which has to be a
+/// **list**.
+///
+/// *`...`: value is not a list*, and *a map cannot be spread into argv* — argv
+/// is flat, so a command's spread is strictly narrower than a *call*'s, which
+/// takes a map of options as well. [`command_operands`] deliberately drops this
+/// flag: it enumerates what a command evaluates, which is the same for both
+/// walks, while whether the value can then be unpacked is a failure-only
+/// question. Raised in review.
+fn spread_arguments(command: &parser::Command) -> impl Iterator<Item = &parser::Expr> {
+    command.items.iter().filter_map(|item| match item {
+        parser::CommandItem::Value {
+            expression,
+            spread: true,
+        } => Some(&expression.value),
+        _ => None,
+    })
+}
+
+/// Can this run of `NAME=value` env bindings only error?
+///
+/// The spelling shared by a compact `export A=… B=…`, a `with` header, and a
+/// command's environment prefix — three positions with one rule, so they ask it
+/// once. Raised in review, naming all three at the same time.
+fn env_bindings_fail(bindings: &[parser::EnvBinding], unwinds: bool) -> bool {
+    bindings.iter().any(|binding| {
+        never_yields(&binding.value, unwinds)
+            || !crosses_into_environment(Some(&binding.key), &binding.value, unwinds)
+    })
+}
+
+/// The stage that runs in **this** process, if this pipeline has one.
+///
+/// `run_pipeline` sends a lone stage to `run_single` and everything else to
+/// `run_multi`, which forks every stage. **A fork is a wall in both
+/// directions**, so neither of this check's walks may look through one:
+///
+/// - an operand that can only error inside a forked stage reports and leaves
+///   the pipeline with a failed *status*, so it does not fail the enclosing
+///   capture — `x = $(puts (not 7) | cat)` binds `''` and carries on, where the
+///   same capture without the `| cat` never binds at all;
+/// - a `return` inside a forked stage unwinds the child, not the function
+///   around it — `any func f() { puts (if true { return 1 }) | cat; 2 }`
+///   answers 2, where the same body without the `| cat` answers 1.
+///
+/// Both halves raised in review one round apart, the second as the mirror of
+/// the first. A backgrounded statement forks the same way and is already
+/// refused a statement earlier, by [`body_fails`] and [`leaves`].
+fn in_process_stage(pipeline: &parser::Pipeline) -> Option<&parser::Stage> {
+    match pipeline.stages.as_slice() {
+        [single] => Some(single),
+        _ => None,
+    }
+}
+
+/// Every expression a **word** evaluates to build itself: its `${…}` pieces.
+///
+/// Plain text carries none, and `$name` is a lookup rather than an expression.
+/// Shared because a word is evaluated in more places than a command's arguments
+/// — a redirect's target and an `alias`'s computed name are words too.
+fn word_values(word: &parser::Word) -> impl Iterator<Item = &parser::Expr> {
+    word.pieces.iter().filter_map(|piece| match piece {
+        parser::WordPiece::Value { expression, .. } => Some(&expression.value),
+        parser::WordPiece::Text { .. } | parser::WordPiece::Variable { .. } => None,
+    })
+}
+
+/// Every expression a **definition** evaluates where it runs, which is its
+/// computed name and nothing else.
+///
+/// `alias "${…}" = …` evaluates that word to decide what is being defined, so a
+/// piece that can only error is what happens instead of the definition, and one
+/// that returns leaves before the definition is made. The body is not among them
+/// — an `alias`/`func` body is syntax stored for call time — and `with (…)`
+/// captures are bare names. Only `alias` takes a computed name; a definition
+/// cannot carry a postfix guard, so this is unconditional and both walks read it
+/// the same way. Raised in review, both halves in the same round.
+fn definition_operands(
+    computed_name: Option<&parser::Word>,
+) -> impl Iterator<Item = &parser::Expr> {
+    computed_name.into_iter().flat_map(word_values)
+}
+
+/// Every expression a **command** evaluates before it runs: its environment
+/// prefixes, its value arguments, and every `${…}` inside a word or inside a
+/// redirect's target.
+///
+/// One enumeration rather than two, because this check's two walks kept
+/// learning these positions separately and a round apart — a value argument in
+/// one, an interpolated word in the other. A heredoc body is plain text and
+/// carries no expression, so it is not among them. Raised in review, twice.
+fn command_operands(command: &parser::Command) -> impl Iterator<Item = &parser::Expr> {
+    let items =
+        command
+            .items
+            .iter()
+            .flat_map(|item| -> Box<dyn Iterator<Item = &parser::Expr> + '_> {
+                match item {
+                    parser::CommandItem::Value { expression, .. } => {
+                        Box::new(std::iter::once(&expression.value))
+                    }
+                    parser::CommandItem::Word(word) => Box::new(word_values(&word.value)),
+                    parser::CommandItem::Redirect { target, .. } => {
+                        Box::new(word_values(&target.value))
+                    }
+                }
+            });
+    command
+        .env
+        .iter()
+        .map(|binding| &binding.value)
+        .chain(items)
+}
+
+/// Every `if …` a statement can carry, whichever shape carries it.
+///
+/// A value statement and an exit each hold one; a pipeline holds one **per
+/// command**, since `a if $p | b if $q` guards each stage. Reading only the
+/// first two spellings missed `puts hi if not 7`, which is the ordinary one.
+fn statement_guards(
+    executable: &parser::Executable,
+) -> Box<dyn Iterator<Item = &parser::Expr> + '_> {
+    match executable {
+        parser::Executable::Expression { guard, .. }
+        | parser::Executable::Control { guard, .. } => {
+            Box::new(guard.as_ref().map(|guard| &guard.condition).into_iter())
+        }
+        parser::Executable::Pipeline(pipeline) => Box::new(
+            pipeline
+                .stages
+                .iter()
+                .filter_map(parser::Stage::as_command)
+                .filter_map(|command| command.guard.as_ref())
+                .map(|guard| &guard.condition),
+        ),
+        _ => Box::new(std::iter::empty()),
+    }
+}
+
+/// Can this body only error, whatever the run does?
+///
+/// **The last statement is the one that decides**, because it is the body's
+/// result. An earlier failure reports and the body carries on, so it does not
+/// take the body with it: `$(y = not 7)` captures nothing, but
+/// `$(y = not 7; puts hi)` captures `hi` — the same error, then `hi` on stdout
+/// and a capture that binds. Asking `.any()` here called the second one
+/// impossible and swallowed a real warning. Raised in review, indirectly, by a
+/// comment about the neighbouring case.
+///
+/// A guard or a `&` decides at run time whether the statement is reached, so
+/// neither counts. **The head of a chain is different**: `a && b` runs `a`
+/// whatever happens, so a head that can only error takes the statement with it.
+/// But `||` *catches* that — `$(y = not 7 || puts hi)` binds `hi` and exits 0 —
+/// and it catches from anywhere in the chain, so `a && b || c` is caught too.
+/// The head therefore counts only when every link is `&&`. Raised in review;
+/// the `||` half was measured rather than assumed, and it is the difference
+/// between this rule and a false silence.
+///
+/// It does **not** ask whether an earlier statement leaves first. Doing so means
+/// a second walk of the same body beside the one [`yields`] is already making,
+/// which is how both of this check's exponentials started; the cost of not
+/// asking is silence on a body that returns before its impossible statement,
+/// which is a missed warning in an exotic shape rather than a wrong one.
+fn body_fails(body: &parser::Source, unwinds: bool) -> bool {
+    body.statements.last().is_some_and(|statement| {
+        let uncaught = statement
+            .and_or
+            .rest
+            .iter()
+            .all(|(op, _)| matches!(op, parser::AndOrOp::And));
+        uncaught && !statement.background && executable_fails(&statement.and_or.first, unwinds)
+    })
+}
+
+/// The one-statement half of [`body_fails`].
+///
+/// **A compound fails the same way an expression does**, and reading only the
+/// two value shapes left `$(if 7 { … })` looking like a capture — *an int is not
+/// a condition* is exactly as fatal there as `not 7` is. Each compound is put to
+/// the rule that already owns it rather than a second reading. Raised in review.
+fn executable_fails(executable: &parser::Executable, unwinds: bool) -> bool {
+    // **A guard is worked out before the statement it guards**, so one that can
+    // only error is what happens whether or not the statement would have run —
+    // `puts hi if not 7` is *an int is not a condition*. The guarded expression
+    // itself stays conditional, which is why the two are asked separately.
+    // Raised in review.
+    if statement_guards(executable).any(|guard| never_yields(guard, unwinds)) {
+        return true;
+    }
+    match executable {
+        parser::Executable::Not(inner) => executable_fails(inner, unwinds),
+        parser::Executable::Expression {
+            expression,
+            guard: None,
+        } => never_yields(expression, unwinds),
+        // **A compact `export A=… B=…` is several env writes in one statement**,
+        // and each value is evaluated. Matching only the singular spelling left
+        // `$(export X=(not 7))` looking like a capture. Raised in review.
+        //
+        // **And evaluating is not the same as crossing** — see
+        // [`crosses_into_environment`]. Raised in review.
+        parser::Executable::EnvAssignments { bindings } => env_bindings_fail(bindings, unwinds),
+        // **A binding target is invalid whatever the value turns out to be** —
+        // `$([x x] = [1 2])` is *duplicate binding `x`* and `$([env] = [1])` is
+        // the reserved name, neither of which the right-hand side can rescue.
+        // Put to `validate_patterns`, which is what the assignment itself calls,
+        // and spelled the way it calls it. The `for` path had learned this and
+        // the assignment path had not. Raised in review.
+        parser::Executable::Assignment { pattern, value, .. } => {
+            validate_patterns(std::slice::from_ref(pattern)).is_err()
+                || never_yields(value, unwinds)
+        }
+        // Every shape that writes a value, not just the plain one — the same
+        // set `may_leave` walks. Matching only `Assignment` left
+        // `$($env.X = not 7)` looking like a capture. Raised in review.
+        parser::Executable::MemberAssignment { value, .. } => never_yields(value, unwinds),
+        // A write *into* an entry has three more ways to be impossible before
+        // the value matters — see [`env_member_write_fails`]. Raised in review.
+        parser::Executable::EnvMemberAssignment { target, value, .. } => {
+            never_yields(value, unwinds) || env_member_write_fails(target, value, unwinds)
+        }
+        // The singular `$env.X = …` writes one entry, so it asks the same
+        // question the compact spelling does — with the name it was written
+        // with, or none at all when only the run can say which entry it is.
+        parser::Executable::EnvAssignment { key, value, .. } => {
+            let name = env_key_written(key);
+            // **A name the environment cannot hold is refused before the value
+            // is written** — `$env["A=B"]` is *an environment name cannot
+            // contain `=`*. Put to `environ::check_name`, which is what the
+            // write itself calls. Raised in review.
+            name.as_deref()
+                .is_some_and(|name| crate::environ::check_name(name).is_err())
+                || never_yields(value, unwinds)
+                || !crosses_into_environment(name.as_deref(), value, unwinds)
+        }
+        parser::Executable::If(node) => compound_yields(node, unwinds) == Yields::Never,
+        parser::Executable::Match(node) => match_fails(node, unwinds),
+        parser::Executable::For {
+            bindings, iterable, ..
+        } => !iterates(bindings, yields(iterable, unwinds)),
+        parser::Executable::While { condition, .. } => !condition_runs(condition, unwinds),
+        // **A `with` evaluates its header before the block**, the same way
+        // `may_leave` reads it. Raised in review.
+        //
+        // **And its block always runs**, which is what separates it from every
+        // other compound here: an `if`, a `for`, a `while` or a `match` may
+        // never reach its body, so a failure inside one is not certain, but
+        // `run_with_block` executes this one whatever happens. So the body
+        // decides too, by the same last-statement rule. Raised in review.
+        // (A `loop` body also runs, and is deliberately not here: its result is
+        // the loop's, so `$(loop { y = not 7; break })` binds `''` rather than
+        // failing — checked rather than assumed.)
+        parser::Executable::With { bindings, body } => {
+            env_bindings_fail(bindings, unwinds) || body_fails(body, unwinds)
+        }
+        // **A computed alias name is evaluated to decide what is defined** —
+        // see [`definition_operands`]. Raised in review.
+        //
+        // **And a name written out is judged before the definition is made**,
+        // by the same pair of checks the definition itself runs: a modifier's
+        // name against the built-in *modifiers*, any other against the command
+        // vocabulary. `alias true = …` is *`true` is a boolean literal and
+        // cannot be a function name*, whatever the body would have been. A
+        // computed name is the run's business, so only a written one is judged.
+        // Raised in review.
+        parser::Executable::Function {
+            name,
+            computed_name,
+            subject,
+            ..
+        } => {
+            let named_badly = computed_name.is_none()
+                && if subject.is_some() {
+                    modifier_definition_name_problem(name).is_some()
+                } else {
+                    definition_name_problem(name).is_some()
+                };
+            named_badly
+                || definition_operands(computed_name.as_ref())
+                    .any(|operand| never_yields(operand, unwinds))
+        }
+        // **A command's value arguments are expanded before it runs** —
+        // `puts (not 7)` is *an int is not a condition*, and the command never
+        // starts. Only an unguarded command counts: a guard decides at run time
+        // whether its arguments are reached at all. Raised in review.
+        //
+        // And only the stage that runs *here* counts — see [`in_process_stage`],
+        // which is where the reasoning about the fork lives. Raised in review.
+        parser::Executable::Pipeline(pipeline) => {
+            in_process_stage(pipeline).is_some_and(|stage| match stage {
+                // A stage can be a compound, and it fails the way one does
+                // anywhere.
+                parser::Stage::Compound(inner) => executable_fails(inner, unwinds),
+                // Only an **unguarded** command's operands are certain to be
+                // expanded — a guard decides at run time whether they are
+                // reached. Its guard itself is read by [`statement_guards`]
+                // above.
+                parser::Stage::Command(command) => {
+                    command.guard.is_none()
+                        && (command_operands(command)
+                            .any(|operand| never_yields(operand, unwinds))
+                            // A prefix is an env write, so its value has to
+                            // cross as well as evaluate — the same rule the
+                            // `export` spellings ask. Raised in review.
+                            || env_bindings_fail(&command.env, unwinds)
+                            // And a `...` argument has to be unpackable as well
+                            // as evaluate — see [`spread_arguments`].
+                            || spread_arguments(command).any(|argument| {
+                                !matches!(
+                                    yields(argument, unwinds),
+                                    Yields::Known(ReturnType::List) | Yields::Unknown
+                                )
+                            })
+                            // And a duplication's target has to name a
+                            // descriptor — see [`redirect_refused`].
+                            || command.items.iter().any(redirect_refused))
+                }
+            })
+        }
+        _ => false,
     }
 }
 
 /// Can this expression **only** error, whatever the run does?
 ///
-/// The one thing `literal_expr_type` cannot say by returning `None`, which means
-/// "only the run can tell". Answering the two the same way let `:capture` — an
-/// error standing alone, since it applies to a call — pass for a run-time value
-/// in every position that reads one: a status code, a condition, a range
-/// endpoint, an element of a list or a map. Raised in review four times, once
-/// per container, which is what made it one predicate rather than four guards.
+/// The one thing a kind cannot say by being absent, which means "only the run
+/// can tell". Answering the two the same way let `:capture` pass for a run-time
+/// value in every position that reads one — a status code, a condition, a range
+/// endpoint, an element of a list or a map. Raised in review once per container.
+fn never_yields(expression: &parser::Expr, unwinds: bool) -> bool {
+    yields(expression, unwinds) == Yields::Never
+}
+
+/// Can these operands meet this operator at all?
 ///
-/// A container is only as good as what is in it, so this recurses; anything else
-/// is somebody else's question, and answered where it is asked.
-fn never_yields(expression: &parser::Expr) -> bool {
-    match expression {
-        parser::Expr::Group(inner) => never_yields(inner),
-        // `:capture` applies to a call — `f(…):capture` — so alone it is an
-        // error rather than the function value its siblings are.
-        parser::Expr::ModifierRef(name) => name == "capture",
-        // Nothing can be counted to.
-        parser::Expr::Range { end: None, .. } => true,
-        parser::Expr::List(items) => items.iter().any(|item| match item {
-            parser::ListItem::Value(item) | parser::ListItem::Spread(item) => never_yields(item),
-        }),
-        parser::Expr::Map(items) => items.iter().any(|item| match item {
-            parser::MapItem::Pair(key, value) => never_yields(key) || never_yields(value),
-            parser::MapItem::Spread(item) => never_yields(item),
-        }),
-        _ => false,
+/// Each rule is one the runtime states in a diagnostic, and only a **known**
+/// operand is judged by it — anything the run decides is left alone, as
+/// everywhere else here.
+fn operands_fit(op: &parser::BinaryOp, left: Yields, right: Yields) -> bool {
+    let kind = |side| match side {
+        Yields::Known(kind) => Some(kind),
+        _ => None,
+    };
+    let (left, right) = (kind(left), kind(right));
+    // Two known operands of different kinds. Unknown on either side is not a
+    // mismatch: only the run can say what it will be.
+    let mismatched = matches!((left, right), (Some(a), Some(b)) if a != b);
+    let is = |side: Option<ReturnType>, wanted| side.is_none() || side == Some(wanted);
+    match op {
+        // *an int is not a condition* — these take bools and give one back.
+        parser::BinaryOp::Or | parser::BinaryOp::And => {
+            is(left, ReturnType::Bool) && is(right, ReturnType::Bool)
+        }
+        // *cannot compare an int with a string* — like with like, any kind.
+        parser::BinaryOp::Equal | parser::BinaryOp::NotEqual => !mismatched,
+        // *comparison requires two integers or two strings* — ordering is
+        // narrower than equality, which compares two lists happily.
+        parser::BinaryOp::Less
+        | parser::BinaryOp::LessEqual
+        | parser::BinaryOp::Greater
+        | parser::BinaryOp::GreaterEqual => {
+            let ordered =
+                |side| matches!(side, None | Some(ReturnType::Int) | Some(ReturnType::Str));
+            ordered(left) && ordered(right) && !mismatched
+        }
+        // *right operand of `in` must be a collection or string*, and a string
+        // or a map is searched by string — *left operand of `in` must be a
+        // string*, *map key must be a string*.
+        parser::BinaryOp::In => {
+            let searchable = matches!(
+                right,
+                None | Some(ReturnType::List) | Some(ReturnType::Map) | Some(ReturnType::Str)
+            );
+            let element = match right {
+                Some(ReturnType::Str) | Some(ReturnType::Map) => is(left, ReturnType::Str),
+                _ => true,
+            };
+            searchable && element
+        }
+        // *left operand of `~` must be a string*, and *right operand of `~` must
+        // be a regex or bare glob* — neither of those has a kind here, so a
+        // right operand this **can** name is by that fact the wrong one.
+        parser::BinaryOp::Match | parser::BinaryOp::NotMatch => {
+            is(left, ReturnType::Str) && right.is_none()
+        }
+        // *expected integer*, and nothing else reaches an arithmetic operator.
+        parser::BinaryOp::Add
+        | parser::BinaryOp::Subtract
+        | parser::BinaryOp::Multiply
+        | parser::BinaryOp::Divide
+        | parser::BinaryOp::Remainder => is(left, ReturnType::Int) && is(right, ReturnType::Int),
     }
+}
+
+/// Can this be a map's key?
+///
+/// **A key is a string**, and a scalar becomes one — `[7: 1]` and `[true: 1]`
+/// bind under `'7'` and `'true'`. A collection or a function does not, and the
+/// map is *map key must be a string* rather than a map, so a branch written that
+/// way has no kind to report.
+///
+/// Asked of the **kind** rather than of the syntax. Listing the spellings caught
+/// `[[]: 1]` and missed `[(if $q { [1] } else { [2] }): 1]`, which is the same
+/// list arriving by another shape — and the walk already knows it is one. Both
+/// raised in review, the second because of the first.
+fn map_key(key: Yields) -> bool {
+    !matches!(
+        key,
+        Yields::Never | Yields::Known(ReturnType::List | ReturnType::Map | ReturnType::Func)
+    )
 }
 
 /// Is the whole of this operand written in the source — no variable, no spliced
@@ -11932,7 +13107,7 @@ fn written_word(expression: &parser::Expr) -> bool {
     }
 }
 
-/// The `i64` an expression literally spells, under [`literal_expr_type`]'s rule
+/// The `i64` an expression literally spells, under [`reported_yields`]'s rule
 /// for one — so the two cannot disagree about which words are integers.
 fn literal_integer(expression: &parser::Expr) -> Option<i64> {
     match expression {
@@ -11980,22 +13155,85 @@ fn may_leave(executable: &parser::Executable, unwinds: bool) -> bool {
             }
             bodies
         }
-        parser::Executable::Match(node) => node
-            .arms
-            .iter()
-            .filter_map(|arm| match &arm.body {
-                parser::MatchBody::Block(body) => Some(body),
-                // An arm's value is an expression, which cannot carry a control.
-                parser::MatchBody::Value(_) => None,
-            })
-            .collect(),
-        parser::Executable::For { body, .. }
-        | parser::Executable::Loop { body }
-        | parser::Executable::With { body, .. }
-        // A `return` inside a `fork` ends the child rather than this branch, but
-        // saying so would be a claim about process semantics this check does not
-        // need to make — walking it only ever costs silence.
-        | parser::Executable::Fork { body } => vec![body],
+        // An arm's **value** can carry one too — see [`operand_may_leave`] — so
+        // it is asked here rather than dropped, and only block arms go on to be
+        // walked as bodies.
+        // **A command evaluates operands before it runs**, and a stage can be a
+        // compound — neither reached this walk at all, though the failure walk
+        // had learned both. Every command counts here rather than only the
+        // unguarded ones: this answers *may*, and a guard that holds reaches
+        // them. Raised in review.
+        // And only the stage that runs *here* can carry one out — see
+        // [`in_process_stage`]. Raised in review, as the mirror of the same
+        // omission in the failure walk.
+        parser::Executable::Pipeline(pipeline) => {
+            return in_process_stage(pipeline).is_some_and(|stage| match stage {
+                parser::Stage::Compound(inner) => may_leave(inner, unwinds),
+                parser::Stage::Command(command) => {
+                    command
+                        .guard
+                        .as_ref()
+                        .is_some_and(|guard| operand_may_leave(&guard.condition, unwinds))
+                        || command_operands(command)
+                            .any(|operand| operand_may_leave(operand, unwinds))
+                }
+            });
+        }
+        // The compact `export A=… B=…` writes each value, like its singular
+        // sibling in the arm below.
+        parser::Executable::EnvAssignments { bindings } => {
+            return bindings
+                .iter()
+                .any(|binding| operand_may_leave(&binding.value, unwinds));
+        }
+        // A computed alias name is evaluated where the definition runs, so a
+        // control in it leaves before anything is defined — the same positions
+        // the failure walk reads, from [`definition_operands`].
+        parser::Executable::Function { computed_name, .. } => {
+            return definition_operands(computed_name.as_ref())
+                .any(|operand| operand_may_leave(operand, unwinds));
+        }
+        parser::Executable::Match(node) => {
+            if operand_may_leave(&node.value, unwinds)
+                || node.arms.iter().any(|arm| arm_may_leave(arm, unwinds))
+            {
+                return true;
+            }
+            node.arms
+                .iter()
+                .filter_map(|arm| match &arm.body {
+                    parser::MatchBody::Block(body) => Some(body),
+                    parser::MatchBody::Value(_) => None,
+                })
+                .collect()
+        }
+        // **The iterable is evaluated before the first pass**, so a control in
+        // it leaves before the body is reached at all. Raised in review.
+        parser::Executable::For { iterable, body, .. } => {
+            if operand_may_leave(iterable, unwinds) {
+                return true;
+            }
+            vec![body]
+        }
+        // **A `with` evaluates its header before the body**, so a control in a
+        // binding value leaves before the block is entered. Raised in review.
+        parser::Executable::With { bindings, body } => {
+            if bindings
+                .iter()
+                .any(|binding| operand_may_leave(&binding.value, unwinds))
+            {
+                return true;
+            }
+            vec![body]
+        }
+        parser::Executable::Loop { body } => vec![body],
+        // **A `fork` body runs in a child**, so a `return` there ends the child
+        // and this branch carries on: `any func f() { fork { return 1 }; 2 }`
+        // answers 2. This is the same wall [`in_process_stage`] describes, and
+        // the failure walk already declines to look through it — walking it here
+        // cost a warning rather than merely being cautious, which is what an
+        // earlier comment here had wrong.
+        parser::Executable::Fork { .. } => return false,
         parser::Executable::While { condition, body } => {
             if may_leave(condition, unwinds) {
                 return true;
@@ -12040,23 +13278,38 @@ fn operand_may_leave(expression: &parser::Expr, unwinds: bool) -> bool {
     };
     match expression {
         parser::Expr::Group(inner) => operand_may_leave(inner, unwinds),
+        // **Every condition in the chain counts, not just the first** — an
+        // `else if` is tested whenever the tests before it were false, so a
+        // control in one leaves before any body runs. The executable form has
+        // always walked the chain; this one stopped at the head. Raised in
+        // review.
         parser::Expr::If(node) => {
             let (bodies, _) = branch_bodies(node);
-            may_leave(&node.condition, unwinds) || leaves_a_body(bodies)
+            chain_conditions(node).any(|condition| may_leave(condition, unwinds))
+                || leaves_a_body(bodies)
         }
-        parser::Expr::Match(node) => leaves_a_body(
-            node.arms
-                .iter()
-                .filter_map(|arm| match &arm.body {
-                    parser::MatchBody::Block(body) => Some(body),
-                    parser::MatchBody::Value(_) => None,
+        // **An arm's value can carry a control after all** — `1 => if $q
+        // { return 1 } else { return 2 }` is an expression that returns, and
+        // dropping every value arm here missed it. Raised in review.
+        parser::Expr::Match(node) => {
+            operand_may_leave(&node.value, unwinds)
+                || node.arms.iter().any(|arm| {
+                    arm_may_leave(arm, unwinds)
+                        || matches!(&arm.body, parser::MatchBody::Block(body) if leaves_a_body(vec![body]))
                 })
-                .collect(),
-        ),
+        }
         parser::Expr::For { iterable, body, .. } => {
             operand_may_leave(iterable, unwinds) || leaves_a_body(vec![body])
         }
         parser::Expr::Capture(body) => leaves_a_body(vec![body]),
+        // **A word is built by evaluating its pieces**, so a control inside
+        // `"x${…}"` leaves before the word exists. Raised in review.
+        parser::Expr::Scalar(word) => word.value.pieces.iter().any(|piece| match piece {
+            parser::WordPiece::Value { expression, .. } => {
+                operand_may_leave(&expression.value, unwinds)
+            }
+            _ => false,
+        }),
         parser::Expr::List(items) => items.iter().any(|item| match item {
             parser::ListItem::Value(item) | parser::ListItem::Spread(item) => {
                 operand_may_leave(item, unwinds)
@@ -12114,34 +13367,53 @@ fn leaves_always(node: &parser::IfExpr, unwinds: bool) -> bool {
         })
 }
 
-/// The type a nested `if` **certainly** yields: every branch literal, all of
-/// them agreeing, and an `else` present.
+/// What a nested `if` yields: every branch agreeing, and an `else` present.
 ///
 /// `x = if $p { if $q { 1 } else { 2 } } else { "s" }` is an `int` against a
 /// `str` however `$q` falls, so declining to look inside lost a disagreement
-/// that is as certain as any other here — raised in review. All three
-/// conditions are needed: one unknown branch and the compound could be
-/// anything; a missing `else` and it can yield the empty string instead.
-fn compound_type(node: &parser::IfExpr, unwinds: bool) -> Option<ReturnType> {
+/// that is as certain as any other here — raised in review. Both conditions are
+/// needed: one unknown branch and the compound could be anything; a missing
+/// `else` and it can yield the empty string instead.
+///
+/// Each question is asked **once**.
+///
+/// This used to test the conditions itself while [`yields`] tested them
+/// again on the way in, so an `if` written as another `if`'s condition doubled
+/// the work per level: 18 of them took 29s. The same doubling as the binary
+/// chain, one arm later. Both raised in review, with measurements.
+fn compound_yields(node: &parser::IfExpr, unwinds: bool) -> Yields {
     // **A compound whose own condition cannot run yields nothing at all**, so
     // reading a kind off its bodies describes a value no run produces:
     // `if $p { if 7 { 1 } else { 2 } } else { "s" }` reported `int` against
     // `str` while the program ran happily down the `str` side. Raised in review.
     if !conditions_run(node, unwinds) {
-        return None;
+        return Yields::Never;
     }
-    let (kinds, complete) = branch_types(node, unwinds);
+    let (branches, complete) = branch_types(node, unwinds);
+    // A chain with no `else` produces a value on the path nobody wrote — the
+    // value path answers an uncovered branch with the empty string — so it is
+    // unknown even when every branch written can only error.
     if !complete {
-        return None;
+        return Yields::Unknown;
     }
-    let mut kinds = kinds.into_iter();
-    let first = kinds.next()??;
-    for kind in kinds {
-        if kind? != first {
-            return None;
+    // **A branch that can only error contributes no kind and no value**, so it
+    // neither names the compound nor disagrees with the branch that does. When
+    // every branch is one of those there is nothing left to yield, and calling
+    // that *unknown* let a surrounding operator hand the compound a kind.
+    // Raised in review.
+    let mut yielded = None;
+    for branch in branches {
+        match branch {
+            Yields::Never => {}
+            Yields::Known(kind) if yielded.is_none_or(|seen| seen == kind) => {
+                yielded = Some(kind);
+            }
+            // A branch this cannot read, or two that disagree: the compound
+            // produces a value, just not a named one.
+            _ => return Yields::Unknown,
         }
     }
-    Some(first)
+    yielded.map_or(Yields::Never, Yields::Known)
 }
 
 /// Can every condition in this `if` chain be a condition at all?
@@ -12166,10 +13438,24 @@ fn conditions_run(node: &parser::IfExpr, unwinds: bool) -> bool {
 
 /// The one-condition half of [`conditions_run`].
 fn condition_runs(condition: &parser::Executable, unwinds: bool) -> bool {
+    // **A condition is a statement, and a statement can fail before it answers**
+    // — `if puts hi if not 7 { … }` never reaches either branch. The expression
+    // form was read here and every other form fell through as runnable, which
+    // is the same split [`executable_fails`] exists to close. Raised in review.
+    if executable_fails(condition, unwinds) {
+        return false;
+    }
     match condition {
         parser::Executable::Not(inner) => condition_runs(inner, unwinds),
         parser::Executable::Expression { expression, .. } => {
-            reads_as(expression, ReturnType::Bool, unwinds)
+            // **A condition that leaves picks no branch either.** `if (if $q
+            // { return 1 } else { return 2 }) == 1 { … }` returns while the
+            // condition is being worked out, so reporting the branches names a
+            // pair no run compares. It is an exit rather than an error, but the
+            // silence wanted is the same one a condition that cannot run gets,
+            // which is why it answers here. Raised in review.
+            !operand_may_leave(expression, unwinds)
+                && reads_as(expression, ReturnType::Bool, unwinds)
         }
         _ => true,
     }
@@ -12177,16 +13463,32 @@ fn condition_runs(condition: &parser::Executable, unwinds: bool) -> bool {
 
 /// Each branch of an `if` chain, in order, and whether the chain ends in an
 /// `else` — so a caller can tell "unknown" from "not covered", which
-/// [`compound_type`] needs and [`warn_branch_disagreement`] does not.
-fn branch_types(node: &parser::IfExpr, unwinds: bool) -> (Vec<Option<ReturnType>>, bool) {
+/// [`compound_yields`] needs and [`warn_branch_disagreement`] does not.
+fn branch_types(node: &parser::IfExpr, unwinds: bool) -> (Vec<Yields>, bool) {
     let (bodies, complete) = branch_bodies(node);
     (
         bodies
             .into_iter()
-            .map(|body| literal_type(body, unwinds))
+            .map(|body| body_yields(body, unwinds))
             .collect(),
         complete,
     )
+}
+
+/// Every condition in an `if` chain, in order — the head's and each `else if`'s.
+///
+/// One walk of the chain, so a caller cannot check the head and forget the rest,
+/// which is what [`operand_may_leave`] did.
+fn chain_conditions(node: &parser::IfExpr) -> impl Iterator<Item = &parser::Executable> {
+    let mut branch = Some(node);
+    std::iter::from_fn(move || {
+        let current = branch?;
+        branch = match &current.else_branch {
+            Some(parser::ElseBranch::If(next)) => Some(next),
+            _ => None,
+        };
+        Some(current.condition.as_ref())
+    })
 }
 
 /// Every branch body of an `if` chain, in order, and whether the chain ends in
@@ -12210,109 +13512,100 @@ fn branch_bodies(node: &parser::IfExpr) -> (Vec<&parser::Source>, bool) {
     }
 }
 
-/// The type an expression **literally is**, or `None`.
+/// What an expression yields as a **branch or an exit** reads it, as against
+/// what [`yields`] knows.
 ///
-/// Split from [`literal_type`] so a group can recurse: `(7)` is an `int` for the
-/// same reason `7` is, parentheses being transparent.
-fn literal_expr_type(expression: &parser::Expr, unwinds: bool) -> Option<ReturnType> {
-    // An expression that can only error has no kind to report, wherever it is
-    // written — see [`never_yields`].
-    if never_yields(expression) {
+/// A thin reading of that walk, with one deliberate omission: **arithmetic is
+/// not reported**, though the walk knows it is an int. Calling `$n + 1` an
+/// `int` here is true and still wrong to act on — it makes
+/// `if $n < 3 { $n + 1 } else { false }` disagree, and answering `false` to end
+/// a `while` is an idiom `DESIGN.md` pins a contract on. Whether that idiom
+/// should be exempt is a language question, not one to settle by widening a
+/// lint. Operand checking still gets the kind, which is why `not (1 + 1)` is
+/// refused.
+fn reported_yields(expression: &parser::Expr, unwinds: bool) -> Yields {
+    match yields(expression, unwinds) {
+        Yields::Never => Yields::Never,
+        Yields::Known(kind) if !arithmetic(expression) => Yields::Known(kind),
+        _ => Yields::Unknown,
+    }
+}
+
+/// Is this expression's value the result of arithmetic? Parentheses are
+/// transparent, so `(1 + 2)` answers the same as `1 + 2`.
+fn arithmetic(expression: &parser::Expr) -> bool {
+    match expression {
+        parser::Expr::Group(inner) => arithmetic(inner),
+        parser::Expr::Unary {
+            op: parser::UnaryOp::Negate,
+            ..
+        } => true,
+        parser::Expr::Binary { op, .. } => matches!(
+            op,
+            parser::BinaryOp::Add
+                | parser::BinaryOp::Subtract
+                | parser::BinaryOp::Multiply
+                | parser::BinaryOp::Divide
+                | parser::BinaryOp::Remainder
+        ),
+        _ => false,
+    }
+}
+
+/// The kind a **word** spells, or `None` where only the run can say.
+fn scalar_kind(word: &parser::Spanned<parser::Word>) -> Option<ReturnType> {
+    // **A glob is a list of whatever it matched**, so its type is a fact about
+    // the filesystem rather than the source — and reporting it as the `str` its
+    // text spells would be worse than staying quiet, a wrong kind in the message
+    // being harder to disbelieve than none. A qualifier list marks one whatever
+    // the pattern did (`*(d)`), as [`expand::word_globs`] has it.
+    if word.value.qualifiers.is_some() {
         return None;
     }
-    match expression {
-        parser::Expr::Group(inner) => literal_expr_type(inner, unwinds),
-        // The expression spelling of the nested case `literal_type` handles.
-        parser::Expr::If(node) => compound_type(node, unwinds),
-        parser::Expr::List(_) => Some(ReturnType::List),
-        parser::Expr::Map(_) => Some(ReturnType::Map),
-        // A range is a list of the integers it spans, whatever its endpoints
-        // turn out to be — `..3` counts from zero, but an open *end* is an error
-        // rather than a value, so it has no kind to report. So is an endpoint
-        // written as something other than an integer (`"a"..3`), and so is
-        // `1..=` the largest one there is, which overflows counting past it.
-        parser::Expr::Range {
-            start,
-            end: Some(end),
-            inclusive,
-        } => {
-            if !endpoint_runs(start.as_deref(), unwinds) || !endpoint_runs(Some(end), unwinds) {
-                return None;
-            }
-            if *inclusive && literal_integer(end) == Some(i64::MAX) {
-                return None;
-            }
-            Some(ReturnType::List)
+    // Every piece must be static text: a variable or a spliced value is exactly
+    // the run-time dependence this check refuses to guess at.
+    let mut quoted = false;
+    for piece in &word.value.pieces {
+        let parser::WordPiece::Text { quote, .. } = piece else {
+            return None;
+        };
+        if !matches!(quote, parser::QuoteMode::Bare) {
+            quoted = true;
         }
-        // A lambda is a function value whatever its body does, and nothing about
-        // that is deferred to run time.
-        parser::Expr::Lambda { .. } => Some(ReturnType::Func),
-        // **A reference is a function value without resolving anything** — `&f`
-        // binds the name, it does not look it up, so `&nosuchthing` is a `func`
-        // just as `&puts` is. That is why late binding does not bar this one:
-        // the kind is settled here, and only *calling* it asks who `f` is.
-        parser::Expr::FuncRef(_) => Some(ReturnType::Func),
-        // Same for a modifier. `:capture` never reaches here — it applies to a
-        // call, so alone it is an error, which `never_yields` answers above.
-        parser::Expr::ModifierRef(_) => Some(ReturnType::Func),
-        parser::Expr::Scalar(word) => {
-            // **A glob is a list of whatever it matched**, so its type is a fact
-            // about the filesystem rather than the source — and reporting it as
-            // the `str` its text spells would be worse than staying quiet, a
-            // wrong kind in the message being harder to disbelieve than none.
-            // A qualifier list marks one whatever the pattern did (`*(d)`), as
-            // [`expand::word_globs`] has it.
-            if word.value.qualifiers.is_some() {
-                return None;
-            }
-            // Every piece must be static text: a variable or a spliced value is
-            // exactly the run-time dependence this check refuses to guess at.
-            let mut quoted = false;
-            for piece in &word.value.pieces {
-                let parser::WordPiece::Text { quote, .. } = piece else {
-                    return None;
-                };
-                if !matches!(quote, parser::QuoteMode::Bare) {
-                    quoted = true;
-                }
-            }
-            // **The expander's own test, not a scan for `*?[`.** A word carrying
-            // metacharacters that cannot form a pattern never reaches the
-            // filesystem — `foo["bar"` is an unmatched class, so expansion keeps
-            // the literal `foo[bar` — and answering that question a second way
-            // here is how the two come to disagree. Quoted text stands in as a
-            // placeholder, so `"*"` is still a `str`. Raised in review.
-            if crate::expand::segments_glob(word.value.pieces.iter().map(|piece| match piece {
-                parser::WordPiece::Text { text, quote } => {
-                    (text.as_str(), matches!(quote, parser::QuoteMode::Bare))
-                }
-                _ => ("", false),
-            })) {
-                return None;
-            }
-            // **Any quoting at all makes the word a string**, including a word
-            // only partly quoted: in branch position `foo"bar"` is the string
-            // `foobar`, where the wholly bare `foobar` is a *command*. That
-            // asymmetry is the parser's, and it is why a bare word counts only
-            // when it reads as a number or a bool — the two spellings no command
-            // name can claim.
-            if quoted {
-                return Some(ReturnType::Str);
-            }
-            let [parser::WordPiece::Text { text, .. }] = word.value.pieces.as_slice() else {
-                return None;
-            };
-            match text.as_str() {
-                "true" | "false" => Some(ReturnType::Bool),
-                // `canonical_integer`, not `parse::<i64>()`: `007`, `+5` and
-                // `-0` all parse as numbers but stay **strings** when evaluated,
-                // because an `i64` cannot carry their spelling. Asking the same
-                // question the parser asks is the point — half a shared rule is
-                // how `007` came to mean two things once already.
-                other => parser::canonical_integer(other).map(|_| ReturnType::Int),
-            }
+    }
+    // **The expander's own test, not a scan for `*?[`.** A word carrying
+    // metacharacters that cannot form a pattern never reaches the filesystem —
+    // `foo["bar"` is an unmatched class, so expansion keeps the literal
+    // `foo[bar` — and answering that question a second way here is how the two
+    // come to disagree. Quoted text stands in as a placeholder, so `"*"` is
+    // still a `str`. Raised in review.
+    if crate::expand::segments_glob(word.value.pieces.iter().map(|piece| match piece {
+        parser::WordPiece::Text { text, quote } => {
+            (text.as_str(), matches!(quote, parser::QuoteMode::Bare))
         }
-        _ => None,
+        _ => ("", false),
+    })) {
+        return None;
+    }
+    // **Any quoting at all makes the word a string**, including a word only
+    // partly quoted: in branch position `foo"bar"` is the string `foobar`, where
+    // the wholly bare `foobar` is a *command*. That asymmetry is the parser's,
+    // and it is why a bare word counts only when it reads as a number or a bool
+    // — the two spellings no command name can claim.
+    if quoted {
+        return Some(ReturnType::Str);
+    }
+    let [parser::WordPiece::Text { text, .. }] = word.value.pieces.as_slice() else {
+        return None;
+    };
+    match text.as_str() {
+        "true" | "false" => Some(ReturnType::Bool),
+        // `canonical_integer`, not `parse::<i64>()`: `007`, `+5` and `-0` all
+        // parse as numbers but stay **strings** when evaluated, because an `i64`
+        // cannot carry their spelling. Asking the same question the parser asks
+        // is the point — half a shared rule is how `007` came to mean two things
+        // once already.
+        other => parser::canonical_integer(other).map(|_| ReturnType::Int),
     }
 }
 
@@ -12345,8 +13638,14 @@ fn warn_branch_disagreement(node: &parser::IfExpr, unwinds: bool) {
     // A branch with no literal kind is skipped rather than guessed at, and a
     // missing `else` is not a disagreement — the value path already answers an
     // uncovered branch with the empty string.
-    let (kinds, _) = branch_types(node, unwinds);
-    let seen: Vec<ReturnType> = kinds.into_iter().flatten().collect();
+    let (branches, _) = branch_types(node, unwinds);
+    let seen: Vec<ReturnType> = branches
+        .into_iter()
+        .filter_map(|branch| match branch {
+            Yields::Known(kind) => Some(kind),
+            _ => None,
+        })
+        .collect();
     let Some(first) = seen.first() else { return };
     let Some(odd) = seen.iter().find(|kind| *kind != first) else {
         return;

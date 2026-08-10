@@ -5625,10 +5625,198 @@ entry records what each costs.
               spelling `1..=9223372036854775807` is caught; seeing through the
               compound needs the same value-level reading.
 
-            Closing either means the check starts computing values, which is a
-            different thing from reading kinds off syntax — worth deciding on
-            purpose rather than reaching for when a reviewer points at the next
-            spelling.
+            Two more of the same shape were raised while the check was being
+            built, and are here for the same reason:
+
+            - `x = if $p { (1 / 0) == 1 } else { "s" }` warns, though the
+              division can only fail. Catching it means constant-folding
+              arithmetic — division by zero, checked overflow — before believing
+              the operator's kind.
+            - `x = if $p { false and 7 } else { 7 }` is silent, though `and`
+              short-circuits and the branch really is a bool. Catching it means
+              reading the *value* of the left operand, not just its kind.
+
+            **The decision, not yet made: should this check compute values at
+            all?** Every one of the four turns on that and nothing else. Today it
+            reads kinds off syntax and never evaluates, which is what keeps it
+            clear of late binding and cheap enough to run per evaluation.
+            Constant-folding literals is a smaller step than resolving names —
+            it stays inside the source — but it is still a different activity,
+            and it grows: `1 / 0` invites `1 / (2 - 2)`, and short-circuiting
+            invites tracking which bool a variable last held.
+
+            Judge the group on `(1 / 0) == 1`, which is a **wrong** warning
+            rather than a missing one; the other three are silences on code that
+            either runs fine or is already dead. If the answer is no, that is
+            worth writing down here too, so the next reviewer comment about a
+            fifth spelling has something to be answered with.
+
+            **Review has since raised two of these again**, independently and in
+            one round: `(1 / 0) == 1` (adding remainder-by-zero and static
+            overflow as further spellings) and `false and not 7`. Both were
+            declined and pointed here, because which way they go is the same
+            single question and it is the repo owner's to answer, not a
+            reviewer's and not a lint's. That is the evidence the entry was
+            waiting for: the spellings do keep arriving, so the answer is worth
+            making explicit either way.
+      - [ ] **The branch check asks two questions with two traversals, and the
+            gaps between them are where its bugs live.** *Can this only error?*
+            is `yields`; *can this leave?* is `may_leave` / `operand_may_leave`.
+            Both need to know every place an expression can hide, and each is a
+            hand-maintained list of those places.
+
+            Review found **seventeen** distinct positions one walk knew about
+            and the other did not, across six rounds: a `match` arm's value,
+            its guard, its pattern, a `for`'s iterable, an `else if` condition,
+            an interpolated `"${…}"` piece, a condition that leaves, a
+            `return`'s operand, a `with`'s header bindings, a statement guard —
+            in a value statement, an exit, *and* each command of a pipeline —
+            and, in the other direction, the three assignment variants beside
+            plain `Assignment`, the compact `export A=… B=…` spelling, a loop's
+            binding patterns, a `with`'s header bindings *again* — once per
+            walk — a command's value arguments, and a condition written as
+            anything but an expression.
+
+            The rate is not falling: nine rounds in, each one still finds two
+            to four. That is the argument for the refactor rather than more
+            patching — the list is not nearly finished, and every remaining
+            entry is a wrong warning waiting for someone to write its shape.
+
+            **Round eight found the mirror image, which widens the class.** The
+            gap is not only a position one walk has not learned; it is also a
+            construct whose *rule* both walks get wrong in opposite directions.
+            A multi-stage pipeline forks each stage, and a fork is a wall both
+            ways: an operand that can only error inside one does not fail the
+            enclosing capture, and a `return` inside one does not leave the
+            enclosing function. The failure walk was looking through that wall,
+            the exit walk was looking through it too, and each produced a
+            *silence* — a suppressed warning on code that runs fine. So the
+            refactor's unit is the **construct**, not the position: state what
+            runs where once, and let each walk read it.
+
+            Round nine is that prescription working: an `alias` with a computed
+            name evaluates that word where the definition runs, and neither walk
+            read it. Both halves arrived in the same review this time rather
+            than a round apart, and the fix was one enumeration
+            (`definition_operands`) added to both — the construct named once, not
+            a case bolted onto each walk. That is three worked examples now, and
+            the remaining shapes are the refactor.
+
+            **`command_operands` is the shape of the answer, in miniature.** A
+            command evaluates four kinds of thing before it runs — environment
+            prefixes, value arguments, `${…}` inside a word, `${…}` inside a
+            redirect's target — and both walks had learned a different subset of
+            them, a round apart. It is now one function returning the lot, which
+            each walk consumes with its own quantifier: the failure walk takes
+            only unguarded commands, the exit walk takes all of them. That
+            division is the whole difference between the two, and doing the same
+            for the remaining shapes is the refactor. **`in_process_stage` is
+            the second worked example**, and the one that shows the unit is a
+            construct: it answers "which stages run in this process?" once, and
+            both walks stop at the same wall instead of each learning about the
+            fork separately. The failure mode is
+            what makes it worth fixing structurally rather than one gap at a
+            time: a position missing from the exit walk answers "cannot leave",
+            which is a **silent** default — no test catches it unless somebody
+            writes that exact shape, and the warning it produces is wrong
+            rather than absent.
+
+            The fix is one traversal that visits every sub-expression once,
+            with the two questions as what a caller does at each node rather
+            than as two walks. That is a real refactor of about four functions
+            (`yields`, `may_leave`, `operand_may_leave`, `body_fails`), and it
+            has to keep the linear-time property three separate 5-second-bound
+            tests currently pin — which is exactly why it was not attempted
+            inside a review round.
+      - [ ] **The branch check does not know what each built-in modifier
+            requires of its subject.** `x = if $p { not (7:upper) } else { 7 }`
+            warns `bool` against `int`, though selecting that branch can only
+            report *:upper: requires a string*. Raised in review, and correct.
+
+            It is the one member of the literal-validity family with **no owner
+            to ask**. Every other rule this check learned came from a single
+            place that already states it — `expand::compile_regex`,
+            `glob::Pattern::new`, `parser::canonical_integer`,
+            `eval_index`'s diagnostics, `eval_expr`'s `:capture` arm — and
+            asking that place is what made each of them right first time. There
+            is no equivalent for modifiers: `Modifier` has sixty-odd variants
+            and each states its value rule inline, at its own application site,
+            in half a dozen different shapes (*requires a string*, *cannot apply
+            string modifier to this value*, *cannot map over a map*).
+
+            So taking it means **writing that table**, mapping every variant to
+            the kinds it accepts, and then keeping it in step with `expand.rs`
+            forever. Hand-rolling a rule the runtime already owns is the exact
+            mistake this check made five separate times, and each time the
+            hand-rolled version was wrong; a sixty-entry hand-rolled version is
+            that mistake at scale, and its failure mode is a **false silence**,
+            which no test catches unless someone thinks to write it.
+
+            Probing instead of tabulating does not work either: a representative
+            value of the right kind cannot stand in, because several modifiers
+            fail on the *value* rather than the kind — `:int` on `"abc"` but not
+            on `"5"`, `:first` on an empty list but not a full one — so the probe
+            would answer "impossible" for code that runs.
+
+            The tractable version is a classification living in `expand.rs`
+            beside the modifiers themselves, exposed for this check to ask. That
+            is a real piece of work rather than a lint fix, and it is worth doing
+            for its own sake — the same answer would let `whence` and `help`
+            describe what a modifier takes. Filed rather than guessed.
+      - [ ] **Parsing an `if` written as another `if`'s condition is
+            exponential**, and predates the branch check — measured against
+            `origin/main` with the check compiled out, which made no difference:
+
+            ```
+            nested `if`s in condition position     12 → 0.24s     16 → 3.6s
+            ```
+
+            24 levels does not finish inside 30s. The expression need never run:
+            putting it in a `func` nobody calls costs the same, so the time is in
+            the parser rather than the evaluator. Nesting in *body* position is
+            linear, so it is specific to a compound being read as a condition.
+
+            Filed here rather than fixed because it is not this check's bug — a
+            reviewer attributed it to the check, and disabling the check
+            entirely left the curve unchanged. Worth a look on its own: the
+            shape is unusual but a hang is a hang.
+      - [ ] **Is "an int or `false`" a disagreement?** The branch check does not
+            report arithmetic's kind, though the classifier knows it is an int,
+            and that omission is holding one question open rather than settling
+            it.
+
+            Classifying `$n + 1` as an int is *true*. It also makes this warn,
+            once per pass of the loop:
+
+            ```
+            any func nxt(_n) { if $_n < 3 { $_n + 1 } else { false } }
+            n = 0
+            while n = nxt($n) { puts "n=$n" }
+            ```
+
+            That is `DESIGN.md`'s own contract for ending a `while` — a value
+            function answering `false` — and it is pinned by
+            `a_function_answering_false_ends_a_while_that_binds_it`, which the
+            arithmetic classification broke when it was tried.
+
+            So one of three things is true, and which one is a language
+            question rather than a lint question:
+
+            1. **The idiom is exempt**: a `false` sentinel beside any other kind
+               is idiomatic, and the check should say so by name rather than by
+               declining to classify arithmetic. Then arithmetic gets classified
+               and `if $p { 1 } else { false }` stops warning too — it warns
+               today, which is the same shape written with a literal.
+            2. **The idiom is a disagreement** and the warning is right, in
+               which case the shape wants a different spelling in `DESIGN.md` —
+               an option type, or a status channel — and the check should be
+               widened once that exists.
+            3. **The distinction is not worth drawing** and arithmetic stays
+               unclassified, which is where it is now, by default rather than by
+               decision.
+
+            The cost of leaving it: `if $p { $n + 1 } else { "s" }` is silent,
+            which is a real disagreement the check would otherwise catch.
       - [ ] **`match` arms are not compared, only `if` branches.** The two sit
             next to each other in both evaluators — `Executable::Match` delegates
             to `eval_match_expr` exactly as `Executable::If` delegates to
@@ -7717,6 +7905,24 @@ of each PR had landed by another route, but these pieces had not.
       since a bare phase code
       with no line under it is exactly what made the earlier sightings
       unreadable.
+
+      **A tenth sighting, and this one comes with a denominator.** Same test,
+      same phase 241, on CI for #493 at `1fb435f`. What makes it worth adding
+      rather than noting is the sample it sits in: that branch pushed sixteen
+      times in one afternoon, so the *same job on the same branch* ran green
+      fifteen times and failed once — a per-run rate rather than another
+      anecdote. The branch touches only the branch-disagreement check and its
+      tests: nothing in the exit path, the hooks, the title writes or the pty
+      harness. It did not reproduce locally, three runs of the test alone.
+
+      That is the second sighting in a row on a branch that cannot plausibly
+      have caused it — #468 was documentation-only, this one is a lint and its
+      tests — which strengthens the reading that the cause is in the harness or
+      the exit path and not in whatever happens to be under test. It does not
+      narrow *which*, so the next step above is unchanged: instrument phase 241
+      to say which of its three disjuncts fired. Sixteen pushes' worth of runs
+      on one branch is also a cheap way to get that number, if someone wants a
+      rate before they have a cause.
 
 - [x] **The pty suite is flaky in CI, in more than one place.** ✅ **Closed
       — see the reopened entry above.**
