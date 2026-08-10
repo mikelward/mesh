@@ -34455,3 +34455,352 @@ fn a_glob_is_declarable_but_nothing_yet_produces_one() {
         String::from_utf8_lossy(&bound.stdout)
     );
 }
+
+/// An `if` used **for its value** whose branches literally disagree is reported
+/// from the source, before either branch runs.
+///
+/// This is the one thing the declared-type warning structurally cannot say: it
+/// sees the value a call produced, so it reports on the branch that ran and is
+/// silent about the one that did not — two runs of the same function disagree
+/// about whether anything is wrong. Reading the branches says it once.
+#[test]
+fn if_branches_that_literally_disagree_are_reported() {
+    let out = run_with_input("p = true\nx = if $p { 7 } else { \"seven\" }\nputs $x\n");
+
+    assert_eq!(out.status.code(), Some(0), "the value is still produced");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "7\n");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stderr),
+        "mesh: warning: if branches disagree: `int` and `str`\n"
+    );
+
+    // An `else if` chain is one `if`, so the whole chain is compared.
+    let chain = run_with_input(
+        "n = 2\nx = if $n == 1 { \"one\" } else if $n == 2 { 2 } else { \"many\" }\nputs $x\n",
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&chain.stderr),
+        "mesh: warning: if branches disagree: `str` and `int`\n"
+    );
+
+    // **A body's tail is the other way an `if` reaches value position**, and the
+    // shape this exists for: an implicit tail return is where a disagreement
+    // does real damage, since the declared type is right there to contradict.
+    // It arrives by a different path from the assignment above and was missed
+    // in the first version of this check.
+    let tail = run_with_input(
+        "int func pick(p) { if $p { 7 } else { \"seven\" } }\na = pick(true)\nputs $a\n",
+    );
+    assert_eq!(String::from_utf8_lossy(&tail.stdout), "7\n");
+    assert_eq!(
+        String::from_utf8_lossy(&tail.stderr),
+        "mesh: warning: if branches disagree: `int` and `str`\n",
+        "a tail `if` in a func body must be checked, and warn exactly once"
+    );
+
+    // **Any quoting makes the word a string, including partial quoting.** In
+    // branch position `foo"bar"` is the string `foobar`, where the wholly bare
+    // `foobar` is a *command* — an asymmetry of the parser's, and the reason a
+    // bare word counts only as a number or a bool. Escaping counts too, and a
+    // group is transparent. All three were missed by the first version and
+    // raised in review.
+    for (source, kinds) in [
+        ("x = if $p { foo\"bar\" } else { 7 }", "`str` and `int`"),
+        ("x = if $p { foo\\ bar } else { 7 }", "`str` and `int`"),
+        ("x = if $p { (7) } else { \"seven\" }", "`int` and `str`"),
+        // A quoted `*` is literal text, not a pattern.
+        ("x = if $p { \"*\" } else { 7 }", "`str` and `int`"),
+        // Metacharacters that cannot form a pattern never reach the filesystem:
+        // `foo["bar"` is an unmatched class, so it stays the string `foo[bar`.
+        ("x = if $p { foo[\"bar\" } else { 7 }", "`str` and `int`"),
+        // A range is the list of integers it spans.
+        ("x = if $p { 1..3 } else { \"s\" }", "`list` and `str`"),
+        // A group is transparent, so a valid operand inside one still counts.
+        ("x = if $p { (1)..3 } else { \"s\" }", "`list` and `str`"),
+        (
+            "x = if $p { if (true) { 1 } else { 2 } } else { \"s\" }",
+            "`int` and `str`",
+        ),
+        // A compound carrying no control statement cannot leave the branch, so
+        // the tail after it is still what the branch yields.
+        (
+            "x = if $p { if $q { puts inner }; 7 } else { \"s\" }",
+            "`int` and `str`",
+        ),
+        (
+            "x = if $p { for i in [1] { puts $i }; 7 } else { \"s\" }",
+            "`int` and `str`",
+        ),
+        // A lambda is a function value whatever its body does.
+        (
+            "x = if $p { int func() { 7 } } else { 7 }",
+            "`func` and `int`",
+        ),
+        // **A reference is a function value without resolving the name** — the
+        // one place late binding does not bar an answer, since only calling it
+        // asks who `puts` is. Same for a modifier.
+        ("x = if $p { &puts } else { 7 }", "`func` and `int`"),
+        ("x = if $p { :upper } else { 7 }", "`func` and `int`"),
+    ] {
+        let out = run_with_input(&format!("p = true\nq = false\n{source}\nputs done\n"));
+        assert_eq!(
+            String::from_utf8_lossy(&out.stderr),
+            format!("mesh: warning: if branches disagree: {kinds}\n"),
+            "for {source}"
+        );
+    }
+
+    // **An explicit `return` is the same tail said out loud**, and the shape
+    // most likely to carry a declared type it can contradict. Missed by the
+    // first version, which only read `Executable::Expression` tails.
+    let returned = run_with_input(
+        "int func pick(p) { if $p { return 7 } else { return \"seven\" } }\na = pick(true)\nputs $a\n",
+    );
+    assert_eq!(String::from_utf8_lossy(&returned.stdout), "7\n");
+    assert_eq!(
+        String::from_utf8_lossy(&returned.stderr),
+        "mesh: warning: if branches disagree: `int` and `str`\n"
+    );
+
+    // Quoting decides the kind: `"7"` is a str even though it spells a number.
+    let quoted = run_with_input("p = true\nx = if $p { \"7\" } else { 7 }\nputs done\n");
+    assert_eq!(
+        String::from_utf8_lossy(&quoted.stderr),
+        "mesh: warning: if branches disagree: `str` and `int`\n"
+    );
+
+    // Inside a function the same two exits do unwind, so they still report —
+    // the prompt cases above are about context, not about the exits themselves.
+    let unwound =
+        run_with_input("any func pr(p) { if $p { return 7 } else { \"s\" } }\na = pr(false)\n");
+    assert_eq!(
+        String::from_utf8_lossy(&unwound.stderr),
+        "mesh: warning: if branches disagree: `int` and `str`\n"
+    );
+
+    // **The channel decides a status return's kind, not its operand.**
+    // `return status 5` yields a status however its operand reads, so reporting
+    // the operand's `int` would name a kind the value never had.
+    let status = run_with_input(
+        "any func pick(p) { if $p { return status 5 } else { return 7 } }\na = pick(true)\nputs done\n",
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&status.stderr),
+        "mesh: warning: if branches disagree: `status` and `int`\n"
+    );
+
+    // **What leaves the branch first decides it**, so an unreachable tail neither
+    // hides a real disagreement nor invents one: here the *first* return is the
+    // `str`, and it is the one reported.
+    let unreachable = run_with_input(
+        "any func pick(p) { if $p { return \"s\"; return 7 } else { return 8 } }\na = pick(true)\nputs done\n",
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&unreachable.stderr),
+        "mesh: warning: if branches disagree: `str` and `int`\n"
+    );
+
+    // **A nested `if` whose own branches agree has a kind of its own.** However
+    // `$q` falls the inner one is an int, so the outer disagreement is as certain
+    // as any other here — and reported once, by the outer `if`.
+    let nested = run_with_input(
+        "p = true\nq = true\nx = if $p { if $q { 1 } else { 2 } } else { \"s\" }\nputs done\n",
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&nested.stderr),
+        "mesh: warning: if branches disagree: `int` and `str`\n"
+    );
+
+    // **`fail` is the status channel's `return`** and produces a value like
+    // one — `fail 3` is `status(3)`, a bare `fail` is `status(1)` — so a branch
+    // ending in either disagrees with one returning an int.
+    for source in [
+        "any func pf(p) { if $p { fail 3 } else { return 7 } }\na = pf(true)\nputs done\n",
+        "any func pn(p) { if $p { fail } else { return 7 } }\na = pn(true)\nputs done\n",
+        // A code only the run can read is still a status.
+        "any func pv(p) { n = 4; if $p { fail $n } else { return 7 } }\na = pv(true)\nputs done\n",
+    ] {
+        let out = run_with_input(source);
+        assert_eq!(
+            String::from_utf8_lossy(&out.stderr),
+            "mesh: warning: if branches disagree: `status` and `int`\n",
+            "for {source:?}"
+        );
+    }
+
+    // **An operand can carry a control out of the branch**, so the tail after
+    // it is conditional: this function returns `'s'` rather than the `7` the
+    // outer branch appears to end in, and only the inner `if` reports.
+    let operand = run_with_input(
+        "any func fo(p, q) { if $p { z = if $q { return \"s\" } else { 1 }; 7 } else { \"s\" } }\na = fo(true, true)\nputs done\n",
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&operand.stderr),
+        "mesh: warning: if branches disagree: `str` and `int`\n",
+        "the inner `if` reports; the outer stays out of it"
+    );
+
+    // A compound in an operand that *cannot* leave still leaves the tail alone,
+    // so the outer disagreement is still reported.
+    let benign = run_with_input(
+        "any func fb(p, q) { if $p { z = if $q { 1 } else { 2 }; 7 } else { \"s\" } }\na = fb(true, true)\nputs done\n",
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&benign.stderr),
+        "mesh: warning: if branches disagree: `int` and `str`\n"
+    );
+
+    // A compound that returns down every path leaves too, so it — not the
+    // unreachable statement after it — is what the branch yields.
+    let compound = run_with_input(
+        "any func pick(p, q) { if $p { if $q { return \"a\" } else { return \"b\" }; return 9 } else { return 3 } }\na = pick(true, true)\nputs done\n",
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&compound.stderr),
+        "mesh: warning: if branches disagree: `str` and `int`\n"
+    );
+
+    // When the *inner* branches disagree the inner reports it, and the outer
+    // stays quiet rather than adding a second line about a kind it cannot know.
+    let inner = run_with_input(
+        "p = true\nq = true\nx = if $p { if $q { 1 } else { \"a\" } } else { \"s\" }\nputs done\n",
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&inner.stderr),
+        "mesh: warning: if branches disagree: `int` and `str`\n",
+        "exactly one warning, from the inner `if`"
+    );
+}
+
+/// What the check stays silent about, which is most things — and deliberately.
+///
+/// A **statement** `if` is read by a different parser path, so its branches are
+/// effects whose types are nobody's business. A branch whose tail is a call or a
+/// variable is skipped rather than guessed at: mesh resolves names at call time,
+/// so a check that needed to know what `f` returns would be wrong the moment `f`
+/// was redefined. Only a disagreement visible in the text is reported.
+#[test]
+fn the_branch_check_stays_out_of_everything_it_cannot_see() {
+    for source in [
+        // A statement `if` — the branches are effects, not a value.
+        "if true { 7 } else { \"seven\" }\nputs after\n",
+        // Agreeing literals.
+        "p = true\nx = if $p { 7 } else { 9 }\nputs after\n",
+        // A call: its type is a run-time fact, and late binding means it can
+        // change between calls.
+        "str func f() { \"s\" }\np = true\nx = if $p { f() } else { 7 }\nputs after\n",
+        // A variable: same reason.
+        "v = 1\np = true\nx = if $p { $v } else { \"s\" }\nputs after\n",
+        // A **typeless** func's body runs for its status, so it has no value
+        // channel and its branches' types are nobody's business.
+        "func t(p) { if $p { 7 } else { \"seven\" } }\nt(true)\nputs after\n",
+        // **A glob is a list of whatever it matched**, so its kind is a fact
+        // about the filesystem. Reporting the `str` its text spells would be a
+        // wrong kind in the message, which is worse than no message.
+        "p = true\nx = if $p { foo*\"bar\" } else { 7 }\nputs after\n",
+        "p = true\nx = if $p { *.rs } else { 7 }\nputs after\n",
+        // **A number an `i64` cannot spell back stays a string.** `007`, `+5`
+        // and `-0` all parse as numbers, so reading them as `int` reported a
+        // disagreement between two branches that agree — a false warning.
+        // `canonical_integer` is the parser's own rule for this.
+        "any func p7(p) { if $p { return 007 } else { return \"seven\" } }\na = p7(true)\n",
+        "any func p5(p) { if $p { return +5 } else { return \"five\" } }\na = p5(true)\n",
+        "any func p0(p) { if $p { return -0 } else { return \"zero\" } }\na = p0(true)\n",
+        // Two status returns agree; the channel, not the operand, is the kind.
+        "any func ps(p) { if $p { return status 5 } else { return status 1 } }\na = ps(true)\n",
+        // **An unreachable tail is not a branch's kind.** Both paths here return
+        // an int; reading the syntactic last statement reported a `str`/`int`
+        // disagreement that no run can produce.
+        "any func pu(p) { if $p { return 7; return \"seven\" } else { return 8 } }\na = pu(true)\n",
+        // A nested `if` with no `else` can yield the empty string instead of its
+        // literal, so the compound has no certain kind.
+        "p = true\nq = false\nx = if $p { if $q { 1 } } else { \"s\" }\n",
+        // **A compound that returns down every path leaves too.** Every path
+        // here returns an int; the `str` after it is unreachable.
+        "any func pc(p, q) { if $p { if $q { return 1 } else { return 2 }; return \"s\" } else { return 3 } }\na = pc(true, true)\n",
+        // One that returns down *some* path makes what follows conditional, so
+        // the branch has no certain kind either way.
+        "any func pm(p, q) { if $p { if $q { return 1 }; return \"s\" } else { return 3 } }\na = pm(true, false)\n",
+        // A valid pattern is still a glob, and a range with no end is an error
+        // rather than a value.
+        "p = true\nx = if $p { foo[ab]\"bar\" } else { 7 }\n",
+        // A compound that *does* carry a control makes the tail conditional.
+        "any func pw(p, q) { if $p { if $q { return 1 }; 7 } else { \"s\" } }\na = pw(true, false)\n",
+        "any func pl(p) { if $p { for i in [1] { return 1 }; 7 } else { \"s\" } }\na = pl(true)\n",
+        // **A status code the channel cannot carry is an error, not a value.**
+        // Warning about a `status` branch here would come ahead of the error
+        // saying that branch produces nothing at all.
+        "any func pb(p) { if $p { return status \"bad\" } else { return 7 } }\na = pb(false)\n",
+        "any func pr(p) { if $p { return status 999 } else { return 7 } }\na = pr(false)\n",
+        // **A status operand is read as a number**, so a bare word is a literal
+        // here even though a bare word in value position is a command: `bad` and
+        // `007` are known-bad codes rather than unknown values.
+        "any func pw(p) { if $p { return status bad } else { return 7 } }\na = pw(false)\n",
+        "any func pz(p) { if $p { return status 007 } else { return 7 } }\na = pz(false)\n",
+        // `fail` has its own range, starting at 1 rather than 0.
+        "any func pf0(p) { if $p { fail 0 } else { return 7 } }\na = pf0(false)\n",
+        "any func pf9(p) { if $p { fail 999 } else { return 7 } }\na = pf9(false)\n",
+        // **A range whose endpoints cannot be integers is an error, not a
+        // list** — and counting past the largest integer there is overflows.
+        "p = false\nx = if $p { \"a\"..3 } else { \"s\" }\n",
+        "p = false\nx = if $p { 1..=9223372036854775807 } else { \"s\" }\n",
+        // **A condition that cannot be one picks no branch.** A bool is the only
+        // literal that can be a condition; an int is *not a condition* by name,
+        // so this compound yields nothing for the outer `if` to compare.
+        "p = false\nq = true\nx = if $p { if 7 { 1 } else { 2 } } else { \"s\" }\n",
+        "p = false\nq = true\nx = if $p { if $q { 1 } else if \"s\" { 2 } else { 3 } } else { \"t\" }\n",
+        // **Inside a group a bare word is a string, not the command it would be
+        // in value position** — `(007)` and `(a)` are both *a string is not a
+        // condition* / *range endpoints must be integers*, so a word written out
+        // is a known-bad operand rather than one only the run can read.
+        "p = false\nx = if $p { (007)..3 } else { \"s\" }\n",
+        "p = false\nx = if $p { (a)..3 } else { \"s\" }\n",
+        "p = false\nx = if $p { 1..(007) } else { \"s\" }\n",
+        "p = false\nx = if $p { if (007) { 1 } else { 2 } } else { \"s\" }\n",
+        "p = false\nx = if $p { if (a) { 1 } else { 2 } } else { \"s\" }\n",
+        // **`:capture` applies to a call, so alone it can only error** — in a
+        // status code, a condition, a range endpoint, or an element of a list or
+        // a map. One predicate answers all five, so a container is only as good
+        // as what is in it.
+        "any func pc(p) { if $p { return status :capture } else { return 7 } }\na = pc(false)\n",
+        "p = false\nx = if $p { if (:capture) { 1 } else { 2 } } else { \"s\" }\n",
+        "p = false\nx = if $p { (:capture)..3 } else { \"s\" }\n",
+        "p = false\nx = if $p { [:capture] } else { \"s\" }\n",
+        "p = false\nx = if $p { [a: :capture] } else { \"s\" }\n",
+        // **At the prompt neither `return` nor `fail` unwinds**, so a branch
+        // written with one errors rather than producing the value it names.
+        "p = false\nx = if $p { return 7 } else { \"s\" }\n",
+        "p = false\nx = if $p { fail 3 } else { \"s\" }\n",
+    ] {
+        let out = run_with_input(source);
+        assert!(
+            out.stderr.is_empty(),
+            "expected silence for {source:?}, got: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    // The **outer** `if`'s own condition is the same case, and the same answer:
+    // one that cannot be a condition picks no branch, so there is no pair to
+    // disagree and the error stands alone.
+    let condition = run_with_input("x = if 7 { 1 } else { \"s\" }\nputs after\n");
+    let stderr = String::from_utf8_lossy(&condition.stderr);
+    assert!(
+        !stderr.contains("branches disagree"),
+        "expected no disagreement warning, got: {stderr}"
+    );
+    assert!(stderr.contains("is not a condition"), "got: {stderr}");
+
+    // `:capture` is an error rather than a value, so that branch has no kind to
+    // compare — the error stands alone, with no warning ahead of it.
+    let capture = run_with_input("p = true\nx = if $p { :capture } else { 7 }\nputs after\n");
+    let stderr = String::from_utf8_lossy(&capture.stderr);
+    assert!(
+        !stderr.contains("branches disagree"),
+        "expected no disagreement warning, got: {stderr}"
+    );
+    assert!(
+        stderr.contains(":capture applies to a call"),
+        "got: {stderr}"
+    );
+}
