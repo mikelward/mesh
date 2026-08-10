@@ -14349,6 +14349,19 @@ fn help_with_a_name_prints_what_that_builtins_help_flag_prints() {
 }
 
 #[test]
+fn help_for_on_covers_every_event_not_just_the_prompt() {
+    let out = run_with_input("help on\n");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "Register a function as an event handler\n\n\
+         Usage: on [--remove] EVENT NAME [FUNCTION]\n\n\
+         Options:\n  --remove\n  --help  Print help\n"
+    );
+    assert!(out.status.success());
+    assert!(out.stderr.is_empty());
+}
+
+#[test]
 fn help_prints_every_name_it_was_given() {
     let out = run_with_input("help pwd jobs\n");
     assert_eq!(
