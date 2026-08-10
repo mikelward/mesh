@@ -72,7 +72,7 @@ const TABLE: &[(&str, &str)] = &[
     ("title TEXT", "Set the window and tab title"),
     (
         "on [--remove] EVENT NAME [FUNCTION]",
-        "Register a function for a prompt event",
+        "Register a function as an event handler",
     ),
     (
         "command [--] NAME [ARG ...]",
