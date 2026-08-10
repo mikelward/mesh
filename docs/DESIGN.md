@@ -7833,14 +7833,24 @@ to avoid" rather than promising the latter as done.
   assign-first shape that
   [reading a failed code](#tests-and-comparisons) documents is itself a bare
   assignment, and this rule refuses it for an option-returning call. **And
-  `$sh.status` is not the way back** — measured, not assumed: an
-  `any func f() { fail 5 }` consumed as `if x = f() { } else { … }` leaves `0` in
-  a fresh shell and `3` after an earlier `sh -c "exit 3"`. The `5` never appears,
-  because a value call restores the standing status. The one shape where it
-  *looks* available — `if s = sh("-c", "exit 5")` leaving `5` — is an **external**
-  callee setting the status as a side effect of running, which is a leak rather
-  than a contract, and a mesh `func` failing with the same code gives nothing.
-  That is
+  `$sh.status` is no longer a way *around* the rule, though it now carries the
+  code** — measured, not assumed. An assignment reports a bound `Status` as its
+  own status, so the assign-first shape reaches it:
+
+  ```
+  any func f() { fail 5 }
+  sh -c "exit 3"
+  t = f()
+  if kept = $t { … } else { … }        # $sh.status is 5
+  if x = f()   { … } else { … }        # $sh.status is 3 — the standing one
+  ```
+
+  The **condition** form still leaves the standing status alone, since a binding
+  condition publishes nothing of its own. So the code is reachable exactly where
+  the hybrid **refuses** to let the call appear: through a bare assignment. That
+  sharpens the cost rather than removing it — the failing code is not
+  intrinsically unreachable, it is unreachable *because this rule forbids the one
+  statement that would publish it*. That is
   defensible rather than accidental: **`T?` is an option, not a result.** A shape
   that carries *why* it failed is a different type, and mesh does not have one —
   the status channel carries that for **commands**, not for values. But it should
