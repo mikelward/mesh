@@ -1873,6 +1873,8 @@ fn run_executable(
                 // than overwriting it with the placeholder.
                 Ok(_) if shell.control.is_some() => Step::Continue(last),
                 Ok(bound) => {
+                    // Before the append arm moves `bound`.
+                    let reported = assignment_status_of(value, &bound, *append, shell);
                     let result = if *append {
                         let parser::BindingPattern::Name(name) = pattern else {
                             unreachable!("the parser restricts += to names")
@@ -1885,11 +1887,7 @@ fn run_executable(
                     } else {
                         bind_pattern(pattern, &bound, &mut shell.vars, *global)
                     };
-                    // A right-hand side that *is* a capture lends the statement its
-                    // status, so `if out = $(diff a b)` branches on the diff rather
-                    // than on the binding having worked — which is always true here.
-                    let captured = capture_status_of(value, shell);
-                    result.map_or_else(runtime_message, |_| Step::Continue(captured))
+                    result.map_or_else(runtime_message, |_| Step::Continue(reported))
                 }
                 Err(step) => step,
             }
@@ -1961,7 +1959,10 @@ fn run_executable(
                 // alone.
                 Ok(_) if shell.control.is_some() => Step::Continue(last),
                 Ok(evaluated_value) => {
-                    let captured = capture_status_of(value, shell);
+                    // Before the write moves it — the same projection a plain
+                    // assignment reports, so which syntax stores the value does
+                    // not change what `$sh.status` says about it.
+                    let captured = assignment_status_of(value, &evaluated_value, *append, shell);
                     env_key(key, &shell.vars)
                         .and_then(|key| environ::write(&key, evaluated_value, *append))
                         .map_or_else(runtime_message, |()| Step::Continue(captured))
@@ -1984,7 +1985,10 @@ fn run_executable(
                 // `break`/`continue` produced no value, so leave the entry alone.
                 Ok(_) if shell.control.is_some() => Step::Continue(last),
                 Ok(evaluated_value) => {
-                    let captured = capture_status_of(value, shell);
+                    // Before the write moves it — the same projection a plain
+                    // assignment reports, so which syntax stores the value does
+                    // not change what `$sh.status` says about it.
+                    let captured = assignment_status_of(value, &evaluated_value, *append, shell);
                     assign_into_env_member(target, evaluated_value, *append, shell)
                         .map_or_else(runtime_message, |()| Step::Continue(captured))
                 }
@@ -2003,7 +2007,10 @@ fn run_executable(
                 // `break`/`continue` produced no value, so leave the place alone.
                 Ok(_) if shell.control.is_some() => Step::Continue(last),
                 Ok(evaluated_value) => {
-                    let captured = capture_status_of(value, shell);
+                    // Before the write moves it — the same projection a plain
+                    // assignment reports, so which syntax stores the value does
+                    // not change what `$sh.status` says about it.
+                    let captured = assignment_status_of(value, &evaluated_value, *append, shell);
                     assign_into_member(target, evaluated_value, *append, *global, shell)
                         .map_or_else(runtime_message, |()| Step::Continue(captured))
                 }
@@ -2111,10 +2118,16 @@ fn run_executable(
                 match eval_operand_of(&binding.value, last, in_function, shell) {
                     Ok(_) if shell.control.is_some() => return Step::Continue(last),
                     Ok(value) => {
+                        // Before the write moves it, and by the same rule the
+                        // spaced spelling takes: `export A=status(5)` and
+                        // `export A = status(5)` are the same write and must not
+                        // report differently. Raised in review.
+                        let reported =
+                            assignment_status_of(&binding.value, &value, binding.append, shell);
                         if let Err(message) = environ::write(&binding.key, value, binding.append) {
                             return runtime_message(message);
                         }
-                        status = capture_status_of(&binding.value, shell);
+                        status = reported;
                     }
                     Err(step) => return step,
                 }
@@ -7396,18 +7409,38 @@ fn argv_words(value: &Value, name: &str) -> Result<Vec<String>, Step> {
     }
 }
 
-/// The status an assignment takes from its right-hand side: the last recorded
-/// status when that side **is** a capture, and `0` otherwise.
+/// The status an assignment reports, which is what `$sh.status` then holds.
 ///
-/// Reading the shell's ordinary status is safe precisely because [`capture_tail`]
-/// is syntactic — the only way to reach this is to have just evaluated an
-/// expression whose value came from a capture, and running that capture is what
-/// recorded the status.
-fn capture_status_of(expr: &parser::Expr, shell: &Shell) -> u8 {
-    if capture_tail(expr) {
-        shell.vars.status()
-    } else {
-        0
+/// A capture lends the statement the status of what it *ran*, so
+/// `if out = $(diff a b)` branches on the diff. Reading the shell's ordinary
+/// status is safe there precisely because [`capture_tail`] is syntactic: the
+/// only way to reach it is to have just evaluated an expression whose value came
+/// from a capture, and running that capture is what recorded the status.
+///
+/// Otherwise a bound `Status`
+/// reports its own code: `x = f()` where `f` ends in `fail 5` bound `status(5)`
+/// into `x` and still reported `0`, leaving the code in the value channel and
+/// nowhere in the status one. `run_recorded` states the invariant this restores
+/// — after a statement, `$sh.status` is the code it just returned — and an
+/// assignment was the one statement reporting a constant instead.
+///
+/// **Not the general [`status_of`] projection**, which would also make
+/// `x = false` report `1`. Presence is the *condition*'s question, not the
+/// assignment's: the statement reports that the binding worked, so a following
+/// `&&` is not silently skipped
+/// (`a_plain_value_assignment_still_reports_its_own_status`). A `Status` is the
+/// one value that carries a code of its own to report.
+///
+/// **And `+=` is not one of these**, because there `value` is the appended
+/// *element* rather than what the target ends up holding: `x = []` then
+/// `x += status(5)` leaves a list, so reporting `5` would describe a value that
+/// is not there — and skip a following `&&` besides. An append reports that it
+/// appended. Raised in review.
+fn assignment_status_of(expr: &parser::Expr, bound: &Value, append: bool, shell: &Shell) -> u8 {
+    match bound {
+        _ if capture_tail(expr) => shell.vars.status(),
+        Value::Status(code) if !append => *code,
+        _ => 0,
     }
 }
 
@@ -7575,7 +7608,7 @@ fn capture_raw(
         // Every POSIX shell binds it and reports the status separately. Nothing is
         // stashed for the caller here: running the body recorded the status the
         // ordinary way, and an assignment whose right-hand side is a capture reads
-        // it back through `capture_status_of`.
+        // it back through `assignment_status_of`.
         Step::Continue(_) => Ok(output),
         // An evaluation error is not a status to carry — the program was invalid,
         // and mesh aborts the statement for one wherever it happens (`x = $nope`

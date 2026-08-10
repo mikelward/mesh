@@ -16102,6 +16102,77 @@ fn reading_a_failed_codes_value_takes_a_plain_assignment() {
 }
 
 #[test]
+fn an_assignment_reports_a_bound_status_as_its_own() {
+    // `$sh.status` is the status of the last *expression*, and an assignment was
+    // the one statement that quietly reported a constant `0` instead. A call that
+    // ends in `fail 5` binds `status(5)` — the code was in the value channel all
+    // along — so reporting `0` put it nowhere in the status one.
+    //
+    // Pinned against a *standing* `3`, because a fresh shell also reads `0` and
+    // would pass whether or not the fix is in: before, this said `3`.
+    let out = run_with_input(
+        "any func f() { fail 5 }\n\
+         sh -c \"exit 3\"\n\
+         x = f()\n\
+         puts \"x=$x status=$sh.status\"\n",
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "x=5 status=5\n",
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // The two neighbours it must not disturb. A capture still lends the statement
+    // the status of what it *ran*, since the bytes are the value; and a plain
+    // value still reports `0`, because presence is the condition's question and a
+    // following `&&` must not be skipped — `x = false` is `0`, not `1`.
+    let capture = run_with_input("x = $(sh -c \"exit 4\")\nputs $sh.status\n");
+    assert_eq!(String::from_utf8_lossy(&capture.stdout), "4\n");
+    let plain = run_with_input("sh -c \"exit 3\"\nx = 1\nputs $sh.status\n");
+    assert_eq!(String::from_utf8_lossy(&plain.stdout), "0\n");
+
+    // Every assignment *syntax* agrees, since the rule is about the value being
+    // stored and not about where it is stored. Raised in review: routing only the
+    // plain form through the projection made `$sh.status` — and so `&&` — depend
+    // on which spelling wrote the same status.
+    // The compact `export A=…` spelling is a fifth form and parses to its own
+    // node, so it needs the same routing — `export A=status(5)` and
+    // `export A = status(5)` are the same write and must not report differently.
+    let forms = run_with_input(
+        "m = [:]\n\
+         $m.k = status(5)\n\
+         puts \"member=$sh.status\"\n\
+         $env.MESH_TEST_ST = status(5)\n\
+         puts \"env=$sh.status\"\n\
+         export MESH_TEST_A=status(5)\n\
+         puts \"compact=$sh.status\"\n\
+         export MESH_TEST_B = status(5)\n\
+         puts \"spaced=$sh.status\"\n\
+         $m.j = 1\n\
+         puts \"value=$sh.status\"\n",
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&forms.stdout),
+        "member=5\nenv=5\ncompact=5\nspaced=5\nvalue=0\n",
+        "{}",
+        String::from_utf8_lossy(&forms.stderr)
+    );
+
+    // `+=` is not one of them: the right-hand side is the *appended element*, not
+    // what the target ends up holding, so a list must not report the status of
+    // one of its members — that would describe a value that isn't there and skip
+    // a following `&&`. Raised in review.
+    let appended = run_with_input("x = []\nx += status(5)\nputs \"$x:repr $sh.status\"\n");
+    assert_eq!(
+        String::from_utf8_lossy(&appended.stdout),
+        "[status(5)] 0\n",
+        "{}",
+        String::from_utf8_lossy(&appended.stderr)
+    );
+}
+
+#[test]
 fn a_background_launch_with_no_handle_yields_a_status() {
     // Inside a fork there is no job table entry to hand back, so the launch's
     // own status stands in — as a `Status`, so `if $j` is the condition it is
