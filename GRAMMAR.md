@@ -547,7 +547,7 @@ binds a variable named `global`.
 ```ebnf
 definition      = return-type? "wrapper"? "func" definition-name parameter-list capture-list? NL* block
                 | "alias" alias-name capture-list? "=" NL* alias-command ;
-return-type     = "status" | "int" | "str" | "bool" | "list" | "map" | "any" ;
+return-type     = "status" | "int" | "str" | "bool" | "list" | "map" | "job" | "any" ;
 definition-name = bare-WORD ;                 # unjudged here; checked when it runs
 alias-name      = definition-name
                 | computed-name ;             # a word holding an interpolation
@@ -584,9 +584,12 @@ reads after a bare `f`, for every body — so `{ false }` yields `status(1)` lik
 rather than the list it built. A body with no value channel is not asked for a
 value at all: it runs the way the statement `f` runs it, so the two cannot
 disagree. `status func` is that same function said out loud, and yields the
-same. `any` is a member of the set rather than an escape from it — mesh has
-values the set deliberately does not name (a job, a styled string, an
-`Instant`), and a pass-through helper over one has no honest concrete type.
+same. `job` names a job, the kind `$j`, `$j.status` and `$sh.jobs` carry: a kind
+joins the set **on use at a function boundary**, not on existing in the runtime,
+which is what keeps a styled string and an `Instant` out until something
+declares one. `any` is still accepted and is being retired — it says only that
+there is a value channel, and the sites that reached for it each have a
+concrete type to state instead.
 
 Parameters are comma-separated, and the comma is required between two of them
 with no trailing one allowed: `func f(a b)` and `func f(a,)` are both errors.

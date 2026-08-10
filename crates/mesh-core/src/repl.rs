@@ -12747,7 +12747,7 @@ fn typed_header_follows(after: &str) -> bool {
 /// stay quarantined so its diagnostic is the reserved-word one rather than
 /// whatever its body would have done at top level.
 const TYPE_MARKER_WORDS: &[&str] = &[
-    "status", "int", "str", "bool", "list", "map", "any", "float",
+    "status", "int", "str", "bool", "list", "map", "job", "any", "float",
 ];
 
 fn strip_wrapper_marker(text: &str) -> &str {
@@ -15374,16 +15374,16 @@ mod tests {
     use super::{
         ArgumentRecall, CommandLine, CompletionState, EscapePrefix, HeredocGate, Hook, HookEvent,
         Integration, Invocation, Lookup, MeshPrompt, NOTIFY_LIMIT, PromptMarkers, SemanticMark,
-        Shell, StartupOptions, Step, TITLE_LIMIT, TimestampedHistory, argument_completions,
-        body_awaits_close, command_line, command_notification, command_position,
-        command_segment_words, command_words, completed_command, deferred_words, duration_words,
-        escape_stripped_width, eval_binary, expand_history_designators, expansion_word,
-        external_stage, func_definition_is_open, handle_signal, help_completions,
+        Shell, StartupOptions, Step, TITLE_LIMIT, TYPE_MARKER_WORDS, TimestampedHistory,
+        argument_completions, body_awaits_close, command_line, command_notification,
+        command_position, command_segment_words, command_words, completed_command, deferred_words,
+        duration_words, escape_stripped_width, eval_binary, expand_history_designators,
+        expansion_word, external_stage, func_definition_is_open, handle_signal, help_completions,
         history_designators, history_path_from, input_highlighter, interactive_keybindings,
         interruptible_task, last_argument, mark_sequence, needs_more_input, open_history,
         path_completions_sync, persist_logical_history, prepare_history_path, run_hooks, run_line,
-        run_source, segment_completions, title_sequence, title_text, variable_completions,
-        vscode_escaped,
+        run_source, segment_completions, strip_type_marker, title_sequence, title_text,
+        variable_completions, vscode_escaped,
     };
 
     /// One debt per dialect, however many titles were written.
@@ -18107,6 +18107,12 @@ mod tests {
             "int wrapper func f (...xs) {\nputs hi\n",
             "int wrapper func f(...xs) {\nputs hi\n",
             "status func f() {\nputs hi\n",
+            // Every case in this list — this one and the `int` / `float` ones
+            // above alike — reaches `Complete` through the parser's `Incomplete`
+            // arm, so none of them exercises `strip_type_marker`. What pins the
+            // marker list is `every_type_word_comes_off_a_header`, which calls
+            // the strip directly; these pin the reader's answer instead.
+            "job func f() {\nputs hi\n",
             // Reserved, and still a header: the diagnostic has to be the
             // reserved-word one rather than whatever the body would have done.
             "float func f() {\nputs hi\n",
@@ -18178,6 +18184,67 @@ mod tests {
         assert!(!needs_more_input("int \\\nfunc f() { 1 }\n"));
         // An escaped backslash is not a continuation: `puts a\\` is complete.
         assert!(!needs_more_input("puts a\\\\\n"));
+    }
+
+    /// Every type the **parser** accepts comes off here, driven by
+    /// [`ReturnType::ALL`] rather than by `TYPE_MARKER_WORDS` — iterating the
+    /// reader's own list would be circular, since a word missing from it simply
+    /// would not be tested. That circularity is exactly the mistake this
+    /// replaces: the first attempt looped over `TYPE_MARKER_WORDS` and stayed
+    /// green with `job` removed.
+    ///
+    /// Asserted on [`strip_type_marker`] **directly**, because a reader-level
+    /// assertion does not pin it either: a well-formed header takes
+    /// `pending_input`'s `Incomplete` arm, which never consults the list, so
+    /// such a test passes with a word missing too. Raised in review as a P1
+    /// twice, the second time against that second mistake.
+    #[test]
+    fn every_type_word_comes_off_a_header() {
+        for declared in parser::ReturnType::ALL {
+            let word = declared.as_str();
+            assert!(
+                TYPE_MARKER_WORDS.contains(&word),
+                "the parser accepts `{word} func` but the reader does not know the word, \
+                 so a malformed body of one stops being quarantined"
+            );
+            assert_eq!(
+                strip_type_marker(&format!("{word} func f() {{")),
+                "func f() {",
+                "{word} func"
+            );
+            assert_eq!(
+                strip_type_marker(&format!("{word} wrapper func f(...xs) {{")),
+                "wrapper func f(...xs) {",
+                "{word} wrapper func"
+            );
+        }
+        // `float` is reserved rather than declarable, so it is not in
+        // `ReturnType::ALL` and is pinned separately: the parser recognizes it in
+        // the same position, and its diagnostic has to be the reserved-word one
+        // rather than whatever its body would have done at top level.
+        assert!(TYPE_MARKER_WORDS.contains(&"float"));
+        assert_eq!(strip_type_marker("float func f() {"), "func f() {");
+        // **The other direction**, which matters as much: a word left here after
+        // the parser stopped accepting it goes on being stripped as a definition
+        // marker, so a header the parser reads as an ordinary command has its
+        // body quarantined. That is live rather than hypothetical — `any` is
+        // being retired, and without this the reader would keep claiming it.
+        for word in TYPE_MARKER_WORDS {
+            assert!(
+                *word == "float"
+                    || parser::ReturnType::ALL
+                        .iter()
+                        .any(|declared| declared.as_str() == *word),
+                "the reader claims `{word} func` as a definition header, but the \
+                 parser does not accept `{word}` as a type, so `{word}` is an \
+                 ordinary command word whose block is being quarantined"
+            );
+        }
+        // Contextual, as the parser's own test is: the word only comes off when
+        // a header follows it, so these keep every other meaning they have.
+        assert_eq!(strip_type_marker("job = 1"), "job = 1");
+        assert_eq!(strip_type_marker("job 5"), "job 5");
+        assert_eq!(strip_type_marker("job"), "job");
     }
 
     #[test]
