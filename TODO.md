@@ -5590,6 +5590,56 @@ entry records what each costs.
             knowing `any`.
       - [ ] Still open: whether a compound kind is writable at all (`list`, or a
             list of what).
+      - [x] **Branch disagreement is reported from the source.** `x = if $p { 7 }
+            else { "seven" }` now warns before either branch runs. This is the
+            one thing the declared-type check structurally cannot say: that check
+            reads the value a call produced, so it reports on the branch that ran
+            and is silent about the one that did not — `int func pick(p) { if $p
+            { 7 } else { "seven" } }` warns on the `false` run and not the `true`
+            one, so whether anything is wrong depends on the arguments.
+
+            **Only literal tails are compared**, which is what keeps it clear of
+            late binding: a branch ending in a call or a variable is skipped
+            rather than guessed at, since mesh resolves names at call time and a
+            check that needed to know what `f` returns would be wrong the moment
+            `f` was redefined. A bare word in value position is a *command*, so
+            only a quoted word is a `str` and a bare one counts only when it
+            reads as an int or a bool. Guards, `&&` chains and `&` are skipped
+            for the same reason — their value is a run-time fact.
+
+            It runs on the **value** path only, so a statement `if cmd { … }`,
+            whose branches are effects, never reaches it. Per evaluation rather
+            than once per site, matching the declared-type warning, which fires
+            per call rather than per definition.
+      - [ ] **The branch check reads kinds, not values, and two gaps follow from
+            that.** Both were raised in review and left deliberately, with the
+            reproductions here so neither has to be rediscovered:
+
+            - `return status (if $q { 1 } else { 2 })` is silent. The operand's
+              *kind* is `int`, but validating a status code needs its *value*,
+              and `literal_integer` reads a scalar rather than evaluating a
+              compound. A missed warning, not a wrong one.
+            - `1..=(if $q { 9223372036854775807 } else { … })` warns `list`
+              against a `str` branch, though counting one past the largest
+              integer overflows and the branch can only error. The direct
+              spelling `1..=9223372036854775807` is caught; seeing through the
+              compound needs the same value-level reading.
+
+            Closing either means the check starts computing values, which is a
+            different thing from reading kinds off syntax — worth deciding on
+            purpose rather than reaching for when a reviewer points at the next
+            spelling.
+      - [ ] **`match` arms are not compared, only `if` branches.** The two sit
+            next to each other in both evaluators — `Executable::Match` delegates
+            to `eval_match_expr` exactly as `Executable::If` delegates to
+            `eval_if_expr` — so `x = match $n { 1 => 1, _ => "many" }` has the
+            same certain disagreement and says nothing. Left out of the `if` work
+            deliberately rather than missed: an arm carries a **pattern** as well
+            as a body, so what a comparison should say about a `match` is a wider
+            question than repeating `literal_type` over the arm bodies, and
+            wiring it in without answering that would fix the shape rather than
+            the question. `literal_type` and `compound_type` are the pieces it
+            would reuse.
       - [ ] **A glob is not a first-class value outside a match operand**, which
             `glob func` now exposes. `Expr::Glob` is built only by match-operand
             parsing (`parser.rs:2860`, `:4884`), so in value position `*.rs` is a
