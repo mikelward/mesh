@@ -20,7 +20,10 @@ argument of record rather than as an open question, and it is written in the
 | `any func` | **`any func`** | argued as `any`; shipped first as **`value func`** — `any` "reads as a claim about a type system this deliberately is not", and `value` is the design's own word for the channel — then reversed back to `any`, because `value` is *also* `return`'s channel word: `return value func() { … }` read the marker as the channel and produced an untyped lambda in silence. Flagged in `TODO.md` under `Decisions needing review`; not yet confirmed |
 
 The vocabulary is a **closed set** — `status`, `int`, `str`, `bool`, `list`,
-`map`, `any` — with `float` reserved in the declaration position only. Where
+`map`, `job`, `any` — with `float` reserved in the declaration position only.
+`job` was added on the repo owner's decision, which also settled the rule that
+keeps the set closed: a kind joins **on use at a function boundary**, not on
+existing in the runtime. `any` is accepted but being retired. Where
 this document still weighs something about §5, it is weighing something that
 is **not** part of the accepted decision or not yet built.
 
@@ -1190,8 +1193,8 @@ With that correction, the four items:
 Costs, stated plainly:
 
 - **A vocabulary of type names becomes claimable in declaration position.**
-  `status`, `int`, `str`, `bool`, `list`, `map`, `any` and `float` have to be
-  recognized before `func`, contextually, the way `fork` is recognized only
+  `status`, `int`, `str`, `bool`, `list`, `map`, `job`, `any` and `float` have to
+  be recognized before `func`, contextually, the way `fork` is recognized only
   before a block — so `func int() { … }` stays a legal definition of a function
   named `int`. That is more surface than one `proc` would have claimed, and it
   is the main thing this option costs that the split does not.

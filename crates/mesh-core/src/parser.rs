@@ -837,17 +837,34 @@ pub enum ReturnType {
     Bool,
     List,
     Map,
-    /// `any func f()` — **a value channel of unstated kind.** Not a gap in the
-    /// vocabulary but a member of it: the closed set names the kinds a reader
-    /// writes, and mesh has values it deliberately does not name there — a job, a
-    /// styled string, an `Instant`, a `Duration`. A pass-through helper over any
-    /// of them (`func ident(x) { return $x }`) has no honest concrete type, since
-    /// what it returns is whatever it was handed, so this is the true answer
-    /// rather than an escape from having to give one.
+    /// `job func f()` — **a job**, the kind `$j`, `$j.status` and `$sh.jobs`
+    /// already carry. It earns its place on use rather than on existence, which
+    /// is the rule that keeps the set closed: a styled string, an `Instant` and a
+    /// `Duration` are values too, and each joins when a boundary wants to name
+    /// it, not before.
+    Job,
+    /// `any func f()` — a value channel of unstated kind. **Being retired**: the
+    /// migration reached for it as a blanket, and each site it covers has a true
+    /// type to state instead. Kept only until those sites are re-typed.
     Value,
 }
 
 impl ReturnType {
+    /// Every declarable type, so a second list of these words can be checked
+    /// against this one rather than trusted to stay in step. The reader's
+    /// `TYPE_MARKER_WORDS` is such a list — it works on raw text, before a token
+    /// exists, so it cannot ask this enum at run time and only a test pairs them.
+    pub const ALL: &'static [ReturnType] = &[
+        ReturnType::Status,
+        ReturnType::Int,
+        ReturnType::Str,
+        ReturnType::Bool,
+        ReturnType::List,
+        ReturnType::Map,
+        ReturnType::Job,
+        ReturnType::Value,
+    ];
+
     /// The word as written, for diagnostics and `help`.
     pub fn as_str(self) -> &'static str {
         match self {
@@ -857,6 +874,7 @@ impl ReturnType {
             ReturnType::Bool => "bool",
             ReturnType::List => "list",
             ReturnType::Map => "map",
+            ReturnType::Job => "job",
             ReturnType::Value => "any",
         }
     }
@@ -870,6 +888,7 @@ impl ReturnType {
             "bool" => Some(ReturnType::Bool),
             "list" => Some(ReturnType::List),
             "map" => Some(ReturnType::Map),
+            "job" => Some(ReturnType::Job),
             "any" => Some(ReturnType::Value),
             _ => None,
         }
@@ -8240,7 +8259,7 @@ mod tests {
             ("bool func f() { true }", ReturnType::Bool, false),
             ("list func f() { [1] }", ReturnType::List, false),
             ("map func f() { [a: 1] }", ReturnType::Map, false),
-            ("any func f() { 1 }", ReturnType::Value, false),
+            ("job func f() { $j }", ReturnType::Job, false),
             ("int wrapper func f(...xs) { 1 }", ReturnType::Int, true),
         ] {
             let tree = complete(source);

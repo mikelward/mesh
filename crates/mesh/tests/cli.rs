@@ -10001,7 +10001,7 @@ fn a_handle_reads_the_same_however_it_arrives() {
     // Both access forms, since indexing and member access are separate arms and
     // each needed teaching on its own.
     let out = run_with_input(
-        "j = sh -c 'sleep 0.2; exit 6' &\na = ($j).state\nputs a=$a\nany func ident(x) { return $x }\nb = ident($j).state\nputs b=$b\nsleep 0.5\nc = ($j).status\nputs c=$c\nd = ($sh.jobs[1]).state\nputs d=$d\n",
+        "j = sh -c 'sleep 0.2; exit 6' &\na = ($j).state\nputs a=$a\njob func ident(j) { return $j }\nb = ident($j).state\nputs b=$b\nsleep 0.5\nc = ($j).status\nputs c=$c\nd = ($sh.jobs[1]).state\nputs d=$d\n",
     );
     assert_eq!(
         String::from_utf8_lossy(&out.stdout),
@@ -10011,7 +10011,7 @@ fn a_handle_reads_the_same_however_it_arrives() {
     );
 
     let indexed = run_with_input(
-        "j = sh -c 'sleep 0.2; exit 6' &\na = ($j)[\"state\"]\nputs a=$a\nany func ident(x) { return $x }\nb = ident($j)[\"state\"]\nputs b=$b\nsleep 0.5\nc = ($j)[\"status\"]\nputs c=$c\n",
+        "j = sh -c 'sleep 0.2; exit 6' &\na = ($j)[\"state\"]\nputs a=$a\njob func ident(j) { return $j }\nb = ident($j)[\"state\"]\nputs b=$b\nsleep 0.5\nc = ($j)[\"status\"]\nputs c=$c\n",
     );
     assert_eq!(
         String::from_utf8_lossy(&indexed.stdout),

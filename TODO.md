@@ -17,9 +17,20 @@ Delete an entry once you have agreed with it or reversed it.
       available, and resetting a pinned merged branch is the one in-loop action
       autopilot is told to ask about. *Reversible:* the commits split cleanly at
       `bd7545d` if you would rather land the design alone.
-- [ ] **`value` was renamed to `any`, and this one genuinely needs your
-      confirmation** — the repo owner said "go with 1 for now, needs
-      confirmation later". *Why it was not a free choice:* `value` is `return`'s
+- [ ] **`any` is being retired — `job` replaced the case that motivated it.**
+      The repo owner did not want a top type and asked for `job` by name; `job`
+      is now in the vocabulary and the two job-returning sites declare it. What
+      remains is **221 `any func` sites in `crates/mesh/tests/cli.rs`**, each of
+      which has a concrete type to state instead. The cheap way to do it is to
+      land the declared-type check as a *warning* first and let it report the
+      actual kind flowing out of each site, turning the migration into a list
+      rather than 221 judgment calls. The sites that warn inconsistently are the
+      genuinely polymorphic ones, and that count is what decides whether `any`
+      can be deleted outright or whether the answer is type variables.
+
+      *Superseded — kept for the reasoning:* **`value` was renamed to `any`, and
+      this one genuinely needs your confirmation** — the repo owner said "go
+      with 1 for now, needs confirmation later". *Why it was not a free choice:* `value` is `return`'s
       channel word, so `return value func() { … }` silently produced an untyped
       lambda while `return str func() { … }` worked. Disambiguating by shape was
       the alternative — `channel_word` already declines when a `(` abuts, so a
@@ -5542,9 +5553,12 @@ before `func` is the slot `wrapper func` and `fork func` already use. The postfi
 entry records what each costs.
 
 - [x] **The type vocabulary is `status`, `int`, `str`, `bool`, `list`, `map`,
-      `any`** — *(landed — `ReturnType` in `parser.rs`, closed at exactly this
-      set; the sub-items below record what each one cost. `any` was spelled
-      `value` until the narrowing landed — see the rename below.)*
+      `job`, `any`** — *(landed — `ReturnType` in `parser.rs`, closed at exactly
+      this set; the sub-items below record what each one cost. `any` was spelled
+      `value` until the narrowing landed — see the rename below — and is now
+      being retired in favor of the concrete kinds. `job` joined on the repo
+      owner's decision, which also fixed the rule: a kind joins **on use at a
+      function boundary**, not on existing in the runtime.)*
       short forms, since `int` is already the language's word (`:int` parses one)
       and `string` would be the odd one out beside it. The prefix form recognizes
       `WORD func NAME (`, so the parser needs this set closed up front; the
@@ -5585,9 +5599,15 @@ entry records what each costs.
             knowing `any`.
       - [ ] Still open: whether a compound kind is writable at all (`list`, or a
             list of what).
-      - [ ] **Open decision: is there a `job` type — and if not, why is `any`
-            the answer?** Asked directly by the repo owner, twice, and not
-            actually settled either time. A **job is a real value kind**: `$j`
+      - [x] **Decided: there is a `job` type.** Asked directly by the repo owner
+            three times; added on the third. The rule it settles is that a kind
+            joins **on use at a function boundary**, not on existing in the
+            runtime — so a styled string, an `Instant` and a `Duration` stay out
+            until something declares one, and the set stays closed. `any` is
+            retired on the back of it, once the sites that reached for it are
+            re-typed. The reasoning that had kept it out follows, unchanged.
+
+            A **job is a real value kind**: `$j`
             is one, `$j.status` reads it, and `$sh.jobs` is a map of job
             records, so `job func find-server()` is a sentence someone could
             reasonably want to write. Leaving it out means such a function
@@ -5868,7 +5888,7 @@ once there is a type vocabulary in the language to reason with.
 
 **How the current proposal works, in one paragraph.** A `func` may declare a
 return type drawn from a closed set (`status`, `int`, `str`, `bool`, `list`,
-`map`, `any`, with `float` reserved). Declaring none means no value channel: the result
+`map`, `job`, `any`, with `float` reserved). Declaring none means no value channel: the result
 is a `Status`, and the body's last expression stops being its value. The type
 rides on the definition, so `help` can print it and a caller can read it without
 opening the body.

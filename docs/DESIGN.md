@@ -6815,8 +6815,8 @@ to avoid" rather than promising the latter as done.
   (declare a type, or stop taking the value). Per the table above that check is a
   runtime one.
 
-  **The vocabulary is `status`, `int`, `str`, `bool`, `list`, `map`, `any`, and
-  `float` is reserved.** Short forms throughout: `int` is already the language's word
+  **The vocabulary is `status`, `int`, `str`, `bool`, `list`, `map`, `job`,
+  `any`, and `float` is reserved.** Short forms throughout: `int` is already the language's word
   (`:int` parses one), so `str` follows it and `string` would be the odd one out
   beside it. **`float` is reserved now and not implemented** — `f64` exists as a
   value ([Arithmetic](#arithmetic)), but declaring one is later work, and claiming
@@ -6829,8 +6829,19 @@ to avoid" rather than promising the latter as done.
   Adding the type later may still invalidate scripts written against its absence,
   and that is accepted.
 
-  **`any` is a member of the set, not an escape from it** *(decided; trying the
-  migration is what settled it)*. The closed set names the kinds a reader writes,
+  **`job` is in the set, and `any` is being retired** *(decided by the repo
+  owner, who asked for `job` directly and did not want the top type)*. A job is a
+  real value kind — `$j`, `$j.status`, `$sh.jobs` — so `job func find-server()`
+  is the sentence to write, and it settles the boundary question the closed set
+  posed: a kind joins **on use at a function boundary**, not on existing in the
+  runtime, which is what keeps a styled string, an `Instant` and a `Duration`
+  out until something declares one. `any` survives only until the sites that
+  reached for it are re-typed; each has a true type to state instead.
+
+  The original argument for it is kept below rather than overwritten, because it
+  is what the reversal is against.
+
+  **`any` was a member of the set, not an escape from it** *(superseded)*. The closed set names the kinds a reader writes,
   and mesh has values it deliberately does not name there — a job, a styled
   string, an `Instant`, a `Duration`. Working the narrowing through the test suite
   turned up `func ident(x) { return $x }` handed a **job**, which no concrete
