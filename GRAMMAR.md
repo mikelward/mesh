@@ -589,9 +589,10 @@ value — `func func make-adder(n)` doubles the word, the first being the type a
 the second the keyword, told apart by shape. A kind
 joins the set **on use at a function boundary**, not on existing in the runtime,
 which is what keeps a styled string and an `Instant` out until something
-declares one. `any` is still accepted and is being retired — it says only that
-there is a value channel, and the sites that reached for it each have a
-concrete type to state instead.
+declares one. `any` says only that there is a value channel. It is kept mostly
+for a function whose kind is not what the code is about, and is still the sole
+spelling for a glob, a stream handle, a flag or the flag terminator, none of
+which has a word yet.
 
 Parameters are comma-separated, and the comma is required between two of them
 with no trailing one allowed: `func f(a b)` and `func f(a,)` are both errors.

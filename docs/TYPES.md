@@ -17,13 +17,14 @@ argument of record rather than as an open question, and it is written in the
 | §5 argued | Shipped | Why |
 |---|---|---|
 | `string func` | **`str func`** | short forms throughout, since `int` is already the language's word |
-| `any func` | **`any func`** | argued as `any`; shipped first as **`value func`** — `any` "reads as a claim about a type system this deliberately is not", and `value` is the design's own word for the channel — then reversed back to `any`, because `value` is *also* `return`'s channel word: `return value func() { … }` read the marker as the channel and produced an untyped lambda in silence. Flagged in `TODO.md` under `Decisions needing review`; not yet confirmed |
+| `any func` | **`any func`** | argued as `any`; shipped first as **`value func`** — `any` "reads as a claim about a type system this deliberately is not", and `value` is the design's own word for the channel — then reversed back to `any`, because `value` is *also* `return`'s channel word: `return value func() { … }` read the marker as the channel and produced an untyped lambda in silence. Confirmed by the repo owner: `any` is **kept**. `job`, `regex` and `func` took away the gap-filling for every previously unnameable kind the declared-type harvest observed, so its main use is now "a value channel, kind not the point" — but it is still the only way to declare a glob, a stream handle, a flag or the flag terminator, and the only honest answer for a polymorphic identity function |
 
 The vocabulary is a **closed set** — `status`, `int`, `str`, `bool`, `list`,
 `map`, `job`, `regex`, `func`, `any` — with `float` reserved in the declaration position only.
 `job` was added on the repo owner's decision, which also settled the rule that
 keeps the set closed: a kind joins **on use at a function boundary**, not on
-existing in the runtime. `any` is accepted but being retired. Where
+existing in the runtime. `any` is kept, for a value channel whose kind is not
+the point. Where
 this document still weighs something about §5, it is weighing something that
 is **not** part of the accepted decision or not yet built.
 

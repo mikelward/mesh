@@ -853,9 +853,19 @@ pub enum ReturnType {
     /// apart by shape (`WORD func NAME (`) exactly as it does for every other
     /// type word.
     Func,
-    /// `any func f()` — a value channel of unstated kind. **Being retired**: the
-    /// migration reached for it as a blanket, and each site it covers has a true
-    /// type to state instead. Kept only until those sites are re-typed.
+    /// `any func f()` — **a value channel whose kind is not the point.** Kept,
+    /// on the repo owner's decision, and it means less than it used to: every
+    /// kind the declared-type harvest saw flowing out of one — a job, a regex, a
+    /// function value — now has a word, so this is no longer where *those* gaps
+    /// hid. It is still the only way to declare a glob, a stream handle, a flag
+    /// or the flag terminator — all four returnable, none with a word. The first
+    /// two wait on the joining rule; the flag kinds wait on whether `Flag`
+    /// survives at all (`docs/TYPES.md` §8), since a word would settle that.
+    ///
+    /// What is left besides that is the honest case — a function, and especially
+    /// a test fixture, that needs a value channel and is not about the type
+    /// flowing through it. Declaring a concrete kind there would assert
+    /// something the code was never checking.
     Value,
 }
 

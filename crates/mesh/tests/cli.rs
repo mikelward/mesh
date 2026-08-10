@@ -34254,9 +34254,10 @@ fn an_honest_declaration_is_silent() {
     );
 }
 
-/// `any` accepts every kind, which is what makes it the top type — and what its
-/// retirement is about. A **typeless** func is silent for a different reason:
-/// it has no value channel, so there is no declaration to disagree with.
+/// `any` accepts every kind, which is what makes it the top type and why it is
+/// kept: a value channel whose kind is not the point. A **typeless** func is
+/// silent for a different reason — it has no value channel at all, so there is
+/// no declaration to disagree with.
 #[test]
 fn the_top_type_and_a_typeless_func_never_warn() {
     let out = run_with_input(

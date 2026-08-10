@@ -17,44 +17,6 @@ Delete an entry once you have agreed with it or reversed it.
       available, and resetting a pinned merged branch is the one in-loop action
       autopilot is told to ask about. *Reversible:* the commits split cleanly at
       `bd7545d` if you would rather land the design alone.
-- [ ] **`any` is being retired — `job` replaced the case that motivated it.**
-      The repo owner did not want a top type and asked for `job` by name; `job`
-      is now in the vocabulary and the two job-returning sites declare it. What
-      remains is **221 `any func` sites in `crates/mesh/tests/cli.rs`**, each of
-      which has a concrete type to state instead. The cheap way to do it is to
-      land the declared-type check as a *warning* first and let it report the
-      actual kind flowing out of each site, turning the migration into a list
-      rather than 221 judgment calls. The sites that warn inconsistently are the
-      genuinely polymorphic ones, and that count is what decides whether `any`
-      can be deleted outright or whether the answer is type variables.
-
-      *Superseded — kept for the reasoning:* **`value` was renamed to `any`, and
-      this one genuinely needs your confirmation** — the repo owner said "go
-      with 1 for now, needs confirmation later". *Why it was not a free choice:* `value` is `return`'s
-      channel word, so `return value func() { … }` silently produced an untyped
-      lambda while `return str func() { … }` worked. Disambiguating by shape was
-      the alternative — `channel_word` already declines when a `(` abuts, so a
-      second special case would fit — but that spends a rule to keep a word we
-      would rather not have picked. *Reversible:* it is `ReturnType::from_word`,
-      `as_str`, `TYPE_MARKER_WORDS`, the grammar and design lines, and whatever
-      has been written against it by then — which is why doing it now was
-      cheaper than later.
-
-      *`docs/TYPES.md` was migrated with the rest, and the first read of it
-      here was wrong.* It landed on `main` as `2f0eadf` while this branch was
-      in review, and its title — "options for a simpler end state" — reads as a
-      proposal, which is how it was first classified and waved past. Its header
-      says the opposite: "**§5 (L3) went first and has landed**", written in
-      the "**shipped spellings**", with a table recording `value func` as the
-      shipped one and `any` as rejected, a closed set naming `value`, and
-      "the narrowing itself … is not enforced yet". All three are false after
-      this branch, so it is documentation of shipped state and migrates on the
-      same rule as every other doc here. Codex caught the misread; the docs
-      suite could not, because `is_design_document` excludes `TYPES.md` exactly
-      as it excludes `DESIGN.md`. The `§5 argued / Shipped` row keeps your
-      original reasoning verbatim — `any` "reads as a claim about a type system
-      this deliberately is not" — and records the reversal against it rather
-      than overwriting it, because that is the call still open here.
 - [ ] **Type words stay contextual — they are *not* becoming reserved words.**
       Raised directly by the repo owner ("make them reserved words if it's useful
       for simplicity") and decided here on the "if". `typed_definition_lead`
@@ -5581,10 +5543,12 @@ entry records what each costs.
 - [x] **The type vocabulary is `status`, `int`, `str`, `bool`, `list`, `map`,
       `job`, `regex`, `func`, `any`** — *(landed — `ReturnType` in `parser.rs`, closed at exactly
       this set; the sub-items below record what each one cost. `any` was spelled
-      `value` until the narrowing landed — see the rename below — and is now
-      being retired in favor of the concrete kinds. `job` joined on the repo
-      owner's decision, which also fixed the rule: a kind joins **on use at a
-      function boundary**, not on existing in the runtime.)*
+      `value` until the narrowing landed — see the rename below — and is **kept**,
+      on the repo owner's decision, for a value channel whose kind is not the
+      point; the concrete kinds took away the gap-filling it had also been doing,
+      not the word itself. `job` joined on the repo owner's decision, which also
+      fixed the rule: a kind joins **on use at a function boundary**, not on
+      existing in the runtime.)*
       short forms, since `int` is already the language's word (`:int` parses one)
       and `string` would be the odd one out beside it. The prefix form recognizes
       `WORD func NAME (`, so the parser needs this set closed up front; the
@@ -5613,8 +5577,9 @@ entry records what each costs.
             no `job` in the vocabulary and none wanted. No concrete spelling fits
             an identity function — what it returns is whatever it was given — so
             this is the true answer rather than an escape from giving one.
-      - [x] **Renamed `value` to `any`.** *(done — needs confirmation, see
-            `Decisions needing review`.)* The argument that decided it is
+      - [x] **Renamed `value` to `any`.** *(done, and confirmed: the repo owner
+            kept `any` — see the decision recorded below.)* The argument that
+            decided it is
             structural rather than stylistic: **`value` is already `return`'s
             channel word**, so `return value func() { … }` parsed the marker as
             the channel and handed back an *untyped* lambda. `return str func()`
@@ -5625,13 +5590,82 @@ entry records what each costs.
             knowing `any`.
       - [ ] Still open: whether a compound kind is writable at all (`list`, or a
             list of what).
+      - [x] **Decided: `any` is kept.** The repo owner asked for it to go, then
+            kept it once the cost was measured. It had been doing two jobs and
+            only one was bad — standing in for kinds the vocabulary could not
+            name, and saying "a value channel, kind not the point". `job`,
+            `regex` and `func` took the first away for every kind the harvest
+            saw, so that is no longer where those gaps hide; the second is
+            honest and is what it now means. A glob, a stream handle, a flag
+            and the flag terminator still have no word, and all four are
+            returnable. The first two wait on the joining rule — no boundary has
+            declared one — and the flag kinds wait on whether `Flag` survives at
+            all, which a word would settle sideways.
+
+            *The counts, with the method, because they are the argument.*
+            Counting the word `any`, an optional `wrapper`, then the keyword
+            `func`, on real word boundaries and excluding Rust comment lines:
+            **247 declarations** in `crates/mesh/tests/cli.rs` — 196 named, 51
+            anonymous lambdas, across 82 distinct names. One further match is
+            excluded and is worth naming: `cli.rs:22257` holds
+            `` `any func(x) { glob($x) }` `` inside an *expected diagnostic*, so
+            it is a suggestion the shell prints rather than source the shell
+            runs. Backticks are the tell — a declaration quoted inside them is
+            prose, and it is the only such match in the file.
+
+            Two traps, both of which caught earlier drafts of this entry, and
+            both arising because the fixtures are *mesh source inside Rust string
+            literals*. A word boundary in the Rust text is not one in the mesh
+            text: 16 declarations are written `\nany func`, where the `n` of the
+            escape sits against `any`, so a plain `\b` or a "no word character
+            before" rule drops every one of them. And a declaration is anonymous
+            exactly when `func` is followed immediately by `(` — an
+            identifier-shaped name pattern instead reads the five modifier
+            declarations (`func ..._xs:oxford(_sep)`, whose name starts with a
+            dot) as lambdas.
+
+            *Two other counts, and why each is wrong, since both look
+            authoritative.* `grep -o 'any func'` says **252**: it counts the 8
+            mentions in Rust comments, which are prose, *and* misses the 4
+            `any wrapper func` declarations, whose text is not `any func` — two
+            errors that partly cancel and leave it 4 above the truth
+            (252 − 8 comment mentions − 1 quoted diagnostic + 4 wrapper
+            declarations = 247). A word-boundary regex says **232**, dropping the 16
+            escaped-newline declarations described above. An earlier draft here
+            explained the 252 as substring matches inside `many func…` and
+            `any funcy`; the file contains neither, and that explanation was
+            guessed rather than checked.
+
+            Of those, **15** have a literal body a reader can classify on
+            sight, and **36 names** are unambiguous through the declared-type
+            harvest — one observed kind, declared exactly once, so one
+            occurrence each. Even assuming no overlap between the two, they
+            cover at most 51, leaving **at least 197** that need a human read;
+            any overlap leaves more. (Both buckets were recomputed when the
+            total was corrected, rather than the subtraction alone — an earlier
+            draft carried forward a remainder derived from the old total, which
+            understated the work.) Roughly two-thirds of all
+            sites never execute, so a wrong guess there is silent, and
+            per-*definition* ground truth is unavailable: the harvest keys on
+            names and `f` alone is 54 distinct definitions, while `FuncDef`
+            carries no span.
+
+            *What decided it:* most of those fixtures need a value channel and
+            are testing something else. Declaring `int` there asserts something
+            the test never checked. A top type that names a real case beats a
+            concrete one that is quietly false.
       - [x] **Decided: there is a `job` type.** Asked directly by the repo owner
             three times; added on the third. The rule it settles is that a kind
             joins **on use at a function boundary**, not on existing in the
             runtime — so a styled string, an `Instant` and a `Duration` stay out
-            until something declares one, and the set stays closed. `any` is
-            retired on the back of it, once the sites that reached for it are
-            re-typed. The reasoning that had kept it out follows, unchanged.
+            until something declares one, and the set stays closed. `regex` and
+            `func` joined on that same rule afterwards, which between them took
+            away every *previously unnameable kind the declared-type harvest
+            observed*. Not every case `any` covers: a glob, a stream handle, a
+            flag and the flag terminator still have no word, and a polymorphic
+            identity function still wants `any` because no concrete kind is true
+            of it. The reasoning that had
+            kept `job` out follows, unchanged.
 
             A **job is a real value kind**: `$j`
             is one, `$j.status` reads it, and `$sh.jobs` is a map of job
@@ -8737,7 +8771,8 @@ a one-line edit. Every claim below was checked against the built shell.
       channel", and the parser, `type`, `help` and the lambda path are built.
       The shipped spellings are `str` and `any`; this entry argued `string`
       and `any`, so only the first differs — `value` shipped briefly in between
-      and was reversed, see `Decisions needing review`. What remains open here is the *rest* of the menu —
+      and was reversed; `any` is settled and kept — see the decision recorded
+      with the type vocabulary. What remains open here is the *rest* of the menu —
       B, C, and the §5 consequences nobody has built: the slot checks, a return
       type per builtin, and the migration diagnostic. The argument, as it
       stood: the
