@@ -2016,9 +2016,11 @@ hyphen between — the third payoff of that one spacing rule.
   mistaken for each other because each turns up where a value was wanted and none
   arrived, so the sort is by *what question each one answers*:
 
-  - **`false` is what *encodes* absence** — mesh's ["no result"](#functions):
-    what `gets()` yields at EOF, and the one value an `if x = f()` presence-bind
-    treats as nothing-there. `""`, `[]` and `0` all bind and take the branch; a
+  - **`false` is what *encodes* absence** — mesh's ["no result"](#functions), and
+    the one value an `if x = f()` presence-bind treats as nothing-there.
+    (**Stream reads are the exception, decided separately**: `gets()` at EOF
+    answers [`status(1)`](#open-questions), not `false`, so the one place the
+    encoding was load-bearing no longer uses it.) `""`, `[]` and `0` all bind and take the branch; a
     nonzero `Status` takes `else` but still binds, being a result rather than an
     absence. The encoding is **contextual, not a property of the value**: a
     `bool func` answers `false` as a complete result, and `:filter` reads it as
@@ -2046,9 +2048,12 @@ hyphen between — the third payoff of that one spacing rule.
     not. That one is left open where it is analyzed
     ([Open questions](#open-questions)), not decided here.
 
-  Stated once, the rule those three obey: **absence is spelled `false`;
-  everything else is a value.** `status(0)` obeys it, which is why the live question is the
-  empty string and not the status — see [Open questions](#open-questions).
+  Stated once, the rule those three obey: **absence is spelled `false` where the
+  operation *asks* and a nonzero `Status` where it *reads*; everything else is a
+  value.** `status(0)` is on the "everything else" side of that — it is success,
+  never absence — which is why the live question is the empty string and not the
+  status. See [Open questions](#open-questions) for both halves: the `""` question,
+  and the stream-absence decision that put the second clause there.
 
   The residual cost on the status side is a lost *diagnostic*, not a null: with
   every call yielding a value, `:map(&puts)` produces a list of `Status(0)` where
@@ -3193,8 +3198,15 @@ $line:match(/\d+\.\d+\.\d+\.\d+/)` pulls an address out of the middle of a line;
   ```
 
   As a *condition*, `lhs = rhs` is true iff the RHS is **truthy** (a `false` — the
-  no-match, or `gets()` at EOF — fails it) **and** its shape fits `lhs`; on true the
-  names bind for the block, on false it skips and binds nothing. A shape mismatch in
+  no-match — fails it, as does a nonzero `Status`, which is what
+  [`gets()` answers at EOF](#open-questions)) **and** its shape fits `lhs`; on true the
+  names bind for the block. On a `false` or a shape miss it skips and binds
+  nothing — but a **nonzero `Status` still binds** while taking the false path,
+  being a result rather than an absence
+  ([Tests and comparisons](#tests-and-comparisons)), so a read loop's binding is
+  left holding the EOF status. That is for a **name-shaped `lhs`**; a
+  destructuring pattern the status cannot fit is an ordinary shape miss and binds
+  nothing, so `if [x] = gets() { … }` leaves `x` alone. A shape mismatch in
   the condition (`[a b]` against a three-element list) is a **soft false → skip** —
   deliberately unlike the bare statement below. This isn't regex-specific:
   `if line = gets() { … }` falls out of the same rule. The longer
@@ -3492,10 +3504,11 @@ Rules:
   `Status(n)` — which projects to its own `n`, so `fail 123` and
   `return status 123` both leave 123. The invariant below is otherwise unchanged:
   what that decision adds is a second value that can carry a failure, not a
-  reason for any other value to.)* `false` is mesh's "no result" — what `gets()`
-  yields at
-  EOF, what a failing predicate returns, what `if x = f() { … }` tests for — so it
-  is the one value whose status is worth reporting as nonzero. Every other value
+  reason for any other value to.)* `false` is mesh's "no result" — what a failing
+  predicate returns, what `if x = f() { … }` tests for — so it
+  is the one value whose status is worth reporting as nonzero. *(A **stream** read
+  with nothing left answers [`status(1)`](#open-questions) rather than `false`,
+  decided separately; the status is the same `1` either way.)* Every other value
   *is* a result, and producing a result is success, which is why `return 5` carries
   the integer five with status `0` rather than claiming exit code 5. A returned
   string, list, map or zero is likewise a success.
@@ -4163,7 +4176,12 @@ Decisions:
   command / nonzero `Status` fails it — *a nonzero **int** does not, under the
   [status decision](#open-questions), since `return 5` is data with status `0`*)
   **and** its shape **fits** `lhs`; on true the
-  names bind for the block, on false it skips and binds nothing. `lhs` may be a
+  names bind for the block. On a `false` or a shape miss it skips and binds
+  nothing; a **nonzero `Status` still binds** while taking the false path, being a
+  result rather than an absence — so at EOF `if line = gets() { … }` skips *and*
+  leaves `line` holding the [`status(1)`](#open-questions). That binding needs a
+  **name-shaped `lhs`**: a pattern the status cannot fit is a shape miss like any
+  other, so `if [x] = gets() { … }` binds nothing. `lhs` may be a
   name (always fits) or a `[…]` [destructuring](#destructuring) pattern, so
   `if [one two] = $s:match(/…/) { … }` and `if line = gets() { … }` both test-and-bind
   in one step, RHS written once. Crucially, **pattern-fit is part of the test**: a
@@ -4914,7 +4932,7 @@ construct you write* is how you declare whether absence is a bug or expected:
 | a captured group | `[x] = s:match(/re/)` | `if [x] = s:match(/re/) { … }` |
 | index an element | `$xs[i]` | `$xs:get(i, default)` — total, never errors |
 | a map value | `$m.key` | `$m:get(key, default)` |
-| read a line | — | `gets()` → `false` at EOF |
+| read a line | — | `gets()` → [`status(1)`](#open-questions) at EOF |
 | a branch's value | — | `if cond { v }` → `""` when false |
 
 So absence is loud when you **asserted** the value is there (a bare bind, a direct
@@ -4930,8 +4948,9 @@ both "empty" and "absent."
 
 **`if` with no `else` is a soft form, not a suppressed error.** A false condition
 is a normal outcome, not a failure, so `tag = if $root { "[root]" }` yielding `""`
-when not root is the *soft channel producing the "nothing" value* — exactly
-parallel to `gets()` producing `false` — and is consistent with fail-loud, which
+when not root is the *soft channel producing the "nothing" value* — the same shape
+as a read that has nothing left, which answers
+[`status(1)`](#open-questions) — and is consistent with fail-loud, which
 governs only *required* positions. The residual edge is stated honestly: `""`-as-
 nothing is indistinguishable from a real empty string and flows downstream under
 [no-null](#variables-and-assignment), so a no-`else` `if` hands you a silent empty
@@ -5483,11 +5502,15 @@ programs or user functions:
     lines and hand-built prompts. The `puts` / `print` pair replaces `echo -n`,
     keeping both flag-free.
   - **`gets [--nulls] [var]`** — read one line from stdin into `var` (trailing newline
-    stripped) and return that line as its value. **At EOF it returns `false`**
-    (whose [status](#variables-and-assignment) is `1`) and leaves `var` unchanged,
-    so `while gets line { … }` terminates. An empty line still reads as a truthy
-    `""` — only EOF is `false` — so blank lines don't end the loop. With no `var`
-    it just yields the line (or `false`). **`--nulls` reads a NUL-terminated item
+    stripped) and return that line as its value. **At EOF it returns
+    [`status(1)`](#open-questions)** and leaves `var` unchanged, so
+    `while gets line { … }` terminates. An empty line still reads as a truthy
+    `""` — only EOF ends the loop — so blank lines don't end it. With no `var`
+    it just yields the line (or that `status(1)`). *(Decided, not yet built: the
+    code returns `false` at EOF today. The status carries the same `1`, so the
+    loop terminates identically; what changes is that `false` stops meaning "no
+    result" — and that `line = gets()` **binds** the status at EOF where the
+    `false` did not.)* **`--nulls` reads a NUL-terminated item
     instead** — the read a `find -print0` stream needs, where a newline inside a name
     is data and a line read would tear the name in half. The separator is *named*
     rather than passed as a character because `\0` is deliberately not one of the
@@ -6800,7 +6823,7 @@ to avoid" rather than promising the latter as done.
   | Check | Where | Needs |
   | --- | --- | --- |
   | `return $v` in a func declaring no type | parse | the declaration and the body — nothing else |
-  | a body whose tail is a command, in a func declaring a type **a `Status` does not satisfy** | parse | the same; a command's result is a `Status(n)`, so it is right for a declared `status` and wrong only for `int`, `str`, and the rest |
+  | a body whose tail is a command, in a func declaring **any type but `status`** | parse | the same; a command's result is a `Status(n)`, so it is right for a declared `status` and wrong for `int`, `str`, and the rest. *(Phrased on the declared **word**, not on type satisfaction — under the [`T | Status(n≠0)` widening](#open-questions) a satisfaction test would fire for a **successful** command tail and let a **failing** one through, which is erratic rather than merely wrong.)* |
   | `return "hi"` against a declared `int` | parse | the same, *and only where the operand is a literal* |
   | `x = f()` where `f` declares no type | run | the callee — see the resolver limit above |
   | a typeless lambda assigned to a value-taking hook slot | dispatch | the slot's declared kind |
@@ -6984,7 +7007,10 @@ to avoid" rather than promising the latter as done.
     checking — so it is named here rather than assumed. `TODO.md` carries the
     exploration.
   - **The nullable encoding.** `false | T` is a real and useful duality
-    ([above](#functions)); how a declaration spells it is unaddressed.
+    ([above](#functions)); how a declaration spells it is unaddressed — and that
+    unaddressed spelling turns out to be the sharpest argument in the
+    [stream-absence question](#open-questions) below, which asks whether the
+    duality should be carried by a `Status` instead.
 
   ---
 
@@ -7328,7 +7354,7 @@ to avoid" rather than promising the latter as done.
   | **Leave it lenient** (today) | The terse one-liner survives; nothing to migrate | Keeps both manufactured silent empties — the no-`else` `if` and the unmatched `match` — in the language whose pitch is that absence is loud |
   | **Require `else` wherever the value is used** | Closes the `if` half of it — the `match` half needs the totality question answered the same way | "Wherever the value is used" includes func tails, `match` arms and `for` bodies, so it fires far beyond the case it was aimed at, and breaks the documented prompt-segment idiom |
   | **Require `else` in binding position only** | Narrow, syntactic, and checkable at parse time | Already weighed and declined once under [Error handling](#error-handling); and it misses the func-tail case, so it buys explicitness without closing the hole |
-  | **Yield `false` instead of `""`** | The only option that changes the *value*, so the only one that closes the hole the *what it buys* paragraph below concedes the others leave open: `""` stops standing for both "empty" and "absent", `if tag = if $root { "[root]" } { … }` becomes a real presence test (today it always takes the branch), and the gap joins `gets()` on the one absent value the language already has — no new type, no null. [Error handling](#error-handling) already calls the no-`else` `if` "exactly parallel to `gets()` producing `false`"; this is that parallel taken literally | `false` renders as the text `false`, so `"$tag"` reads `false` rather than nothing — the terse tag idiom breaks loudly instead of quietly. The [prompt-segment idiom](INTRO.md) needs its "empties dropped" rule to become "absent dropped". And it does not stop a value being manufactured on an unwritten path, it changes which one: an author who wanted `""` now writes `else { "" }`. **Nor is it value-only** — `false` is the [one value that fails](#functions), so wherever the gap's value projects to a status the omitted branch starts reporting failure: a typed `func` tailing in one answers nonzero, and a `… \|\| fallback` chained off that answer runs the fallback where `""` left it alone. Either that is accepted as correct — an unwritten branch *did* produce no result — or the gap's `false` is exempted from the projection, which splits `false` into two kinds and hands back the single absent value the option exists to reach |
+  | **Yield `false` instead of `""`** | The only option that changes the *value*, so the only one that closes the hole the *what it buys* paragraph below concedes the others leave open: `""` stops standing for both "empty" and "absent", `if tag = if $root { "[root]" } { … }` becomes a real presence test (today it always takes the branch), and the gap gets the spelling the [ask/read rule](#open-questions) gives it — no new type, no null. That rule is what carries this row now: a failed condition is an **ask** answered no, and `false` is what an ask spells absence with. *(An earlier draft argued instead that the gap would "join `gets()`" on a single absent value. The [stream-absence decision](#open-questions) retired that: `gets()` at EOF answers `status(1)`, so `false` in the gap agrees with the rule rather than with `gets()`, and two spellings coexist by design instead of one being unified.)* | `false` renders as the text `false`, so `"$tag"` reads `false` rather than nothing — the terse tag idiom breaks loudly instead of quietly. The [prompt-segment idiom](INTRO.md) needs its "empties dropped" rule to become "absent dropped". And it does not stop a value being manufactured on an unwritten path, it changes which one: an author who wanted `""` now writes `else { "" }`. **Nor is it value-only** — `false` is the [one value that fails](#functions), so wherever the gap's value projects to a status the omitted branch starts reporting failure: a typed `func` tailing in one answers nonzero, and a `… \|\| fallback` chained off that answer runs the fallback where `""` left it alone. Either that is accepted as correct — an unwritten branch *did* produce no result — or the gap's `false` is exempted from the projection, which splits `false` into two kinds and hands back the single absent value the option exists to reach |
   | **Make `""` false** | Touches no construct at all: the gap goes on yielding `""`, so the terse tag idiom, the [prompt segment](INTRO.md) and every hand-written `else { "" }` survive unchanged. **At the stronger of the two strengths below** it collapses the three to two *for conditions* — ordinary and presence alike — and makes the gap testable in any condition it already reaches; the [status projection](#functions) still tells `""` from `false` unless the third dial is turned too, so what collapses is the condition behavior rather than the values. At the weaker strength `""` is only a newly falsy value that stays *present* in a bind, so the three stay distinct and the payoff is the explicit `if $tag { … }` alone. It is also the shell-native reading — in POSIX, `[ -z "$x" ]` and an unset name are near-interchangeable — and Python, JavaScript and Perl all take it | Reopens [truthiness](#conditionals-if-is-an-expression), settled and shipped as *no truthy values* — `if "" { … }` is an error today naming the comparison to write, and a falsy `""` makes `if $x` legal for a string, putting `"0"` and `"false"` back on the table with the three disagreeing rules that section retired. And it negates the principle the two-arg `$xs:get(i, default)` was reasoned from — *don't let one value stand in for both "empty" and "absent"* — so where the row above gives that distinction up **in the gap**, this gives it up **language-wide**. (`:get` itself survives, its bounds check being internal; what goes is every test written *on* the value it hands back.) **What it costs past that depends on how far it reaches**, and only the stronger of its two strengths touches `gets()` — below the table |
 
   **What it buys is smaller than it first looks.**
@@ -7348,9 +7374,12 @@ to avoid" rather than promising the latter as done.
   to the three above it so much as the question they never ask, and both axes can
   be taken at once — require `else` in binding position *and* yield `false`
   elsewhere. What recommends it is the [absence rule](#variables-and-assignment):
-  `false` is already how the language spells absence, so a gap that yields it
-  agrees with `gets()` and with presence-binding instead of minting a second
-  answer. It
+  `false` is how the language spells absence **for an operation that asks**, and a
+  failed condition is exactly that, so a gap yielding it agrees with the rule and
+  with presence-binding instead of minting a third answer. It does *not* agree
+  with `gets()` any more — that reads, so it answers `status(1)` under the
+  [stream-absence decision](#open-questions) — and this row no longer claims it
+  does. It
   carries the same coupling as everything else here — whatever `if` does, an
   unmatched `match` does. The valueless `func` body is not dragged along: that
   producer is already the *asking* half of the
@@ -7413,10 +7442,10 @@ to avoid" rather than promising the latter as done.
   value-falsity altogether, failing only on a nonzero `Status`; that costs the
   `false | T` encoding everywhere else, since `if m = lookup(k) { … }` would then
   take the branch with `m` bound to `false`. (Whether `gets()` should answer EOF
-  with a `Status` on its own merits is a separate question, and it does not buy a
-  read-error distinction: a failed read is already a **runtime error** — channel
-  two, fail-loud — so a clean end and a failure are distinguishable today, with
-  `false` marking only the clean one.)
+  with a `Status` on its own merits was a separate question, and is now
+  [decided that way](#open-questions) — which does not change this analysis: a
+  read at EOF fails the presence-bind either way, so it is still the *blank line*
+  that a falsy `""` would stop the loop on.)
 
   **Independent of the flat soft bind above.** That construct is unambiguous with
   a distinct fallback word whether or not this changes, so the two should not be
@@ -7425,6 +7454,152 @@ to avoid" rather than promising the latter as done.
   *would* also disambiguate a fallback spelled `else` — that is why it appears in
   the other entry's list of ways out — but it should stand or fall on the `""`
   question alone.
+- **Stream absence is a `Status` — decided, not yet built.** A stream read that
+  has nothing left answers **`status(1)`**, not `false`. `gets()` at EOF is the
+  case. [The absence rule](#variables-and-assignment) narrowed `false` to what
+  *encodes* absence rather than what absence is, because the same value is also a
+  predicate's complete answer and nothing can tell the two apart; this takes the
+  encoding off `false` where the encoding was actually load-bearing.
+
+  **The scope is narrow, and that is the first thing to say.** The
+  [strict/soft pairs](#error-handling) mean absence is normally not *returned* at
+  all: `$m.key` errors, `$m:get(k, d)` takes a default, `:has` asks. A sentinel
+  survives only where you cannot ask ahead — a **stream read**, where "is there
+  another line?" is answerable only by reading it. [`gets()`](#built-ins) is that
+  case.
+
+  **It is not the only `T | false` producer, and the line between them is worth
+  stating.** [`:match`](#modifiers) answers `false` on a miss, and a caller who
+  wants the captures cannot ask ahead either — `:has`-style pre-checking would mean
+  matching twice. What separates them is not "can you ask ahead" but **what the
+  operation is**: a match is a *question*, and `false` is its answer, which is why
+  that section calls matching "a pass/fail operation". A read is not a question —
+  "give me the next line" has no false. So the rule this decision follows is
+  **`false` where the operation asks, a `Status` where it reads**, and `:match`
+  keeps its `false` under it. So does [`:kind`](#modifiers), and so does any
+  predicate. This decision reaches stream reads and nothing else.
+
+  **Why.** It takes the double meaning off `false`, which is the whole point:
+  after this, a `false` in hand is a boolean answer, full stop, and the
+  [absence rule](#variables-and-assignment)'s "the encoding is contextual and
+  nothing can tell the two uses apart" stops applying anywhere it mattered. Shell
+  tradition spells absence this way — `grep` exits `1` for "no match" — so the
+  encoding is not a mesh invention.
+
+  **What does *not* recommend it: "it barely changes anything."** A draft of this
+  entry argued that `status_of` maps `false` to `1`, so a read loop reaching EOF
+  already leaves a nonzero status and the move only makes that explicit. **That is
+  wrong.** A `while` leaves the status of its last *body* execution, not of the
+  condition that ended it — `puts "a\nb" | while l = gets() { true }` leaves status
+  `0`, pinned by `a_compound_stage_reports_its_status`. The terminating read's
+  status is not observable there at all, so nothing about loop status changes
+  either before or after. This is a real change, argued on what it fixes, not a
+  relabeling.
+
+  **What that argument must not claim.** Binding buys the `else` branch nothing
+  *here*, and `grep`'s `1`-versus-`2` does not transfer: under the proposal as
+  scoped, only a clean EOF becomes a status, since a failed read stays a
+  channel-two [runtime error](#error-handling). One code, no reason to read. The
+  richer version — read failures moved onto the same channel, so `1` and `2` mean
+  what they do in `grep` — is a *different and larger* proposal, **not decided
+  here**, and it is the [error model](#error-handling) it has to argue with: it
+  moves a real failure out of fail-loud and into a value the caller may ignore,
+  which is the trade that model exists to refuse. A failed read stays a runtime
+  error.
+
+  **The costs, accepted rather than argued away.** First, **the overload moves
+  rather than leaves**: a nonzero `Status` already means "this command failed", so
+  `status(1)` now carries two meanings, in a space external programs have
+  overloaded far harder than mesh had overloaded `false`. There are three seats and
+  every one is taken — `false` (boolean answer vs no result), `Status` (failed vs
+  empty-handed), or a real null (which costs the
+  [not-in-every-type property](#variables-and-assignment) that makes mesh's version
+  defensible at all). This picks a seat; it does not empty one. It is picked
+  because a `Status` in hand is *already* ambiguous between failure modes and
+  nobody expects otherwise, while a `false` in hand looked like an answer.
+
+  Second, and more visible in daily use: **a `Status` binds where `false` did
+  not**. `while line = gets() { … }` leaves `$line` holding `status(1)` after the
+  loop, where today the failed bind leaves the last line read. Anything reading
+  `$line` after a read loop changes meaning. The `gets var` form is unaffected — it
+  leaves `var` alone at EOF either way — so the fix at a call site is to use it, or
+  to keep the last line in a variable of your own.
+
+  **The declaration is where the question stops being about streams**, and it cuts
+  less cleanly than it first appears. The [return-type decision](#open-questions)
+  leaves "how a declaration spells `false | T`" unaddressed, and the slot is **one
+  bare word**. Under `false` the choices are a union spelling — `str?` (spends the
+  glob metacharacter), `str|false` (spends the pipe), `maybe str` (spends a
+  keyword, and does not name the value you test for) — or a language-wide rule
+  that every declared type also admits `false`, which is **null by the back door**:
+  every `str` might not be one, the exact property that made the billion-dollar
+  mistake.
+
+  **`Status` does not escape that, and the entry should not pretend it does.** A
+  `Status` did **not** satisfy a declared `str` before this entry — that is why the
+  check table's rule was originally written as "a type a `Status` does not
+  satisfy", a phrasing this decision has to retire (below) — so `str func gets()`
+  answering `Status(1)` at EOF needs the same kind of
+  language-wide widening — `T | Status(n≠0)`, below — spelled nowhere. Both encodings buy their
+  one-word slot with an implicit union; neither is free.
+
+  **What survives is narrower, and it is about honesty rather than syntax.** A
+  `Status` can never be mistaken for a domain value: it is visibly *how it went*,
+  so `str | Status` widens the type without making any `str` suspect. `false`
+  cannot say that — widen `bool func f()` with `false` and the absence is
+  indistinguishable from the answer, which is the overload this whole entry is
+  about, arriving in the type system. That is a real difference in kind, and it is
+  what the decision rests on — not on any syntactic saving, since there is none.
+
+  **So the widening is decided with it, and it is `T | Status(n≠0)`** — a declared
+  value type also admits a **nonzero** `Status`, spelled nowhere because it holds
+  everywhere. `str func gets()` stays one word.
+
+  **Nonzero, not any `Status`, and the restriction is load-bearing.** A
+  `status(0)` is success, never absence
+  ([the absence rule](#variables-and-assignment)), so admitting it would let a
+  `str func` answer `status(0)`, satisfy its own declaration, take the **true**
+  branch of a presence-bind, and hand the caller a `Status` where a string was
+  promised — a declared type weakened at exactly the point it is supposed to hold.
+  The nonzero restriction also keeps the widening aligned with the presence-bind,
+  which the nonzero `Status` already fails; a widening that admitted the success
+  case would be adding a value nothing downstream expects.
+
+  **The boundary is syntactic, and it has to be**, because the two `Status`es are
+  the same value. An EOF `status(1)` and a failed command's `status(1)` are both
+  `Value::Status(1)`, and after an assignment, a parameter pass or a forwarded
+  return nothing distinguishes them — the call-site check sees a `&Value` and no
+  more. So this decision does **not** ask for provenance, which would mean tagging
+  absence into a distinguishable value and quietly rebuilding the null.
+
+  It does mean the [check table](#open-questions)'s rule has to be **restated
+  rather than kept**, and the table above now carries the restatement. Its old
+  predicate — "a func declaring a type a `Status` does not satisfy" — turns
+  *erratic* once a nonzero one is admitted everywhere: it would fire for a
+  **successful** command tail and let a **failing** one through, which is the
+  opposite of what it is for.
+  Phrased on the declared **word** instead, it fires exactly as before: **a body
+  whose tail is a command is rejected in any func declaring a type other than
+  `status`**, at parse, on shape. That is deliberately not a type-satisfaction test
+  and must not be implemented as one. `status func` is how you say the answer *is*
+  the command's outcome. A `Status` arriving any other way — returned, forwarded,
+  propagated — satisfies the widened type at run time.
+
+  **What that costs, stated rather than hidden:** a wrapper that forwards a failed
+  command's status as its value is accepted where writing the command as the tail
+  would have been refused. The two differ in how they were *written*, not in what
+  they answer. That is a seam the check table already lives with — every entry in
+  it is a parse check over shape — and widening the declared type does not deepen
+  it, but it is a seam, and an implementer should not discover it by surprise.
+
+  **Not decided, and explicitly not licensed by this:** making absence a **binding
+  failure** with no value at all. That reintroduces the valueless call the
+  [status decision](#open-questions) removed, on the grounds that a call with no
+  value is unrepresentable without a null. Absence is a value here; it is just no
+  longer `false`.
+
+  **Not urgent.** The surface is one builtin plus the widening, and nothing is
+  built yet — `gets()` returns `false` in the code today.
 - **Hook API — decided** ([Hooks and the prompt](#hooks-and-the-prompt)): hook
   points are insertion-ordered maps of named callables (the key is the handler's
   identity → re-source-safe, individually removable). Events `preprompt`,
