@@ -11689,6 +11689,7 @@ fn declared_matches(declared: ReturnType, value: &Value) -> bool {
         ReturnType::Map => matches!(value, Value::Map(_)),
         ReturnType::Job => matches!(value, Value::Job(_)),
         ReturnType::Regex => matches!(value, Value::Regex(_)),
+        ReturnType::Func => matches!(value, Value::Function(_)),
     }
 }
 
@@ -12765,6 +12766,20 @@ fn pending_input(text: &str) -> Pending {
         // declared malformed and dispatched, running the block's lines at top
         // level. Raised in review as a P1, after an earlier round removed the
         // raw-text name check that had been masking it.
+        // **`func func f()` is the one header that is both readings at once**, and
+        // only the stripped text scans correctly: unstripped, the brace scanner
+        // takes the second `func` for the name, finds no `(` after it, calls the
+        // definition closed and dispatches a buffer that was still waiting for
+        // its `{`. This arm is narrow on purpose — `typed` differs from `untyped`
+        // only when a marker came off, and `untyped` is a header only when the
+        // text already starts with `func`, so the doubled spelling is the only
+        // thing that reaches it. `int func f arg {` still takes the arm below,
+        // which is what the note above is about. Raised in review.
+        Ok(parser::ParseOutcome::Incomplete(_))
+            if is_header(untyped) && typed != untyped && is_header(typed) =>
+        {
+            by_braces(typed)
+        }
         Ok(parser::ParseOutcome::Incomplete(_)) if is_header(untyped) => by_braces(untyped),
         Ok(parser::ParseOutcome::Incomplete(_)) => Pending::Other,
         // The parser has given up, so the reader has to decide whether a body is
@@ -12834,7 +12849,7 @@ fn typed_header_follows(after: &str) -> bool {
 /// stay quarantined so its diagnostic is the reserved-word one rather than
 /// whatever its body would have done at top level.
 const TYPE_MARKER_WORDS: &[&str] = &[
-    "status", "int", "str", "bool", "list", "map", "job", "regex", "any", "float",
+    "status", "int", "str", "bool", "list", "map", "job", "regex", "func", "any", "float",
 ];
 
 fn strip_wrapper_marker(text: &str) -> &str {
@@ -18200,6 +18215,15 @@ mod tests {
             // marker list is `every_type_word_comes_off_a_header`, which calls
             // the strip directly; these pin the reader's answer instead.
             "job func f() {\nputs hi\n",
+            // **The doubled `func func` header, with the block still to come.**
+            // Unstripped it scans as a definition *named* `func`, whose name is
+            // not followed by `(`, so the scanner calls it closed and the buffer
+            // is dispatched mid-definition — while `int func make()` and a plain
+            // `func make()` both stay open. That asymmetry was the defect; these
+            // pin the three shapes it appeared in. Raised in review as a P2.
+            "func func make()\n",
+            "func func make()\n{\nputs hi\n",
+            "func wrapper func w(...xs)\n",
             // Reserved, and still a header: the diagnostic has to be the
             // reserved-word one rather than whatever the body would have done.
             "float func f() {\nputs hi\n",
@@ -18327,6 +18351,16 @@ mod tests {
                  ordinary command word whose block is being quarantined"
             );
         }
+        // **`func` is the one type word that is also the keyword after it**, so
+        // the shape test has to separate three spellings that all start `func`:
+        // the doubled header (stripped to the plain one), an ordinary untyped
+        // definition (untouched — stripping it would hand a nameless header to
+        // the scanner), and a definition whose *name* merely starts with `func`
+        // (untouched, since the marker needs whitespace after it).
+        assert_eq!(strip_type_marker("func func f() {"), "func f() {");
+        assert_eq!(strip_type_marker("func f() {"), "func f() {");
+        assert_eq!(strip_type_marker("func funcy() {"), "func funcy() {");
+        assert_eq!(strip_type_marker("func func() {"), "func func() {");
         // Contextual, as the parser's own test is: the word only comes off when
         // a header follows it, so these keep every other meaning they have.
         assert_eq!(strip_type_marker("job = 1"), "job = 1");

@@ -6816,7 +6816,7 @@ to avoid" rather than promising the latter as done.
   runtime one.
 
   **The vocabulary is `status`, `int`, `str`, `bool`, `list`, `map`, `job`,
-  `regex`, `any`, and `float` is reserved.** Short forms throughout: `int` is already the language's word
+  `regex`, `func`, `any`, and `float` is reserved.** Short forms throughout: `int` is already the language's word
   (`:int` parses one), so `str` follows it and `string` would be the odd one out
   beside it. **`float` is reserved now and not implemented** — `f64` exists as a
   value ([Arithmetic](#arithmetic)), but declaring one is later work, and claiming
@@ -6849,13 +6849,21 @@ to avoid" rather than promising the latter as done.
   concrete: it is the difference between a kind something declares and a kind
   the runtime merely has.
 
-  **A function type is not in the set yet, and the reason is not that nobody
-  wanted one** — four sites need it. Naming it raises whether it carries the
-  return type of the function it describes, and that is the *same* question
-  already open for `list` ("a list, or a list of what"). Deciding it through
-  `func` alone would settle whether compound kinds are writable at all, in the
-  one place that decision is least visible, so it waits for a deliberate answer
-  covering `func`, `list` and `map` together.
+  **`func` joined last, spelled as the doubled `func func f()`** *(decided by
+  the repo owner)*. Four sites returned a function value with no word to
+  describe them. The doubling is the honest spelling rather than an accident of
+  reusing a keyword: the first word is the type, the second the keyword, and
+  `typed_definition_lead` separates them by the same `WORD func NAME (` shape it
+  uses for every other type word — so `func f()` stays an untyped definition and
+  `func funcy()` stays a definition named `funcy`.
+
+  **It carries no return type of its own, deliberately.** Whether a `func` can
+  say what it returns is the *same* question already open for `list` ("a list,
+  or a list of what"), and answering it through `func` alone would settle
+  whether compound kinds are writable at all in the one place that decision is
+  least visible. `func` is therefore as silent about what it returns as `list`
+  is about its elements, and the compound-kind question stays open as one
+  deliberate choice covering `func`, `list` and `map` together.
 
   The original argument for it is kept below rather than overwritten, because it
   is what the reversal is against.

@@ -847,6 +847,12 @@ pub enum ReturnType {
     /// literal produce. Joins on the same rule `job` did: a boundary named one,
     /// so the word exists.
     Regex,
+    /// `func func f()` — a function value, the kind a lambda and an `&name`
+    /// reference are. The doubled word is the honest spelling: the first is the
+    /// type, the second the keyword, and `typed_definition_lead` tells them
+    /// apart by shape (`WORD func NAME (`) exactly as it does for every other
+    /// type word.
+    Func,
     /// `any func f()` — a value channel of unstated kind. **Being retired**: the
     /// migration reached for it as a blanket, and each site it covers has a true
     /// type to state instead. Kept only until those sites are re-typed.
@@ -867,6 +873,7 @@ impl ReturnType {
         ReturnType::Map,
         ReturnType::Job,
         ReturnType::Regex,
+        ReturnType::Func,
         ReturnType::Value,
     ];
 
@@ -881,6 +888,7 @@ impl ReturnType {
             ReturnType::Map => "map",
             ReturnType::Job => "job",
             ReturnType::Regex => "regex",
+            ReturnType::Func => "func",
             ReturnType::Value => "any",
         }
     }
@@ -896,6 +904,7 @@ impl ReturnType {
             "map" => Some(ReturnType::Map),
             "job" => Some(ReturnType::Job),
             "regex" => Some(ReturnType::Regex),
+            "func" => Some(ReturnType::Func),
             "any" => Some(ReturnType::Value),
             _ => None,
         }

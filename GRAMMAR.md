@@ -547,7 +547,7 @@ binds a variable named `global`.
 ```ebnf
 definition      = return-type? "wrapper"? "func" definition-name parameter-list capture-list? NL* block
                 | "alias" alias-name capture-list? "=" NL* alias-command ;
-return-type     = "status" | "int" | "str" | "bool" | "list" | "map" | "job" | "regex" | "any" ;
+return-type     = "status" | "int" | "str" | "bool" | "list" | "map" | "job" | "regex" | "func" | "any" ;
 definition-name = bare-WORD ;                 # unjudged here; checked when it runs
 alias-name      = definition-name
                 | computed-name ;             # a word holding an interpolation
@@ -584,7 +584,9 @@ reads after a bare `f`, for every body — so `{ false }` yields `status(1)` lik
 rather than the list it built. A body with no value channel is not asked for a
 value at all: it runs the way the statement `f` runs it, so the two cannot
 disagree. `status func` is that same function said out loud, and yields the
-same. `job` and `regex` name a job and a compiled pattern: a kind
+same. `job`, `regex` and `func` name a job, a compiled pattern and a function
+value — `func func make-adder(n)` doubles the word, the first being the type and
+the second the keyword, told apart by shape. A kind
 joins the set **on use at a function boundary**, not on existing in the runtime,
 which is what keeps a styled string and an `Instant` out until something
 declares one. `any` is still accepted and is being retired — it says only that
