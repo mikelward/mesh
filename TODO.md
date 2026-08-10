@@ -5579,7 +5579,7 @@ before `func` is the slot `wrapper func` and `fork func` already use. The postfi
 entry records what each costs.
 
 - [x] **The type vocabulary is `status`, `int`, `str`, `bool`, `list`, `map`,
-      `job`, `any`** — *(landed — `ReturnType` in `parser.rs`, closed at exactly
+      `job`, `regex`, `any`** — *(landed — `ReturnType` in `parser.rs`, closed at exactly
       this set; the sub-items below record what each one cost. `any` was spelled
       `value` until the narrowing landed — see the rename below — and is now
       being retired in favor of the concrete kinds. `job` joined on the repo
@@ -5914,7 +5914,7 @@ once there is a type vocabulary in the language to reason with.
 
 **How the current proposal works, in one paragraph.** A `func` may declare a
 return type drawn from a closed set (`status`, `int`, `str`, `bool`, `list`,
-`map`, `job`, `any`, with `float` reserved). Declaring none means no value channel: the result
+`map`, `job`, `regex`, `any`, with `float` reserved). Declaring none means no value channel: the result
 is a `Status`, and the body's last expression stops being its value. The type
 rides on the definition, so `help` can print it and a caller can read it without
 opening the body.

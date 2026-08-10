@@ -11688,6 +11688,7 @@ fn declared_matches(declared: ReturnType, value: &Value) -> bool {
         ReturnType::List => matches!(value, Value::List(_)),
         ReturnType::Map => matches!(value, Value::Map(_)),
         ReturnType::Job => matches!(value, Value::Job(_)),
+        ReturnType::Regex => matches!(value, Value::Regex(_)),
     }
 }
 
@@ -12833,7 +12834,7 @@ fn typed_header_follows(after: &str) -> bool {
 /// stay quarantined so its diagnostic is the reserved-word one rather than
 /// whatever its body would have done at top level.
 const TYPE_MARKER_WORDS: &[&str] = &[
-    "status", "int", "str", "bool", "list", "map", "job", "any", "float",
+    "status", "int", "str", "bool", "list", "map", "job", "regex", "any", "float",
 ];
 
 fn strip_wrapper_marker(text: &str) -> &str {

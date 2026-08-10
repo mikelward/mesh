@@ -6816,7 +6816,7 @@ to avoid" rather than promising the latter as done.
   runtime one.
 
   **The vocabulary is `status`, `int`, `str`, `bool`, `list`, `map`, `job`,
-  `any`, and `float` is reserved.** Short forms throughout: `int` is already the language's word
+  `regex`, `any`, and `float` is reserved.** Short forms throughout: `int` is already the language's word
   (`:int` parses one), so `str` follows it and `string` would be the odd one out
   beside it. **`float` is reserved now and not implemented** — `f64` exists as a
   value ([Arithmetic](#arithmetic)), but declaring one is later work, and claiming
@@ -6837,6 +6837,25 @@ to avoid" rather than promising the latter as done.
   runtime, which is what keeps a styled string, an `Instant` and a `Duration`
   out until something declares one. `any` survives only until the sites that
   reached for it are re-typed; each has a true type to state instead.
+
+  **`regex` joined next, on that same rule and on a measurement.** The
+  declared-type warning cannot report on `any` — the top type matches
+  everything — so `any` was instrumented and the suite run: of 274
+  value-producing calls through `any`-declared functions, one returned a regex
+  and four returned function values, and those were the *only* kinds flowing out
+  of a declaration that no word could describe. A compiled pattern is a real
+  value kind (`re("a+")`, a `/…/` literal), so `regex func pattern-for(kind)` is
+  the sentence to write. "Earns its place on use" is what the measurement makes
+  concrete: it is the difference between a kind something declares and a kind
+  the runtime merely has.
+
+  **A function type is not in the set yet, and the reason is not that nobody
+  wanted one** — four sites need it. Naming it raises whether it carries the
+  return type of the function it describes, and that is the *same* question
+  already open for `list` ("a list, or a list of what"). Deciding it through
+  `func` alone would settle whether compound kinds are writable at all, in the
+  one place that decision is least visible, so it waits for a deliberate answer
+  covering `func`, `list` and `map` together.
 
   The original argument for it is kept below rather than overwritten, because it
   is what the reversal is against.
