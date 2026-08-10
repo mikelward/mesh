@@ -2749,7 +2749,8 @@ fn condition_status(
     // "tests *presence* rather than truth — and there the answer follows from
     // `false` being mesh's 'no result': only `false` is absent, so `\"\"`, `[]`
     // and `0` all bind and take the branch." That is what lets a function answer
-    // `false` for "found nothing" and be tested for it.
+    // `false` for "found nothing" and be tested for it. A nonzero `Status` has
+    // since joined `false` on the absent side — see the arm below for why.
     //
     // Absent binds nothing, the rule the two neighbors already state: a
     // list-pattern mismatch "selects `else` without changing any bindings"
@@ -2789,15 +2790,35 @@ fn condition_status(
         // it is the condition itself — otherwise `if s = sh("-c", "exit 5")`
         // succeeds while `if sh("-c", "exit 5")` fails, on the same value.
         //
-        // It still **binds**, unlike `false`: a status is a result rather than an
-        // absence, so the `else` branch can read the code it failed with — the
-        // same shape as the capture-tailed sibling above, where `if out = $(diff
-        // a b)` binds and branches on the diff's status.
-        if let Value::Status(code) = bound {
-            return match bind_pattern(pattern, &bound, &mut shell.vars, *global) {
-                Ok(()) => Ok(Some(code)),
-                Err(message) => Err(runtime_message(message)),
-            };
+        // And it **binds nothing**, like `false`. It used to bind, on the grounds
+        // that a status is a result rather than an absence and the `else` branch
+        // might want the code. That lost more than it bought: under the
+        // `T | Status(n≠0)` widening a declared type admits a failing status, so
+        // binding one puts a `Status` into a `str`-typed name and the annotation
+        // stops meaning anything on the failure path.
+        //
+        // The code is genuinely lost here, and `$sh.status` is not a substitute:
+        // a value condition leaves the standing status alone, so what is there
+        // depends on what ran — `0` in a fresh shell, `3` after an earlier failing
+        // command, and the rejected code itself when the right-hand side *is* the
+        // failing command. Unreliable rather than unavailable, which is worse. All
+        // three are pinned by
+        // `reading_a_failed_codes_value_takes_a_plain_assignment`. A caller who
+        // wants it assigns first — a statement binds unconditionally — and then
+        // asks presence again: `t = f()` then `if kept = $t { … } else { $t:code }`.
+        // The inner bind matters: a bare `if $t` serves a bool or a status and
+        // errors on a string, which is the case this rule exists for.
+        //
+        // A **successful** status is not this case: it is a value, so it binds and
+        // takes the true branch through the arm below.
+        //
+        // The capture-tailed sibling is untouched, and is not an exception: `if
+        // out = $(diff a b)` binds the *output*, a string, and branches on the
+        // diff's status — the bound value was never a `Status` there.
+        if let Value::Status(code) = bound
+            && code != 0
+        {
+            return Ok(Some(code));
         }
         // A list pattern never reaches here — the arm above claims every one of
         // them, capture-tailed or not — so the only failures left are real ones.

@@ -5359,6 +5359,11 @@ thing a reader takes on trust.*
       mismatch "selects `else` without changing any bindings", and `gets` at end
       of input leaves `var` unchanged.
 
+      **Since amended:** a nonzero `Status` joins `false` on the absent side —
+      it takes `else` and binds nothing — so that a declared type widened to
+      `T | Status(n≠0)` cannot leave a `Status` in, say, a `str`-typed name.
+      A **successful** status is still an ordinary value and binds.
+
       Scoped by `capture_tail`, the same syntax-only test the assignment
       *statement* uses to pick between its own `0` and the capture's status, so
       `if out = $(diff a b)` keeps branching on the diff. And the presence test
