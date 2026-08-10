@@ -2012,7 +2012,7 @@ hyphen between — the third payoff of that one spacing rule.
   back for, e.g., "key present but unset"? Current answer: no; `:has` +
   `:get(key, default)` cover it.)*
 
-  **Three values look null-shaped, and only one of them is absence.** They get
+  **Three values look null-shaped, and only one of them encodes absence.** They get
   mistaken for each other because each turns up where a value was wanted and none
   arrived, so the sort is by *what question each one answers*:
 
@@ -2046,8 +2046,8 @@ hyphen between — the third payoff of that one spacing rule.
     not. That one is left open where it is analyzed
     ([Open questions](#open-questions)), not decided here.
 
-  Stated once, the rule those three obey: **absence is `false`; everything else
-  is a value.** `status(0)` obeys it, which is why the live question is the
+  Stated once, the rule those three obey: **absence is spelled `false`;
+  everything else is a value.** `status(0)` obeys it, which is why the live question is the
   empty string and not the status — see [Open questions](#open-questions).
 
   The residual cost on the status side is a lost *diagnostic*, not a null: with
@@ -7329,7 +7329,7 @@ to avoid" rather than promising the latter as done.
   | **Require `else` wherever the value is used** | Closes the `if` half of it — the `match` half needs the totality question answered the same way | "Wherever the value is used" includes func tails, `match` arms and `for` bodies, so it fires far beyond the case it was aimed at, and breaks the documented prompt-segment idiom |
   | **Require `else` in binding position only** | Narrow, syntactic, and checkable at parse time | Already weighed and declined once under [Error handling](#error-handling); and it misses the func-tail case, so it buys explicitness without closing the hole |
   | **Yield `false` instead of `""`** | The only option that changes the *value*, so the only one that closes the hole the *what it buys* paragraph below concedes the others leave open: `""` stops standing for both "empty" and "absent", `if tag = if $root { "[root]" } { … }` becomes a real presence test (today it always takes the branch), and the gap joins `gets()` on the one absent value the language already has — no new type, no null. [Error handling](#error-handling) already calls the no-`else` `if` "exactly parallel to `gets()` producing `false`"; this is that parallel taken literally | `false` renders as the text `false`, so `"$tag"` reads `false` rather than nothing — the terse tag idiom breaks loudly instead of quietly. The [prompt-segment idiom](INTRO.md) needs its "empties dropped" rule to become "absent dropped". And it does not stop a value being manufactured on an unwritten path, it changes which one: an author who wanted `""` now writes `else { "" }`. **Nor is it value-only** — `false` is the [one value that fails](#functions), so wherever the gap's value projects to a status the omitted branch starts reporting failure: a typed `func` tailing in one answers nonzero, and a `… \|\| fallback` chained off that answer runs the fallback where `""` left it alone. Either that is accepted as correct — an unwritten branch *did* produce no result — or the gap's `false` is exempted from the projection, which splits `false` into two kinds and hands back the single absent value the option exists to reach |
-  | **Make `""` false** | Collapses the three to two without touching a single construct: the gap goes on yielding `""` — and at the stronger of the two strengths below, becomes testable anyway — so the terse tag idiom, the [prompt segment](INTRO.md) and every hand-written `else { "" }` survive unchanged. It is also the shell-native reading — in POSIX, `[ -z "$x" ]` and an unset name are near-interchangeable — and Python, JavaScript and Perl all take it | Reopens [truthiness](#conditionals-if-is-an-expression), settled and shipped as *no truthy values* — `if "" { … }` is an error today naming the comparison to write, and a falsy `""` makes `if $x` legal for a string, putting `"0"` and `"false"` back on the table with the three disagreeing rules that section retired. And it negates the principle the two-arg `$xs:get(i, default)` was reasoned from — *don't let one value stand in for both "empty" and "absent"* — so where the row above gives that distinction up **in the gap**, this gives it up **language-wide**. (`:get` itself survives, its bounds check being internal; what goes is every test written *on* the value it hands back.) **What it costs past that depends on how far it reaches**, and only the stronger of its two strengths touches `gets()` — below the table |
+  | **Make `""` false** | Touches no construct at all: the gap goes on yielding `""`, so the terse tag idiom, the [prompt segment](INTRO.md) and every hand-written `else { "" }` survive unchanged. **At the stronger of the two strengths below** it collapses the three to two *for conditions* — ordinary and presence alike — and makes the gap testable in any condition it already reaches; the [status projection](#functions) still tells `""` from `false` unless the third dial is turned too, so what collapses is the condition behavior rather than the values. At the weaker strength `""` is only a newly falsy value that stays *present* in a bind, so the three stay distinct and the payoff is the explicit `if $tag { … }` alone. It is also the shell-native reading — in POSIX, `[ -z "$x" ]` and an unset name are near-interchangeable — and Python, JavaScript and Perl all take it | Reopens [truthiness](#conditionals-if-is-an-expression), settled and shipped as *no truthy values* — `if "" { … }` is an error today naming the comparison to write, and a falsy `""` makes `if $x` legal for a string, putting `"0"` and `"false"` back on the table with the three disagreeing rules that section retired. And it negates the principle the two-arg `$xs:get(i, default)` was reasoned from — *don't let one value stand in for both "empty" and "absent"* — so where the row above gives that distinction up **in the gap**, this gives it up **language-wide**. (`:get` itself survives, its bounds check being internal; what goes is every test written *on* the value it hands back.) **What it costs past that depends on how far it reaches**, and only the stronger of its two strengths touches `gets()` — below the table |
 
   **What it buys is smaller than it first looks.**
   `tag = if $root { "[root]" } else { "" }` still produces an empty string
@@ -7348,23 +7348,27 @@ to avoid" rather than promising the latter as done.
   to the three above it so much as the question they never ask, and both axes can
   be taken at once — require `else` in binding position *and* yield `false`
   elsewhere. What recommends it is the [absence rule](#variables-and-assignment):
-  `false` is already the language's absent value, so a gap that yields it agrees
-  with `gets()` and with presence-binding instead of minting a second answer. It
+  `false` is already how the language spells absence, so a gap that yields it
+  agrees with `gets()` and with presence-binding instead of minting a second
+  answer. It
   carries the same coupling as everything else here — whatever `if` does, an
   unmatched `match` does. The valueless `func` body is not dragged along: that
   producer is already the *asking* half of the
   [strict/soft pairs](#error-handling), so it is a separate call.
 
   **The fifth row is a third axis again**, and the widest: making `""` false
-  leaves every construct alone and changes what the *value* means, so the gap
-  needs no answer at all — at the stronger of the two strengths below, it becomes
-  testable wherever it already is. One
+  leaves every construct alone and changes what the *value* means, so at the
+  stronger of the two strengths below the gap needs no answer of its own — it
+  becomes testable in any condition it already reaches. One
   sub-question it raises is settled by precedent rather than standing against it:
   a value may be falsy without comparing equal to `false`, since `status(0)` is
   true in a condition while `status(0) == true` stays refused, truth and equality
   going through different projections. `"" == false` is the part that is *not*
   available, equivalence classes needing a lossless projection and
-  String → Boolean having none. What the row is judged on is everything below:
+  String → Boolean having none. **That precedent reaches truth-against-equality
+  only** — it says nothing about truth against *status*, which is a separate
+  split, charged to this row two paragraphs down. What the row is judged on is
+  everything below:
   the reopened truthiness, which holds at any strength, and the costs that depend
   on how far the change reaches.
 
