@@ -5785,43 +5785,67 @@ entry records what each costs.
             reviewer attributed it to the check, and disabling the check
             entirely left the curve unchanged. Worth a look on its own: the
             shape is unusual but a hang is a hang.
-      - [ ] **Is "an int or `false`" a disagreement?** The branch check does not
-            report arithmetic's kind, though the classifier knows it is an int,
-            and that omission is holding one question open rather than settling
-            it.
-
-            Classifying `$n + 1` as an int is *true*. It also makes this warn,
-            once per pass of the loop:
+      - [x] **"An int or `false`" is a disagreement — built.** A value function
+            that ends a loop answers a **nonzero status**, not `false`, so the
+            sentinel joins the status channel and the branch check gets to
+            report a `false` sitting beside another kind:
 
             ```
-            any func nxt(_n) { if $_n < 3 { $_n + 1 } else { false } }
+            any func nxt(_n) { if $_n < 3 { $_n + 1 } else { fail } }
             n = 0
-            while n = nxt($n) { puts "n=$n" }
+            while n = nxt($n) { puts "n=$n" }      # $n is 3 after, as before
             ```
 
-            That is `DESIGN.md`'s own contract for ending a `while` — a value
-            function answering `false` — and it is pinned by
-            `a_function_answering_false_ends_a_while_that_binds_it`, which the
-            arithmetic classification broke when it was tried.
+            Decided by the repo owner from three options; this was option 2,
+            *the idiom is a disagreement and the shape wants a different
+            spelling*. What it took, and what each piece cost, since two of
+            them were misjudged twice before being measured:
 
-            So one of three things is true, and which one is a language
-            question rather than a lint question:
+            **1. `DESIGN.md`'s ask/read rule widened to name generators.** The
+            stream-absence decision said it "reaches stream reads and nothing
+            else", which drew the line at the *mechanism* rather than at the
+            ask/produce distinction it had just stated. A generator is a
+            sequence held in a function's state instead of a file, and a caller
+            cannot see the difference. A **lookup** stays on the other side and
+            keeps its `false` — `find-up` asks "is there one?", which is a
+            question whatever it does to answer — and
+            `a_value_function_answering_false_is_testable_where_bash_tests_a_status`
+            is unchanged, deliberately.
 
-            1. **The idiom is exempt**: a `false` sentinel beside any other kind
-               is idiomatic, and the check should say so by name rather than by
-               declining to classify arithmetic. Then arithmetic gets classified
-               and `if $p { 1 } else { false }` stops warning too — it warns
-               today, which is the same shape written with a literal.
-            2. **The idiom is a disagreement** and the warning is right, in
-               which case the shape wants a different spelling in `DESIGN.md` —
-               an option type, or a status channel — and the check should be
-               widened once that exists.
-            3. **The distinction is not worth drawing** and arithmetic stays
-               unclassified, which is where it is now, by default rather than by
-               decision.
+            **2. The `T | Status(n≠0)` widening, built in `declared_matches`.**
+            A declared value type admits a *failing* status standing for "no
+            value". This was the blocker: while `int func` still warned
+            "declared `int`, returned a status", exempting the status branch
+            would have left the branch check contradicting the check beside it.
+            The two now go quiet together, pinned by
+            `the_branch_check_and_the_declared_type_check_agree_about_a_status`.
 
-            The cost of leaving it: `if $p { $n + 1 } else { "s" }` is silent,
-            which is a real disagreement the check would otherwise catch.
+            **3. The branch check exempts a status branch — but only a failing
+            one.** `status(0)` is an outcome, never absence, so it keeps its
+            kind: `if $p { return status 0 } else { return 7 }` still reports,
+            and its declared-type companion still reports beside it. A first
+            version filtered every status wholesale and silenced exactly that,
+            which is the same two-checks-disagreeing defect in the other
+            direction. `successful_status_exit` draws the line, and `fail 0` is
+            not a second spelling of it — `fail`'s codes start at 1, so a zero
+            there is an error rather than a value.
+
+            **4. Arithmetic is classified**, which is the payoff and was the
+            whole reason the question was open: `if $p { $n + 1 } else { "s" }`
+            reports where it was silent. `reported_yields` is gone rather than
+            emptied — with its one deliberate omission removed it was `yields`
+            under another name, so the three call sites ask `yields` directly.
+
+            Four assertions inverted and are on the **silence list** rather than
+            deleted — `return status 5`, `fail 3`, bare `fail`, `fail $n`, each
+            against `return 7` — so a later round cannot read the inversion as a
+            regression and undo it. Each change was stubbed back out and fails
+            the suite on its own.
+
+            **What is still open**, unchanged by this: the `gets()` half of the
+            stream decision is decided-not-built, and `gets()` still answers
+            `false` at EOF. The language rule the two share is built; only that
+            builtin's own return is left.
       - [ ] **`match` arms are not compared, only `if` branches.** The two sit
             next to each other in both evaluators — `Executable::Match` delegates
             to `eval_match_expr` exactly as `Executable::If` delegates to
@@ -7869,6 +7893,14 @@ of each PR had landed by another route, but these pieces had not.
       `.md` files, no `crates/` change — which is what makes it evidence rather
       than a suspect: the same branch went green twice before on `28b7800` and
       `4dcf326`, and the full suite passes locally.
+
+      **Eleventh sighting: locally, on #498**, in a full-suite run — the first
+      of these seen off CI. Ruled out as caused by the change under test the
+      same way as the others: the test passed 3/3 in isolation immediately
+      after, the next full run was green, and the diff touches `literal_integer`
+      and a unary arm in the branch check, nothing the PTY harness reaches.
+      That it reproduces locally is the new information — every prior sighting
+      was on CI, which had left "the runner" as a live explanation.
 
       Phase 241 is the last step of `title_ownership_harness`: after `exit 0` is
       typed, the harness `waitpid`s the shell and requires a normal exit with

@@ -2050,11 +2050,26 @@ hyphen between — the third payoff of that one spacing rule.
     ([Open questions](#open-questions)), not decided here.
 
   Stated once, the rule those three obey: **absence is spelled `false` where the
-  operation *asks* and a nonzero `Status` where it *reads*; everything else is a
-  value.** `status(0)` is on the "everything else" side of that — it is success,
+  operation *asks* and a nonzero `Status` where it *produces*; everything else is
+  a value.** `status(0)` is on the "everything else" side of that — it is success,
   never absence — which is why the live question is the empty string and not the
   status. See [Open questions](#open-questions) for both halves: the `""` question,
   and the stream-absence decision that put the second clause there.
+
+  **Producing covers two operations, a read and a generator**, and the second was
+  added after the first. A **read** is `gets()` at EOF. A **generator** is a value
+  function called until it says stop, which is how `while n = nxt($n) { … }`
+  terminates:
+
+  ```mesh
+  any func nxt(_n) { if $_n < 3 { $_n + 1 } else { fail } }
+  ```
+
+  Neither is a question — "give me the next one" has no false — and the two differ
+  only in where the sequence lives, a stream or the function's own state, which is
+  not a difference the caller sees. `$n` keeps the last value the loop read either
+  way, because a failing status
+  [binds nothing in a condition](#tests-and-comparisons) exactly as a `false` did.
 
   The residual cost on the status side is a lost *diagnostic*, not a null: with
   every call yielding a value, `:map(&puts)` produces a list of `Status(0)` where
@@ -7487,9 +7502,20 @@ to avoid" rather than promising the latter as done.
   operation is**: a match is a *question*, and `false` is its answer, which is why
   that section calls matching "a pass/fail operation". A read is not a question —
   "give me the next line" has no false. So the rule this decision follows is
-  **`false` where the operation asks, a `Status` where it reads**, and `:match`
-  keeps its `false` under it. So does [`:kind`](#modifiers), and so does any
-  predicate. This decision reaches stream reads and nothing else.
+  **`false` where the operation asks, a `Status` where it produces**, and
+  `:match` keeps its `false` under it. So does [`:kind`](#modifiers), and so does
+  any predicate.
+
+  **A generator produces too, and is in** — built, where the stream half is still
+  decided-not-built. A value function called until it says stop is a sequence like
+  a stream's, kept in the function's own state rather than in a file, and the
+  caller cannot see the difference: `while n = nxt($n) { … }` is the same loop
+  whichever end feeds it. So `nxt` answers `fail` rather than `false`, and the
+  earlier draft of this decision — which said it "reaches stream reads and
+  nothing else" — was drawing the line at the *mechanism* rather than at the
+  ask/produce distinction it had just stated. A **lookup** is on the other side
+  and keeps its `false`: `find-up` asks "is there one?", and that is a question
+  whatever it has to do to answer.
 
   **Why.** It takes the double meaning off `false`, which is the whole point:
   after this, a `false` in hand is a boolean answer, full stop, and the
@@ -7566,7 +7592,10 @@ to avoid" rather than promising the latter as done.
 
   **So the widening is decided with it, and it is `T | Status(n≠0)`** — a declared
   value type also admits a **nonzero** `Status`, spelled nowhere because it holds
-  everywhere. `str func gets()` stays one word.
+  everywhere. `str func gets()` stays one word. *(Built — `declared_matches`, with
+  the generator sentinel that needed it. The `gets()` half of the stream decision
+  is still unbuilt; the widening is the language rule those two share, and it
+  landed with whichever arrived first.)*
 
   **Nonzero, not any `Status`, and the restriction is load-bearing.** A
   `status(0)` is success, never absence
@@ -7611,8 +7640,11 @@ to avoid" rather than promising the latter as done.
   value is unrepresentable without a null. Absence is a value here; it is just no
   longer `false`.
 
-  **Not urgent.** The surface is one builtin plus the widening, and nothing is
-  built yet — `gets()` returns `false` in the code today.
+  **Not urgent, and half built.** The surface was one builtin plus the widening;
+  the **widening is built** — `declared_matches` admits a nonzero status against
+  a declared value type — because the generator sentinel needed the same rule and
+  arrived first. What is left is the builtin: `gets()` returns `false` at EOF in
+  the code today.
 - **Hook API — decided** ([Hooks and the prompt](#hooks-and-the-prompt)): hook
   points are insertion-ordered maps of named callables (the key is the handler's
   identity → re-source-safe, individually removable). Events `preprompt`,

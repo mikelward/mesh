@@ -22891,13 +22891,19 @@ fn an_absent_assignment_condition_leaves_the_name_as_it_was() {
 }
 
 #[test]
-fn a_function_answering_false_ends_a_while_that_binds_it() {
+fn a_function_answering_a_failing_status_ends_a_while_that_binds_it() {
     // The shape `DESIGN.md` pins the contract on. Reporting the *assignment's*
     // status made every such condition true, so the loop ran one pass past the
-    // end, bound the sentinel, and then tripped over it comparing `false` to an
-    // integer.
+    // end, bound the sentinel, and then tripped over it comparing the sentinel
+    // to an integer.
+    //
+    // **The sentinel is a nonzero status, not `false`** — a generator *reads*
+    // rather than asks, so it follows the ask/read rule onto the status channel
+    // and `false` goes back to meaning a boolean answer. `$n` keeping the last
+    // value read is the presence-bind refusing a failing status, which is why
+    // the swap costs the loop nothing.
     let out = run_with_input(
-        "any func nxt(_n) { if $_n < 3 { $_n + 1 } else { false } }\n\
+        "any func nxt(_n) { if $_n < 3 { $_n + 1 } else { fail } }\n\
          n = 0\n\
          while n = nxt($n) { puts \"n=$n\" }\n\
          puts \"done n=$n\"\n",
@@ -22907,6 +22913,25 @@ fn a_function_answering_false_ends_a_while_that_binds_it() {
         "n=1\nn=2\nn=3\ndone n=3\n"
     );
     assert!(out.stderr.is_empty(), "{:?}", out.stderr);
+}
+
+#[test]
+fn the_old_false_sentinel_now_reports_a_disagreement() {
+    // The counterpart of the test above, and the payoff for classifying
+    // arithmetic: the spelling the idiom moved *away* from is a real
+    // disagreement, an `int` beside a `bool`, and saying so is the whole point
+    // of putting the sentinel on the status channel. Silent before the move.
+    let out = run_with_input(
+        "any func nxt(_n) { if $_n < 3 { $_n + 1 } else { false } }\n\
+         n = 0\n\
+         while n = nxt($n) { puts \"n=$n\" }\n",
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr)
+            .contains("mesh: warning: if branches disagree: `int` and `bool`"),
+        "{:?}",
+        out.stderr
+    );
 }
 
 #[test]
@@ -34297,6 +34322,65 @@ fn a_declared_type_that_disagrees_warns_and_still_yields() {
     );
 }
 
+/// **A declared value type also admits a *failing* status**, standing for "no
+/// value" — `DESIGN.md`'s `T | Status(n≠0)` widening, spelled nowhere because
+/// it holds everywhere, which is what keeps `str func gets()` one word.
+///
+/// The zero case is the one worth pinning: `status(0)` is an outcome rather
+/// than an absence, so it is still a disagreement. Raised in review, against a
+/// first version of the widening that took every status.
+#[test]
+fn a_declared_value_type_admits_a_failing_status_but_not_a_successful_one() {
+    let failing = run_with_input("int func f() { return status 5 }\nx = f()\nputs $x\n");
+    assert!(
+        failing.stderr.is_empty(),
+        "a failing status is absence, not a disagreement: {:?}",
+        failing.stderr
+    );
+
+    let success = run_with_input("int func z() { return status 0 }\nx = z()\nputs $x\n");
+    assert_eq!(
+        String::from_utf8_lossy(&success.stderr),
+        "mesh: warning: z: declared `int`, returned a status\n"
+    );
+
+    // `status func` is untouched: a status is that channel's domain value, not
+    // the absence of one, so the widening does not apply and an honest
+    // declaration still passes.
+    let declared = run_with_input("status func s() { return status 5 }\nx = s()\nputs $x\n");
+    assert!(declared.stderr.is_empty(), "{:?}", declared.stderr);
+}
+
+/// **The branch check and the declared-type check answer the same about one
+/// line**, which is what makes the status exemption a reading of the language
+/// rather than a convenience.
+///
+/// Raised in review: the four assertions that moved to the silence list are all
+/// `any func`, which accepts everything, so on their own they cannot show the
+/// two diagnostics going quiet *together*. These are the typed counterparts.
+#[test]
+fn the_branch_check_and_the_declared_type_check_agree_about_a_status() {
+    // A failing status: both silent.
+    let absent = run_with_input(
+        "int func pick(p) { if $p { return status 5 } else { return 7 } }\na = pick(true)\n",
+    );
+    assert!(
+        absent.stderr.is_empty(),
+        "both checks should go quiet together: {:?}",
+        absent.stderr
+    );
+
+    // A successful one: both report, on the same line.
+    let outcome = run_with_input(
+        "int func z(p) { if $p { return status 0 } else { return 7 } }\na = z(true)\n",
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&outcome.stderr),
+        "mesh: warning: if branches disagree: `status` and `int`\n\
+         mesh: warning: z: declared `int`, returned a status\n"
+    );
+}
+
 /// The same through a **lambda**, which reaches the check by a different call
 /// path and names the variable it was bound to.
 #[test]
@@ -34538,6 +34622,84 @@ fn if_branches_that_literally_disagree_are_reported() {
         "mesh: warning: if branches disagree: `int` and `str`\n"
     );
 
+    // **Arithmetic is classified**, which is what taking the status sentinel
+    // bought. This was silent while `false` was the loop-ending idiom, because
+    // classifying `$n + 1` made that idiom disagree once per pass; with the
+    // sentinel on the status channel there is nothing left to protect, and a
+    // genuine `int`-beside-`str` disagreement gets reported.
+    let arithmetic =
+        run_with_input("p = false\nn = 1\nx = if $p { $n + 1 } else { \"s\" }\nputs $x\n");
+    assert_eq!(
+        String::from_utf8_lossy(&arithmetic.stderr),
+        "mesh: warning: if branches disagree: `int` and `str`\n"
+    );
+
+    // **A *successful* status is an outcome, not an absence**, so it keeps its
+    // kind where a failing one is exempt. The exemption is `T | Status(n≠0)`,
+    // and a first version of it filtered every status wholesale — which
+    // silenced exactly this, while the declared-type check went on reporting.
+    // Raised in review.
+    let zero = run_with_input(
+        "any func z(p) { if $p { return status 0 } else { return 7 } }\na = z(true)\n",
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&zero.stderr),
+        "mesh: warning: if branches disagree: `status` and `int`\n"
+    );
+
+    // **A spread is transparent to the *code* reading too** — `...0` is `0`,
+    // so `return status ...0` is the success `status(0)` rather than the
+    // absence a failing one would be, and the branch disagrees. `literal_integer`
+    // peels the spread for the same reason `yields` does. Raised in review.
+    let spread_zero = run_with_input(
+        "any func z(p) { if $p { return status ...0 } else { return 7 } }\na = z(false)\n",
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&spread_zero.stderr),
+        "mesh: warning: if branches disagree: `status` and `int`\n"
+    );
+
+    // **A variable is not a word**, so `${s}` keeps its value where `"$s"`
+    // renders — `1 + ${s}` really is `6` for an integer `s`, and the operand
+    // guard must not swallow it. Checked because a draft had the two alike.
+    let braced = run_with_input("s = 5\np = false\nx = if $p { 1 + ${s} } else { \"s\" }\n");
+    assert_eq!(
+        String::from_utf8_lossy(&braced.stderr),
+        "mesh: warning: if branches disagree: `int` and `str`\n"
+    );
+
+    // **Transparent means transparent both ways**: `...7` is the int `7`, so
+    // the spread peel must not swallow a real disagreement while removing a
+    // false one.
+    let spread_int = run_with_input("p = false\nx = if $p { 1 + ...7 } else { \"s\" }\n");
+    assert_eq!(
+        String::from_utf8_lossy(&spread_int.stderr),
+        "mesh: warning: if branches disagree: `int` and `str`\n"
+    );
+
+    // **A nested `if` returning `status 0` down every path is that same
+    // success**, and a flat scan for the word missed it because the zeros are
+    // not top-level statements. Raised in review.
+    let nested_zero = run_with_input(
+        "any func c(p, q) { if $p { if $q { return status 0 } else { return status 0 } } else { return 7 } }\nx = c(false, true)\n",
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&nested_zero.stderr),
+        "mesh: warning: if branches disagree: `status` and `int`\n"
+    );
+
+    // **A path that can only error has no say in whether the nested status is
+    // a success.** `compound_yields` skips it when it calls the compound a
+    // status, so counting it as evidence the code might be nonzero exempted a
+    // branch whose every value is `status(0)`. Raised in review.
+    let zero_beside_error = run_with_input(
+        "int func f(p, q) { if $p { if $q { return status 0 } else { return status \"bad\" } } else { return 7 } }\na = f(false, true)\n",
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&zero_beside_error.stderr),
+        "mesh: warning: if branches disagree: `status` and `int`\n"
+    );
+
     // An `else if` chain is one `if`, so the whole chain is compared.
     let chain = run_with_input(
         "n = 2\nx = if $n == 1 { \"one\" } else if $n == 2 { 2 } else { \"many\" }\nputs $x\n",
@@ -34674,17 +34836,6 @@ fn if_branches_that_literally_disagree_are_reported() {
         "mesh: warning: if branches disagree: `int` and `str`\n"
     );
 
-    // **The channel decides a status return's kind, not its operand.**
-    // `return status 5` yields a status however its operand reads, so reporting
-    // the operand's `int` would name a kind the value never had.
-    let status = run_with_input(
-        "any func pick(p) { if $p { return status 5 } else { return 7 } }\na = pick(true)\nputs done\n",
-    );
-    assert_eq!(
-        String::from_utf8_lossy(&status.stderr),
-        "mesh: warning: if branches disagree: `status` and `int`\n"
-    );
-
     // **What leaves the branch first decides it**, so an unreachable tail neither
     // hides a real disagreement nor invents one: here the *first* return is the
     // `str`, and it is the one reported.
@@ -34706,23 +34857,6 @@ fn if_branches_that_literally_disagree_are_reported() {
         String::from_utf8_lossy(&nested.stderr),
         "mesh: warning: if branches disagree: `int` and `str`\n"
     );
-
-    // **`fail` is the status channel's `return`** and produces a value like
-    // one — `fail 3` is `status(3)`, a bare `fail` is `status(1)` — so a branch
-    // ending in either disagrees with one returning an int.
-    for source in [
-        "any func pf(p) { if $p { fail 3 } else { return 7 } }\na = pf(true)\nputs done\n",
-        "any func pn(p) { if $p { fail } else { return 7 } }\na = pn(true)\nputs done\n",
-        // A code only the run can read is still a status.
-        "any func pv(p) { n = 4; if $p { fail $n } else { return 7 } }\na = pv(true)\nputs done\n",
-    ] {
-        let out = run_with_input(source);
-        assert_eq!(
-            String::from_utf8_lossy(&out.stderr),
-            "mesh: warning: if branches disagree: `status` and `int`\n",
-            "for {source:?}"
-        );
-    }
 
     // **An operand can carry a control out of the branch**, so the tail after
     // it is conditional: this function returns `'s'` rather than the `7` the
@@ -34812,7 +34946,6 @@ fn if_branches_that_literally_disagree_are_reported() {
         "p = false\nx = if $p { not (([a: 1]).a) } else { 7 }\nputs done\n",
         "func cg() { }\np = false\nx = if $p { not (cg():capture) } else { 7 }\nputs done\n",
         // A scalar interpolates, and a spread of a list or an unknown is fine.
-        "p = false\nx = if $p { not (\"${7}\") } else { 7 }\nputs done\n",
         "func fs(x) { return $x }\np = false\nx = if $p { not fs(...[1]) } else { 7 }\nputs done\n",
         "func fs(x) { return $x }\nxs = [1]\np = false\nx = if $p { not fs(...$xs) } else { 7 }\nputs done\n",
         // Comparing a capture is a bool like any other comparison, and an
@@ -34861,7 +34994,6 @@ fn if_branches_that_literally_disagree_are_reported() {
         "q = true\np = false\nx = if $p { (if $q { true } else if $q { false } else { true }) == true } else { 7 }\nputs done\n",
         "m = [k: 1]\np = false\nx = if $p { not ($m.k) } else { 7 }\nputs done\n",
         "p = false\nx = if $p { not (\"a\":split(\" \")) } else { 7 }\nputs done\n",
-        "s = \"a\"\np = false\nx = if $p { not (\"${s}\") } else { 7 }\nputs done\n",
         // Only an all-failing compound yields nothing; one live branch is a value.
         "p = false\nq = false\nx = if $p { not (if $q { :capture } else { true }) } else { 7 }\nputs done\n",
         // **A fork is a wall in both directions**, so what happens inside one
@@ -35393,12 +35525,101 @@ fn the_branch_check_stays_out_of_everything_it_cannot_see() {
         // `with` evaluates its header before its body.
         "any func fr(p, q) { if $p { return (if $q { return 1 } else { return 2 }) == 1 } else { return \"s\" } }\na = fr(false, true)\n",
         "any func fh(p) { if $p { with X=(if true { return 1 }) { }; true } else { 7 } }\na = fh(false)\n",
-        // **Arithmetic is not classified**, though it is integer-only: calling
-        // it an `int` makes `if $n < 3 { $n + 1 } else { false }` disagree, and
-        // answering `false` to end a `while` is an idiom `DESIGN.md` pins a
-        // contract on. Whether that idiom should be exempt is a language
-        // question, not one to settle by widening a lint.
-        "any func nx(_n) { if $_n < 3 { $_n + 1 } else { false } }\nn = 0\nwhile n = nx($n) { }\n",
+        // **A generator's sentinel is a nonzero status, so it does not
+        // disagree with the values it yields.** Arithmetic *is* classified now
+        // — that is what makes `if $p { $n + 1 } else { "s" }` report, on the
+        // reported list — and the idiom stays quiet because `fail` answers on
+        // the absence channel rather than with a kind of its own.
+        "any func nx(_n) { if $_n < 3 { $_n + 1 } else { fail } }\nn = 0\nwhile n = nx($n) { }\n",
+        // **The exemption follows the path the branch takes**, so an
+        // unreachable `return status 0` does not revoke it: nothing after an
+        // unconditional exit runs, and reporting there names a value no run
+        // produces. Raised in review, with the nested counterpart on the
+        // reported list.
+        "any func a(p) { if $p { return status 5; return status 0 } else { return 7 } }\nx = a(true)\n",
+        // And one failing path among nested ones is an absence the caller can
+        // meet, so the compound is not a success even with a zero beside it.
+        "any func e(p, q) { if $p { if $q { return status 0 } else { return status 5 } } else { return 7 } }\nx = e(false, true)\n",
+        // **A code only the run can read is left to the run**, so a computed
+        // one is treated as the absence it usually is. `return status 0 + 0`
+        // really does produce `status(0)`, a success, and the declared-type
+        // check reports it when that path runs — this one defers instead of
+        // constant-folding to find out. Deliberate: the alternative is
+        // reporting every `return status $code`, which is a false warning on
+        // ordinary forwarding, and this check prefers a false silence. Raised
+        // in review.
+        "any func zc(p) { if $p { return status 0 + 0 } else { return 7 } }\na = zc(true)\n",
+        // **Arithmetic that can only fail is still not a kind.** Classifying
+        // arithmetic exposed this: the operands fit, and only the value says
+        // it cannot run. A literal zero divisor is read, not computed — `1 /
+        // (2 - 2)` still needs the run. Raised in review.
+        "p = false\nx = if $p { 1 / 0 } else { \"s\" }\n",
+        "p = false\nx = if $p { 1 % 0 } else { \"s\" }\n",
+        // **A sign is part of the spelling**, so `-(0)` is a zero divisor and
+        // `1 / -(0)` is *division by zero*. Distinct from `1 / -0`, where the
+        // operand is a bare word rather than a negation. Raised in review.
+        "p = false\nx = if $p { 1 / -(0) } else { \"s\" }\n",
+        "p = false\nx = if $p { 1 % -(0) } else { \"s\" }\n",
+        // The same reading at the other caller: `status -(5)` is out of range,
+        // which is what the runtime says.
+        "any func q(p) { if $p { return status -(5) } else { return 7 } }\na = q(false)\n",
+        // **Arithmetic reads a bare word as a number, not as a command.**
+        // `-0` is a word, so `1 / -0` is *expected integer* rather than a
+        // division — the same rule `..` states about a range endpoint, asked
+        // through the same `reads_as`. Raised in review as a zero-divisor
+        // case, which it is not. Overflow is deliberately *not* here: it
+        // needs the value computed, which is the filed decision.
+        "p = false\nx = if $p { 1 / -0 } else { \"s\" }\n",
+        "p = false\nx = if $p { 1 + foo } else { \"s\" }\n",
+        // **A spread is transparent to that reading too**, the same way
+        // `yields` treats it — `...foo` is the word, so `1 + ...foo` is
+        // *expected integer*. Peeling in one place and not the other made the
+        // two disagree about one expression. Raised in review.
+        "p = false\nx = if $p { 1 + ...foo } else { \"s\" }\n",
+        // **A word that globs is a list, and one that interpolates renders to
+        // a string** — neither is a number, and `scalar_kind` gives up on both
+        // at the first non-text piece. Raised in review.
+        "s = \".toml\"\np = false\nx = if $p { 1 + *${s} } else { \"s\" }\n",
+        "s = 5\np = false\nx = if $p { 1 + \"$s\" } else { \"s\" }\n",
+        // **Unary negation reads its operand the same way** — `007` is a word,
+        // not the integer it resembles, so `-(007)` is *expected integer*.
+        // Fixing the binary half alone left this reporting an `int`. Raised in
+        // review.
+        "p = false\nx = if $p { -(007) } else { \"s\" }\n",
+        "s = \"a\"\np = false\nx = if $p { not (\"${s}\") } else { 7 }\nputs done\n",
+        // **A quoted interpolation is a string, so `not` refuses it** — the
+        // runtime says *a string is not a condition*, so the branch produces
+        // nothing. This sat on the **reported** list until the operand guard
+        // reached the unary arm, which is when the pinned kind was measured:
+        // reporting `bool` named a value no run makes. Raised in review as the
+        // unary/binary divergence; the stale assertion was its second half.
+        "p = false\nx = if $p { not (\"${7}\") } else { 7 }\nputs done\n",
+        // **The unary arm asks the same question as the binary one**, so an
+        // interpolated word is refused there too — `-("$s")` is *expected
+        // integer* and `not "$s"` is *a string is not a condition*, whatever
+        // `$s` holds. The two arms diverged three times in review; they now
+        // share `operand_is_written_out`.
+        "s = 5\np = false\nx = if $p { -(\"$s\") } else { \"s\" }\n",
+        "s = 5\np = false\nx = if $p { not \"$s\" } else { 7 }\n",
+        // The same peel at the other call site: `return status ...bad` is
+        // *the code must be an integer, not a string*.
+        "any func q(p) { if $p { return status ...bad } else { return 7 } }\na = q(false)\n",
+        // And a nested chain that produces nothing at all is not a success
+        // either — there is no `status(0)` to find, so the branch stays exempt.
+        "any func z(p, q) { if $p { if $q { return status \"bad\" } else { return status \"bad\" } } else { return 7 } }\nx = z(false, true)\n",
+        // **A status branch is the absence channel, whatever spells it.** These
+        // four reported ``status`` and ``int`` until the `T | Status` widening
+        // made a declared value type admit a failing status; they are here
+        // rather than deleted because the inversion is the deliberate half of
+        // that change, and a later round reading them as a regression would
+        // undo it. `return status 5` takes its kind from the channel rather
+        // than its operand, `fail` is that channel's `return` — `fail 3` is
+        // `status(3)`, a bare `fail` is `status(1)` — and a code only the run
+        // can read is still a status.
+        "any func pick(p) { if $p { return status 5 } else { return 7 } }\na = pick(true)\n",
+        "any func pf(p) { if $p { fail 3 } else { return 7 } }\na = pf(true)\n",
+        "any func pn(p) { if $p { fail } else { return 7 } }\na = pn(true)\n",
+        "any func pv(p) { n = 4; if $p { fail $n } else { return 7 } }\na = pv(true)\n",
         // **A key is a string, and a collection or a function is not one.**
         "p = false\nx = if $p { [[]: 1] } else { \"s\" }\n",
         "p = false\nx = if $p { [[a: 1]: 1] } else { \"s\" }\n",

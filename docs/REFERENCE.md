@@ -3423,8 +3423,22 @@ if path = find-up(Makefile) {
   puts "none above here"
 }
 
-while line = next-line() { puts $line }   # ends when `next-line` answers false
+while line = next-line() { puts $line }   # ends when `next-line` answers `fail`
 ```
+
+The two sentinels are not interchangeable, and which one a function answers
+with depends on what it *is*. `find-up` **asks** — "is there one above here?"
+— and `false` is that question's answer. `next-line` **produces**, and a
+producer has no false to give, so it ends with a nonzero status:
+
+```mesh
+any func next-line() { if $more { … } else { fail } }
+```
+
+Writing a producer's sentinel as `false` still ends the loop, since both are
+absent to a presence-bind — but it puts a `bool` beside whatever the function
+yields, which the branch check reports as a disagreement. `DESIGN.md`
+§"Variables and assignment" has the rule the two sides come from.
 
 A **status** is the other value-level failure, so a failing one takes `else`
 here exactly as it does when it is the condition itself — otherwise `if s =

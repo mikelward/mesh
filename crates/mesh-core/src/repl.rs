@@ -11759,7 +11759,7 @@ fn body_yields(body: &parser::Source, unwinds: bool) -> Yields {
             if operand_may_leave(expression, unwinds) {
                 return Yields::Unknown;
             }
-            reported_yields(expression, unwinds)
+            yields(expression, unwinds)
         }
         // A nested `if` is a branch tail like any other, and one whose own
         // branches all agree has a kind of its own — see [`compound_yields`].
@@ -11872,7 +11872,7 @@ fn leaves(statement: &parser::Statement, unwinds: bool) -> Leaves {
             // the branch has no bool to read. A bare `return` carries no kind,
             // which is unknown rather than impossible.
             Leaves::Always(match value.as_ref() {
-                Some(value) => reported_yields(value, unwinds),
+                Some(value) => yields(value, unwinds),
                 None => Yields::Unknown,
             })
         }
@@ -11910,16 +11910,24 @@ fn status_exit_type(
     let Some(expression) = value else {
         return Yields::Known(ReturnType::Status);
     };
-    match reported_yields(expression, unwinds) {
+    match yields(expression, unwinds) {
         Yields::Never => Yields::Never,
-        Yields::Known(ReturnType::Int) => literal_integer(expression)
-            .filter(|code| codes.contains(code))
-            .map_or(Yields::Never, |_| Yields::Known(ReturnType::Status)),
+        // **Only a code the source spells out can be known bad.** `return
+        // status 300` is out of range and produces nothing; `return status
+        // 0 + 0` is a code [`literal_integer`] cannot read, and the run
+        // accepts it — so calling it an error claimed a failure the value does
+        // not have, and left the branch check silent where the declared-type
+        // check reported. Raised in review, after this arm started asking
+        // [`yields`] rather than a reading of it that answered `Unknown` here.
+        Yields::Known(ReturnType::Int) => match literal_integer(expression) {
+            Some(code) if !codes.contains(&code) => Yields::Never,
+            _ => Yields::Known(ReturnType::Status),
+        },
         // A string, a list, a func: the channel refuses them all.
         Yields::Known(_) => Yields::Never,
         // **A word written out is a literal here even when it isn't elsewhere.**
         // In value position a bare word is a *command*, which is why
-        // [`reported_yields`] declines it — but a status operand is read as a
+        // [`yields`] declines it — but a status operand is read as a
         // number, so `return status bad` and `return status 007` are known-bad
         // codes rather than unknown values, and warning about the branch would
         // come ahead of the error saying it produces nothing. Raised in review.
@@ -12000,8 +12008,46 @@ fn yields(expression: &parser::Expr, unwinds: bool) -> Yields {
             {
                 return Yields::Never;
             }
-            let left = yields(left, unwinds);
-            let right = yields(right, unwinds);
+            // **A literal zero divisor can only error**, whatever the operand
+            // kinds say — `1 / 0` is *divide by zero*, so the arithmetic names
+            // no kind. The operands fit, which is why this sits beside
+            // [`operands_fit`] rather than inside it, and it is a reading of a
+            // literal rather than a computation: `1 / (2 - 2)` still needs the
+            // run, and so does overflow. Exposed by classifying arithmetic as
+            // a branch kind, and raised in review.
+            if matches!(op, parser::BinaryOp::Divide | parser::BinaryOp::Remainder)
+                && literal_integer(right) == Some(0)
+            {
+                return Yields::Never;
+            }
+            let left_yield = yields(left, unwinds);
+            let right_yield = yields(right, unwinds);
+            // **Arithmetic reads its operands as numbers**, so a bare word
+            // there is not the command it would be in value position — `1 / -0`
+            // is *expected integer*, since `-0` is a word rather than a negated
+            // zero. That is [`reads_as`]'s question, asked of the answers
+            // already in hand rather than by calling it: `reads_as` walks the
+            // operand again, and a second walk per operand per level is the
+            // exponential this check exists to have removed — a 24-term chain
+            // hung for the best part of an hour before this was written the
+            // other way round.
+            let reads_int = |operand, answer| match answer {
+                Yields::Never => false,
+                Yields::Known(kind) => kind == ReturnType::Int,
+                Yields::Unknown => !operand_is_written_out(operand),
+            };
+            if matches!(
+                op,
+                parser::BinaryOp::Add
+                    | parser::BinaryOp::Subtract
+                    | parser::BinaryOp::Multiply
+                    | parser::BinaryOp::Divide
+                    | parser::BinaryOp::Remainder
+            ) && !(reads_int(left, left_yield) && reads_int(right, right_yield))
+            {
+                return Yields::Never;
+            }
+            let (left, right) = (left_yield, right_yield);
             if left == Yields::Never || right == Yields::Never || !operands_fit(op, left, right) {
                 return Yields::Never;
             }
@@ -12034,6 +12080,12 @@ fn yields(expression: &parser::Expr, unwinds: bool) -> Yields {
             match operand {
                 Yields::Known(kind) if kind != wants => Yields::Never,
                 Yields::Never => Yields::Never,
+                // **A written word is read as the kind this wants**, exactly as
+                // it is for binary arithmetic — `-(007)` is *expected integer*
+                // and `-("$s")` is too. The same predicate answers both arms
+                // deliberately: they diverged three times in review, once per
+                // rule added to one and not the other.
+                Yields::Unknown if operand_is_written_out(expression) => Yields::Never,
                 _ => Yields::Known(gives),
             }
         }
@@ -13116,9 +13168,81 @@ fn map_key(key: Yields) -> bool {
 
 /// Is the whole of this operand written in the source — no variable, no spliced
 /// value, nothing waiting on the run to say what it is?
+/// Can this **word** be a number, whatever the run does with it?
+///
+/// Arithmetic reads its operands as numbers, and a word is not one in two ways
+/// that survive interpolation — which is why this exists beside
+/// [`scalar_kind`] rather than inside it. That answers a *literal* kind and so
+/// gives up at the first non-text piece; the question here is narrower and the
+/// interpolation does not settle it either way:
+///
+/// - **A word that globs is a list.** `eval_scalar` builds a `Value::List`
+///   whatever it matched, count included, so `1 + *${s}` is *expected integer*.
+///   The test is [`expand::segments_glob`]'s, with non-text pieces standing in
+///   as empty and unbare — the same placeholder `scalar_kind` uses for quoted
+///   text — so it answers about the metacharacters actually written.
+/// - **A word that interpolates renders to a string.** `1 + "$s"` is *expected
+///   integer* even where `$s` is the integer `5`, because the word is built
+///   before the operator sees it. `scalar_kind` calls a quoted word a `str`
+///   already, but only when every piece is text, so this is the same rule
+///   surviving the interpolation it gives up at.
+///
+/// A **variable** is not a word and is not covered: `$s` and `${s}` both keep
+/// the value, so `1 + ${s}` is `6` for an integer `s` and stays classified.
+/// That distinction was checked rather than assumed — a draft of this comment
+/// had `${s}` behaving like `"$s"`, and it does not.
+///
+/// Both raised in review, the second while checking the first.
+/// Is this operand **written out** as something an operator cannot read?
+///
+/// The one question both the binary and unary arms ask, sharing a name so they
+/// cannot drift: they diverged three times in review, once for each rule added
+/// to one arm and not its twin. Two ways to be written out, and neither leaves
+/// the operator anything to work with —
+/// [`written_word`] for a bare word that is not the number or bool it must be,
+/// and [`word_is_never_a_number`] for a word whose *shape* settles it whatever
+/// the pieces interpolate to.
+fn operand_is_written_out(expression: &parser::Expr) -> bool {
+    written_word(expression) || word_is_never_a_number(expression)
+}
+
+fn word_is_never_a_number(expression: &parser::Expr) -> bool {
+    match expression {
+        parser::Expr::Group(inner) => word_is_never_a_number(inner),
+        parser::Expr::Unary {
+            op: parser::UnaryOp::Spread,
+            expression,
+        } => word_is_never_a_number(expression),
+        parser::Expr::Scalar(word) => {
+            word.value.qualifiers.is_some()
+                || word
+                    .value
+                    .pieces
+                    .iter()
+                    .any(|piece| !matches!(piece, parser::WordPiece::Text { .. }))
+                || crate::expand::segments_glob(word.value.pieces.iter().map(|piece| match piece {
+                    parser::WordPiece::Text { text, quote } => {
+                        (text.as_str(), matches!(quote, parser::QuoteMode::Bare))
+                    }
+                    _ => ("", false),
+                }))
+        }
+        _ => false,
+    }
+}
+
 fn written_word(expression: &parser::Expr) -> bool {
     match expression {
         parser::Expr::Group(inner) => written_word(inner),
+        // **`...` is transparent where a value is read**, which is exactly how
+        // [`yields`] treats it — `...7` is 7 — so a predicate about the operand
+        // has to see through it too, or the two disagree about one expression.
+        // `1 + ...foo` is *expected integer*, and reading the outer node as
+        // "not a written word" claimed an int no run produces. Raised in review.
+        parser::Expr::Unary {
+            op: parser::UnaryOp::Spread,
+            expression,
+        } => written_word(expression),
         parser::Expr::Scalar(word) => word
             .value
             .pieces
@@ -13128,11 +13252,28 @@ fn written_word(expression: &parser::Expr) -> bool {
     }
 }
 
-/// The `i64` an expression literally spells, under [`reported_yields`]'s rule
+/// The `i64` an expression literally spells, under [`yields`]'s rule
 /// for one — so the two cannot disagree about which words are integers.
 fn literal_integer(expression: &parser::Expr) -> Option<i64> {
     match expression {
         parser::Expr::Group(inner) => literal_integer(inner),
+        // Transparent, the same way [`yields`] and [`written_word`] are —
+        // `...0` is `0`, so `return status ...0` is the success `status(0)`
+        // and not the absence a failing one would be. Raised in review.
+        parser::Expr::Unary {
+            op: parser::UnaryOp::Spread,
+            expression,
+        } => literal_integer(expression),
+        // **A sign is part of the spelling, not a computation.** `-(0)` is
+        // zero, so `1 / -(0)` is *division by zero* and names no kind, and
+        // `return status -(5)` is out of range exactly as the runtime says.
+        // `checked_neg` because `-(i64::MIN)` has no answer — an unreadable
+        // literal rather than a wrong one. Raised in review, against a guard
+        // that saw a bare `0` only.
+        parser::Expr::Unary {
+            op: parser::UnaryOp::Negate,
+            expression,
+        } => literal_integer(expression).and_then(i64::checked_neg),
         parser::Expr::Scalar(word) => match word.value.pieces.as_slice() {
             [
                 parser::WordPiece::Text {
@@ -13533,46 +13674,6 @@ fn branch_bodies(node: &parser::IfExpr) -> (Vec<&parser::Source>, bool) {
     }
 }
 
-/// What an expression yields as a **branch or an exit** reads it, as against
-/// what [`yields`] knows.
-///
-/// A thin reading of that walk, with one deliberate omission: **arithmetic is
-/// not reported**, though the walk knows it is an int. Calling `$n + 1` an
-/// `int` here is true and still wrong to act on — it makes
-/// `if $n < 3 { $n + 1 } else { false }` disagree, and answering `false` to end
-/// a `while` is an idiom `DESIGN.md` pins a contract on. Whether that idiom
-/// should be exempt is a language question, not one to settle by widening a
-/// lint. Operand checking still gets the kind, which is why `not (1 + 1)` is
-/// refused.
-fn reported_yields(expression: &parser::Expr, unwinds: bool) -> Yields {
-    match yields(expression, unwinds) {
-        Yields::Never => Yields::Never,
-        Yields::Known(kind) if !arithmetic(expression) => Yields::Known(kind),
-        _ => Yields::Unknown,
-    }
-}
-
-/// Is this expression's value the result of arithmetic? Parentheses are
-/// transparent, so `(1 + 2)` answers the same as `1 + 2`.
-fn arithmetic(expression: &parser::Expr) -> bool {
-    match expression {
-        parser::Expr::Group(inner) => arithmetic(inner),
-        parser::Expr::Unary {
-            op: parser::UnaryOp::Negate,
-            ..
-        } => true,
-        parser::Expr::Binary { op, .. } => matches!(
-            op,
-            parser::BinaryOp::Add
-                | parser::BinaryOp::Subtract
-                | parser::BinaryOp::Multiply
-                | parser::BinaryOp::Divide
-                | parser::BinaryOp::Remainder
-        ),
-        _ => false,
-    }
-}
-
 /// The kind a **word** spells, or `None` where only the run can say.
 fn scalar_kind(word: &parser::Spanned<parser::Word>) -> Option<ReturnType> {
     // **A glob is a list of whatever it matched**, so its type is a fact about
@@ -13647,6 +13748,82 @@ fn scalar_kind(word: &parser::Spanned<parser::Word>) -> Option<ReturnType> {
 /// Called from the value path only. A statement-position `if` is read by a
 /// different parser path entirely, so `if cmd { … }` — where the branches are
 /// effects and their types are nobody's business — never reaches here.
+/// Does this branch leave with a status the run **succeeded** with —
+/// `return status 0`?
+///
+/// The exemption below is for a status standing for *absence*, which
+/// `DESIGN.md` spells `T | Status(n≠0)`. A zero code is an outcome rather than
+/// an absence — `status(0)` "says the command ran and went fine" — so it stays
+/// an ordinary kind and goes on disagreeing with a value branch. That is the
+/// same line [`declared_matches`] draws, drawn here so the two cannot answer
+/// differently about one line of source.
+///
+/// **It follows the path [`body_yields`] followed**, rather than searching the
+/// body for the word. A flat scan got this wrong in both directions, and both
+/// were raised in review: `{ return status 5; return status 0 }` reported,
+/// though nothing reaches the zero, and a nested `if` returning `status 0` down
+/// every path was exempted, though the zero is exactly what the branch yields.
+/// So the two walks share their shape — first statement that always leaves
+/// wins, a `Maybe` gives up, otherwise the tail — and [`leaves`] answers which
+/// is which, the same call `body_yields` makes.
+///
+/// `fail 0` is not a second spelling of it: `fail`'s codes start at 1, so a
+/// zero there is an error rather than a value and [`status_exit_type`] already
+/// answers `Never`.
+fn successful_status_exit(body: &parser::Source, unwinds: bool) -> bool {
+    let Some((tail, rest)) = body.statements.split_last() else {
+        return false;
+    };
+    for statement in rest {
+        match leaves(statement, unwinds) {
+            Leaves::No => {}
+            // Nothing after the first statement that always leaves is reached,
+            // so that statement is the branch and the rest is dead text.
+            Leaves::Always(_) => return successful_status_statement(statement, unwinds),
+            // Whether the tail runs is a run-time fact, so which exit produced
+            // the status is one too. Not exempting is the safe answer: it keeps
+            // a warning the run may deserve rather than dropping one it does.
+            Leaves::Maybe => return false,
+        }
+    }
+    successful_status_statement(tail, unwinds)
+}
+
+/// The single statement [`successful_status_exit`] landed on, asked the same
+/// question — with a nested `if` answered by its own branches, since that is
+/// how it produced a status in the first place ([`compound_yields`]).
+fn successful_status_statement(statement: &parser::Statement, unwinds: bool) -> bool {
+    match &statement.and_or.first {
+        parser::Executable::Control {
+            kind: parser::ControlKind::Return,
+            channel: Some(parser::Channel::Status),
+            value: Some(value),
+            guard: None,
+        } => literal_integer(value) == Some(0),
+        // **Every branch that produces anything, and only when the chain
+        // covers them all** — one failing status among them is an absence the
+        // caller can meet, so the compound is not the success this looks for.
+        //
+        // A branch that can only **error** produces nothing, so it is skipped
+        // rather than counted against: [`compound_yields`] ignores it when it
+        // calls the compound a status, and treating it here as evidence the
+        // code might be nonzero exempted a branch whose every value is
+        // `status(0)`. The two walk the same bodies and now agree about which
+        // of them have a say. Raised in review.
+        parser::Executable::If(node) => {
+            let (bodies, complete) = branch_bodies(node);
+            let mut producing = bodies
+                .into_iter()
+                .filter(|body| body_yields(body, unwinds) != Yields::Never)
+                .peekable();
+            complete
+                && producing.peek().is_some()
+                && producing.all(|body| successful_status_exit(body, unwinds))
+        }
+        _ => false,
+    }
+}
+
 fn warn_branch_disagreement(node: &parser::IfExpr, unwinds: bool) {
     // **An `if` whose condition cannot run picks no branch**, so there is no
     // pair to disagree: `if 7 { 1 } else { "s" }` is *an int is not a
@@ -13660,9 +13837,25 @@ fn warn_branch_disagreement(node: &parser::IfExpr, unwinds: bool) {
     // missing `else` is not a disagreement — the value path already answers an
     // uncovered branch with the empty string.
     let (branches, _) = branch_types(node, unwinds);
+    let (bodies, _) = branch_bodies(node);
     let seen: Vec<ReturnType> = branches
         .into_iter()
-        .filter_map(|branch| match branch {
+        .zip(bodies)
+        .filter_map(|(branch, body)| match branch {
+            // **A status branch is the absence channel, not a kind that
+            // disagrees.** `DESIGN.md`'s widening says a declared value type
+            // admits a status meaning "no value", so a branch answering one is
+            // the shape the declaration blesses — and [`declared_matches`] no
+            // longer reports it either. The two fired together on one line
+            // before that widening, which is why exempting this one alone
+            // would have been wrong.
+            //
+            // **The widening is `T | Status(n≠0)`, so a success is not
+            // absence** and keeps its kind. Filtering every status wholesale
+            // silenced `if $p { return status 0 } else { return 7 }`, where the
+            // declared check still reports — the two answering differently
+            // again, in the other direction. Raised in review.
+            Yields::Known(ReturnType::Status) if !successful_status_exit(body, unwinds) => None,
             Yields::Known(kind) => Some(kind),
             _ => None,
         })
@@ -13693,6 +13886,18 @@ fn warn_branch_disagreement(node: &parser::IfExpr, unwinds: bool) {
 /// satisfiable, since a glob is only a value inside a match operand — so a
 /// `glob func` warns until that gap closes, which is filed rather than hidden.
 fn declared_matches(declared: ReturnType, value: &Value) -> bool {
+    // **A declared value type also admits a failing status**, standing for "no
+    // value" — `DESIGN.md`'s `T | Status` widening, spelled nowhere because it
+    // holds everywhere, which is what keeps `str func gets()` one word. The
+    // code has to be **nonzero**: `status(0)` is an outcome rather than an
+    // absence (`DESIGN.md` §"Variables and assignment" sorts the two), so a
+    // success status answering an `int` declaration is still a disagreement.
+    // `status func` is excluded because a status is its domain value there, not
+    // the absence of one.
+    if !matches!(declared, ReturnType::Status) && matches!(value, Value::Status(code) if *code != 0)
+    {
+        return true;
+    }
     match declared {
         ReturnType::Value => true,
         ReturnType::Status => matches!(value, Value::Status(_)),

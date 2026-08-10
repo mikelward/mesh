@@ -1053,7 +1053,8 @@ Five consequences worth stating rather than discovering:
   nothing, exactly as a `false` does. It used to bind, which would have made this
   sentence false the moment `DESIGN.md`'s `T | Status(n≠0)` widening let a declared
   type answer one — the binding contract was changed rather than this guarantee
-  given up. The price is that the `else` branch cannot read the failing code; a
+  given up. Both halves are built now: the widening is in `declared_matches`, and
+  a `status(0)` is still refused there, since only a *failing* status is absence. The price is that the `else` branch cannot read the failing code; a
   caller who wants it assigns first and tests the name.
 - **A tail value *is* a return, and is checked as one.** A typed func whose
   body ends in an expression of its declared type has returned it — `return` is
