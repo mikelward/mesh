@@ -75,6 +75,24 @@ pub struct Table {
     pub unreadable: usize,
 }
 
+/// Does this error mean the process is simply **gone**?
+///
+/// Two spellings, because `/proc` gives a different one depending on *when* the
+/// process died. Gone before the open: `ENOENT`, the directory is not there.
+/// Gone between the open and the read: `ESRCH`, since the file is a view of a
+/// task that no longer exists — and `read` is where that lands, so
+/// [`std::fs::read`] can return it having opened the file successfully.
+///
+/// Only `ENOENT` was handled, which made a whole-table read fail whenever any
+/// process on the host exited inside that window. It went unnoticed on a quiet
+/// machine and turned up under a loaded CI runner, where processes come and go
+/// throughout the scan. `ESRCH` has no [`std::io::ErrorKind`] of its own, so the
+/// raw number is what there is to match on.
+#[cfg(target_os = "linux")]
+fn vanished(error: &std::io::Error) -> bool {
+    error.kind() == std::io::ErrorKind::NotFound || error.raw_os_error() == Some(libc::ESRCH)
+}
+
 /// Every process this user can see.
 ///
 /// An error means the table could not be read *at all* — not that there was
@@ -111,7 +129,7 @@ pub fn processes() -> std::io::Result<Table> {
             Ok(stat) => stat,
             // The process exited between being listed and being read. This is
             // the ordinary case, not a failure.
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(err) if vanished(&err) => continue,
             // A process this user is not allowed to inspect. Under `hidepid`
             // that is every process belonging to somebody else, so failing the
             // whole read here would disable the limit outright on exactly the
@@ -661,6 +679,32 @@ mod tests {
         assert!(!walked_up, "the walk reached this process: {found:?}");
         assert!(root_first, "the root is not listed first: {found:?}");
         assert_eq!(depth, 2, "child and grandchild expected: {found:?}");
+    }
+
+    /// A process that goes during the scan is skipped, however `/proc` spells
+    /// it.
+    ///
+    /// The spelling depends on *when* it went: `ENOENT` before the open, `ESRCH`
+    /// between the open and the read. Only the first was handled, so any process
+    /// on the host exiting inside that window failed the whole table read — rare
+    /// on a quiet machine, reproducible on a loaded CI runner. Anything else is
+    /// still a real failure, since a short table read as a complete one is what
+    /// lets a live group go unswept.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_process_that_goes_mid_read_is_not_a_failed_table() {
+        for code in [libc::ENOENT, libc::ESRCH] {
+            assert!(
+                super::vanished(&std::io::Error::from_raw_os_error(code)),
+                "raw {code} should read as a process that has gone"
+            );
+        }
+        for code in [libc::EACCES, libc::EIO] {
+            assert!(
+                !super::vanished(&std::io::Error::from_raw_os_error(code)),
+                "raw {code} is a real failure, not a process that has gone"
+            );
+        }
     }
 
     /// A process's recorded start does not move while it runs.
