@@ -34517,6 +34517,38 @@ fn if_branches_that_literally_disagree_are_reported() {
         ("x = if $p { 1..3 } else { \"s\" }", "`list` and `str`"),
         // A group is transparent, so a valid operand inside one still counts.
         ("x = if $p { (1)..3 } else { \"s\" }", "`list` and `str`"),
+        // **An operator that answers a question is a bool** whatever it is
+        // given, so it is a usable condition and never a usable endpoint.
+        // Arithmetic is deliberately *not* classified — see the silence test.
+        ("x = if $p { 1 == 1 } else { 7 }", "`bool` and `int`"),
+        ("x = if $p { not true } else { 7 }", "`bool` and `int`"),
+        (
+            "x = if $p { \"a\" == \"a\" } else { 7 }",
+            "`bool` and `int`",
+        ),
+        (
+            "x = if $p { true and false } else { 7 }",
+            "`bool` and `int`",
+        ),
+        ("x = if $p { 1 in [1 2] } else { 7 }", "`bool` and `int`"),
+        // Equality compares two lists happily, where ordering would not.
+        ("x = if $p { [1] == [1] } else { 7 }", "`bool` and `int`"),
+        // A regex right operand has no kind, which is how a real match passes.
+        ("x = if $p { \"ab\" ~ /a/ } else { 7 }", "`bool` and `int`"),
+        // …and a valid one is still read: a bare glob pattern, and a spread
+        // whose operand is fine.
+        ("x = if $p { \"a\" ~ a* } else { 7 }", "`bool` and `int`"),
+        ("x = if $p { not (...true) } else { 7 }", "`bool` and `int`"),
+        (
+            "x = if $p { not (if $q { true } else { false }) } else { 7 }",
+            "`bool` and `int`",
+        ),
+        (
+            "x = if $p { if (1 == 1) { 1 } else { 2 } } else { \"s\" }",
+            "`int` and `str`",
+        ),
+        // A scalar key becomes a string, so this map is a map.
+        ("x = if $p { [7: 1] } else { \"s\" }", "`map` and `str`"),
         (
             "x = if $p { if (true) { 1 } else { 2 } } else { \"s\" }",
             "`int` and `str`",
@@ -34670,6 +34702,268 @@ fn if_branches_that_literally_disagree_are_reported() {
         "mesh: warning: if branches disagree: `int` and `str`\n",
         "exactly one warning, from the inner `if`"
     );
+
+    // A `$(…)` is a string, so a branch that is one reports as `str`.
+    let capture = run_with_input("p = true\nx = if $p { $(puts a) } else { 7 }\nputs done\n");
+    assert_eq!(
+        String::from_utf8_lossy(&capture.stderr),
+        "mesh: warning: if branches disagree: `str` and `int`\n"
+    );
+
+    // A key whose kind is a scalar is a key, however it is spelled — the
+    // compound below yields a `str`, which binds like a written one.
+    let key = run_with_input(
+        "q = true\np = true\nx = if $p { [(if $q { \"a\" } else { \"b\" }): 1] } else { \"s\" }\nputs done\n",
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&key.stderr),
+        "mesh: warning: if branches disagree: `map` and `str`\n"
+    );
+
+    // A map spread of a map is still a map, so the container keeps its kind.
+    let spread = run_with_input(
+        "m = [b: 2]\np = true\nx = if $p { [a: 1, ...$m] } else { \"s\" }\nputs done\n",
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&spread.stderr),
+        "mesh: warning: if branches disagree: `map` and `str`\n"
+    );
+
+    // **A wrapper passing failures through must not swallow the working case.**
+    // A subscript, a modifier with arguments and an interpolation all still
+    // read as values when what they wrap can run.
+    for source in [
+        "xs = [1]\np = false\nx = if $p { not ($xs[(0)]) } else { 7 }\nputs done\n",
+        // A list takes an integer and a map takes a scalar key, so neither of
+        // these is ruled out; a slice of a list is fine with an open end.
+        "p = false\nx = if $p { not (([1 2])[0]) } else { 7 }\nputs done\n",
+        "p = false\nx = if $p { not (([1 2])[1..]) } else { 7 }\nputs done\n",
+        "p = false\nx = if $p { not ([a: 1][\"k\"]) } else { 7 }\nputs done\n",
+        // A call whose callee and arguments can all run is a value like any
+        // other — what it *returns* is a run-time fact.
+        "p = false\nx = if $p { not (f(1)) } else { 7 }\nputs done\n",
+        // A callee that *is* a function value, a member access on a map, a map
+        // spread into a map, and `:capture` on a real call are all untouched.
+        "p = false\nx = if $p { not ((&puts)()) } else { 7 }\nputs done\n",
+        "p = false\nx = if $p { not (([a: 1]).a) } else { 7 }\nputs done\n",
+        "func cg() { }\np = false\nx = if $p { not (cg():capture) } else { 7 }\nputs done\n",
+        // A scalar interpolates, and a spread of a list or an unknown is fine.
+        "p = false\nx = if $p { not (\"${7}\") } else { 7 }\nputs done\n",
+        "func fs(x) { return $x }\np = false\nx = if $p { not fs(...[1]) } else { 7 }\nputs done\n",
+        "func fs(x) { return $x }\nxs = [1]\np = false\nx = if $p { not fs(...$xs) } else { 7 }\nputs done\n",
+        // Comparing a capture is a bool like any other comparison, and an
+        // operand that cannot leave leaves the tail's kind alone.
+        "p = false\nx = if $p { not ($(puts a) == \"a\") } else { 7 }\nputs done\n",
+        "q = true\np = false\nx = if $p { not ((if $q { 1 } else { 2 }) == 1) } else { 7 }\nputs done\n",
+        // A loop, a `match` and a capture whose inputs all run are values like
+        // any other — what they produce is still the run's business.
+        "p = false\nx = if $p { (for i in [1] { $i }) == [1] } else { 7 }\nputs done\n",
+        // Distinct binders destructure fine, and an assignment that can run is
+        // a capture like any other.
+        "p = false\nx = if $p { (for [a b] in [[1 2]] { $a }) == [1] } else { 7 }\nputs done\n",
+        "p = false\nx = if $p { $($env.X = 7) == \"x\" } else { 7 }\nputs done\n",
+        // A guard, an export and a `with` header that can all run are read as
+        // before, and two plain returns still disagree.
+        "q = true\np = false\nx = if $p { $(puts hi if $q) == \"x\" } else { 7 }\nputs done\n",
+        "p = false\nx = if $p { $(export X=(7)) == \"x\" } else { 7 }\nputs done\n",
+        "p = false\nx = if $p { $(with X=(1) { puts a }) == \"x\" } else { 7 }\nputs done\n",
+        // An argument that can run, and a guard that can, are read as before.
+        "p = false\nx = if $p { $(puts (1)) == \"x\" } else { 7 }\nputs done\n",
+        // An interpolation and an env prefix that can run are read as before.
+        "y = 1\np = false\nx = if $p { $(puts \"${y}\") == \"x\" } else { 7 }\nputs done\n",
+        "p = false\nx = if $p { $(X=(1) puts) == \"x\" } else { 7 }\nputs done\n",
+        "any func fo(p) { if $p { puts hi; true } else { 7 } }\na = fo(false)\nputs done\n",
+        "q = true\np = false\nx = if $p { if puts hi if $q { true } else { false } } else { 7 }\nputs done\n",
+        "p = false\nx = if $p { (match 1 { 1 => 2 }) == 1 } else { 7 }\nputs done\n",
+        // A pattern that compiles, a bare glob, a binding-free `_`, and a range
+        // are all patterns a run can try.
+        "p = false\nx = if $p { (match \"a\" { /a/ => 1 }) == 1 } else { 7 }\nputs done\n",
+        "p = false\nx = if $p { (match \"a\" { _ => 1 }) == 1 } else { 7 }\nputs done\n",
+        // A list with one binding, a map with two, a range, and an unknown
+        // iterable are all loops a run can make.
+        "p = false\nx = if $p { (for i in [1 2] { $i }) == [1] } else { 7 }\nputs done\n",
+        "p = false\nx = if $p { (for k, v in [a: 1] { $k }) == [1] } else { 7 }\nputs done\n",
+        "p = false\nx = if $p { (for i in 1..3 { $i }) == [1] } else { 7 }\nputs done\n",
+        "xs = [1]\np = false\nx = if $p { (for i in $xs { $i }) == [1] } else { 7 }\nputs done\n",
+        // A guard on a pattern that can fall through is not one this can be
+        // sure of, so it is left alone.
+        "p = false\nx = if $p { (match 1 { 2 if not 7 => 1 }) == 1 } else { 7 }\nputs done\n",
+        // A capture whose compound statements can all run is a string as before.
+        "p = false\nx = if $p { $(if true { puts x }) == \"x\" } else { 7 }\nputs done\n",
+        "p = false\nx = if $p { $(for i in [1] { puts $i }) == \"x\" } else { 7 }\nputs done\n",
+        // An interpolation, an `else if` chain and a loop that cannot leave are
+        // all read as before.
+        "y = 1\np = false\nx = if $p { \"x${y}\" == \"x\" } else { 7 }\nputs done\n",
+        "q = true\np = false\nx = if $p { (if $q { true } else if $q { false } else { true }) == true } else { 7 }\nputs done\n",
+        "m = [k: 1]\np = false\nx = if $p { not ($m.k) } else { 7 }\nputs done\n",
+        "p = false\nx = if $p { not (\"a\":split(\" \")) } else { 7 }\nputs done\n",
+        "s = \"a\"\np = false\nx = if $p { not (\"${s}\") } else { 7 }\nputs done\n",
+        // Only an all-failing compound yields nothing; one live branch is a value.
+        "p = false\nq = false\nx = if $p { not (if $q { :capture } else { true }) } else { 7 }\nputs done\n",
+        // **A fork is a wall in both directions**, so what happens inside one
+        // settles nothing out here. A stage of a *multi*-stage pipeline runs in
+        // a child: an operand that can only error there leaves the pipeline with
+        // a failed status rather than failing the capture, so the capture is
+        // still the string it always was. The single-stage spellings of these
+        // two are in the silence list, which is the whole point.
+        "p = false\nx = if $p { $(puts (not 7) | cat) == \"x\" } else { 7 }\nputs done\n",
+        "p = false\nx = if $p { $(puts hi | cat (not 7)) == \"x\" } else { 7 }\nputs done\n",
+        // **A glob is compiled only against a string subject.** `match_bindings`
+        // reaches the compile inside its `Value::String` arm, so against an int
+        // the arm simply does not match and the `match` answers normally.
+        "p = false\nx = if $p { (match 1 { a[ => 1; _ => 2 }) == 1 } else { 7 }\nputs done\n",
+        // The exit walk reads the same wall from the other side: a `return` in a
+        // forked stage unwinds the child, so the statement after it still runs
+        // and the branch's tail is reached after all. `fork` is the same rule
+        // said a second way.
+        "any func fk(p) { if $p { puts (if true { return 1 }) | cat; true } else { 7 } }\na = fk(false)\nputs done\n",
+        "any func fo(p) { if $p { fork { return 1 }; true } else { 7 } }\na = fo(false)\nputs done\n",
+        // A computed alias name whose pieces are ordinary is still a definition
+        // that runs, so the capture around it is the string it always was — the
+        // silence above is about what the name *contains*, not about the shape.
+        "y = \"n\"\np = false\nx = if $p { $(alias \"${y}\" = puts hi) == \"x\" } else { 7 }\nputs done\n",
+        // **An error is not the end of a body.** A failing statement reports and
+        // what follows still runs, so it is only the *last* statement that can
+        // take a capture with it — `$(y = not 7; puts hi)` really does capture
+        // `hi`, and a branch body that fails before its tail really does reach
+        // that tail. Reading either as impossible swallowed a true warning.
+        "p = false\nx = if $p { $(y = not 7; puts hi) == \"x\" } else { 7 }\nputs done\n",
+        "p = false\nx = if $p { $(with X=x { y = not 7; puts hi }) == \"x\" } else { 7 }\nputs done\n",
+        "p = false\nx = if $p { y = not 7; true } else { 7 }\nputs done\n",
+        // A binder that *is* legal leaves the capture the string it always was,
+        // so the silence above is about the binder rather than the shape.
+        "p = false\nx = if $p { $([a b] = [1 2]; puts hi) == \"x\" } else { 7 }\nputs done\n",
+        // **A path variable joins a list with `:`**, which is `environ`'s own
+        // exception to the rule above — so this one really does cross, and a
+        // hand-written "a list cannot be an env value" would have got it wrong.
+        // A name only the run knows might be a path variable too, so it is left
+        // alone rather than guessed at.
+        "p = false\nx = if $p { $(export MANPATH=([\"/a\" \"/b\"])) == \"x\" } else { 7 }\nputs done\n",
+        "p = false\nx = if $p { $(export X=(7)) == \"x\" } else { 7 }\nputs done\n",
+        "n = \"X\"\np = false\nx = if $p { $($env[$n] = [1 2]) == \"x\" } else { 7 }\nputs done\n",
+        // A flat path list and a spread of an actual list both run, so both keep
+        // reporting — the silences above are about the element and the kind,
+        // not about the shape.
+        "p = false\nx = if $p { $(export PATH=([\"/a\" \"/b\"])) == \"x\" } else { 7 }\nputs done\n",
+        "p = false\nx = if $p { $(puts ...([1 2])) == \"x\" } else { 7 }\nputs done\n",
+        // **A value with no text form is reported, not thrown.** Interpolating a
+        // list into a *word* leaves the word empty and the capture still binds,
+        // so this branch really is a `str` — unlike `"${not 7}"`, which can only
+        // error and is in the silence list. Raised in review as a claimed
+        // silence; measured, and it is the opposite.
+        "p = false\nx = if $p { $(puts \"${[1]}\") == \"x\" } else { 7 }\nputs done\n",
+        // A **guarded** arm is not certain to run its body, and a first arm that
+        // can fall through settles nothing either — a bare word in pattern
+        // position is a glob, not a binding, so `n` really may not match.
+        "q = true\np = false\nx = if $p { (match 1 { _ if $q => not 7 }) == 1 } else { 7 }\nputs done\n",
+        "p = false\nx = if $p { (match 1 { 2 => not 7; _ => 1 }) == 1 } else { 7 }\nputs done\n",
+        // And a name that is perfectly legal still defines, in both vocabularies.
+        "p = false\nx = if $p { $(alias zz = puts hi) == \"x\" } else { 7 }\nputs done\n",
+        "p = false\nx = if $p { $(func _s:zzz() { $_s }) == \"x\" } else { 7 }\nputs done\n",
+        // **`||` catches a head that can only error** — `$(y = not 7 || puts hi)`
+        // binds `hi` and exits 0 — and it catches from anywhere in the chain, so
+        // the silences above hold only while every link is `&&`. What the *right*
+        // side does is the run's business either way.
+        "p = false\nx = if $p { $(y = not 7 || puts hi) == \"x\" } else { 7 }\nputs done\n",
+        "p = false\nx = if $p { $(y = not 7 && puts a || puts b) == \"x\" } else { 7 }\nputs done\n",
+        "p = false\nx = if $p { $(puts hi && y = not 7) == \"x\" } else { 7 }\nputs done\n",
+        // A legal quoted key still writes, and a key only the run knows is left
+        // alone even when it is spelled badly in the source it came from.
+        "p = false\nx = if $p { $($env[\"AB\"] = x) == \"x\" } else { 7 }\nputs done\n",
+        "n = \"A=B\"\np = false\nx = if $p { $($env[$n] = x) == \"x\" } else { 7 }\nputs done\n",
+        // A path entry really does take a scalar element, `7` included, and a
+        // target only the run can resolve is left alone like every other unknown.
+        "p = false\nx = if $p { $($env.PATH[0] = \"/x\") == \"x\" } else { 7 }\nputs done\n",
+        "p = false\nx = if $p { $($env.PATH[0] = 7) == \"x\" } else { 7 }\nputs done\n",
+        "n = \"PATH\"\np = false\nx = if $p { $($env[$n][0] = \"z\") == \"x\" } else { 7 }\nputs done\n",
+        // A negative index parses, so it is the run's business whether it lands;
+        // an alternation with no catch-all can still fall through to the next
+        // arm; and a guard makes even a certain pattern uncertain again.
+        "p = false\nx = if $p { $($env.PATH[-1] = \"/x\") == \"x\" } else { 7 }\nputs done\n",
+        // A flat spread really does cross, a spread of a variable is the run's
+        // business, and `2>&1` and `2>&-` are both descriptors a duplication
+        // accepts.
+        "p = false\nx = if $p { $(export PATH=(...[\"/a\"])) == \"x\" } else { 7 }\nputs done\n",
+        "v = [\"/a\"]\np = false\nx = if $p { $(export PATH=(...$v)) == \"x\" } else { 7 }\nputs done\n",
+        "p = false\nx = if $p { $(puts 2>&1) == \"x\" } else { 7 }\nputs done\n",
+        "p = false\nx = if $p { $(puts 2>&-) == \"x\" } else { 7 }\nputs done\n",
+        // An alternative that *could* match stops the walk, so what follows it
+        // is not certain — with a string subject, or a subject only the run
+        // knows. A spread of a scalar renders, and one of a variable is the
+        // run's business.
+        "p = false\nx = if $p { (match \"a\" { \"a\" | :capture => 1; _ => 2 }) == 1 } else { 7 }\nputs done\n",
+        "any func sj() { 1 }\np = false\nx = if $p { (match (sj()) { \"a\" | :capture => 1; _ => 2 }) == 1 } else { 7 }\nputs done\n",
+        "p = false\nx = if $p { $(export PATH=([... 7])) == \"x\" } else { 7 }\nputs done\n",
+        "v = [\"/a\"]\np = false\nx = if $p { $(export PATH=([... $v])) == \"x\" } else { 7 }\nputs done\n",
+        "p = false\nx = if $p { (match 1 { 2 | 3 => not 7 }) == 1 } else { 7 }\nputs done\n",
+        "q = true\np = false\nx = if $p { (match 1 { 2 | _ if $q => not 7 }) == 1 } else { 7 }\nputs done\n",
+    ] {
+        let out = run_with_input(source);
+        assert_eq!(
+            String::from_utf8_lossy(&out.stderr),
+            "mesh: warning: if branches disagree: `bool` and `int`\n",
+            "for {source:?}"
+        );
+    }
+}
+
+/// A long expression is read **once**, not once per subtree.
+///
+/// Asking "can this only error?" and "what kind is this?" as two walks that
+/// consult each other visits every subtree twice per level, which is
+/// exponential in depth: a chain of 24 additions took twelve seconds and 26 did
+/// not finish, so an ordinary line could hang the shell. One walk answers both.
+/// Raised in review, with measurements.
+#[test]
+fn a_long_expression_does_not_stall_the_branch_check() {
+    let chain = vec!["1"; 40].join(" + ");
+    let started = std::time::Instant::now();
+    let out = run_with_input(&format!(
+        "p = false\nx = if $p {{ ({chain})..3 }} else {{ \"s\" }}\nputs done\n"
+    ));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "done\n");
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(5),
+        "reading a 40-term chain took {:?}",
+        started.elapsed()
+    );
+
+    // A compound nested inside a binary **operand** is the third shape, and the
+    // one the exit check walks: asking whether an operand can leave is a second
+    // pass over the tail, so it has to stay linear too. Twenty levels is the
+    // deepest this shape fits inside the parser's 100-level cap.
+    let mut operands = String::from("1");
+    for _ in 0..20 {
+        operands = format!("(if $q {{ {operands} }} else {{ 2 }}) == 1");
+    }
+    let started = std::time::Instant::now();
+    let out = run_with_input(&format!(
+        "p = false\nq = true\nx = if $p {{ {operands} }} else {{ \"s\" }}\nputs done\n"
+    ));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "done\n");
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(5),
+        "reading 20 nested binary operands took {:?}",
+        started.elapsed()
+    );
+
+    // A nested compound is the other shape that doubled: the tail was walked
+    // once to ask whether it leaves and again to ask its kind, so 16 levels took
+    // half a minute. The two answers agree, so asking one of them is enough.
+    let mut nested = String::from("1");
+    for _ in 0..40 {
+        nested = format!("if $q {{ {nested} }} else {{ 2 }}");
+    }
+    let started = std::time::Instant::now();
+    let out = run_with_input(&format!(
+        "p = false\nq = true\nx = if $p {{ {nested} }} else {{ \"s\" }}\nputs done\n"
+    ));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "done\n");
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(5),
+        "reading 40 nested compounds took {:?}",
+        started.elapsed()
+    );
 }
 
 /// What the check stays silent about, which is most things — and deliberately.
@@ -34756,6 +35050,295 @@ fn the_branch_check_stays_out_of_everything_it_cannot_see() {
         "p = false\nx = if $p { (007)..3 } else { \"s\" }\n",
         "p = false\nx = if $p { (a)..3 } else { \"s\" }\n",
         "p = false\nx = if $p { 1..(007) } else { \"s\" }\n",
+        // **A bool is not an integer**, so a comparison cannot be a range
+        // endpoint, and an int cannot be a condition — both branches can only
+        // error, whatever kind their operator has.
+        "p = false\nx = if $p { (1 == 1)..3 } else { \"s\" }\n",
+        "p = false\nx = if $p { (not true)..3 } else { \"s\" }\n",
+        // **An operator whose operands cannot meet it produces nothing** —
+        // each of these is a diagnostic rather than a value, so a branch built
+        // on one has no kind, in an endpoint or anywhere else.
+        "p = false\nx = if $p { (1 == \"1\")..3 } else { \"s\" }\n",
+        "p = false\nx = if $p { (true and 7)..3 } else { \"s\" }\n",
+        "p = false\nx = if $p { (1 in 2)..3 } else { \"s\" }\n",
+        "p = false\nx = if $p { (1 in \"abc\")..3 } else { \"s\" }\n",
+        "p = false\nx = if $p { (not 7)..3 } else { \"s\" }\n",
+        "p = false\nx = if $p { (1 < \"a\")..3 } else { \"s\" }\n",
+        "p = false\nx = if $p { (\"a\" ~ \"b\")..3 } else { \"s\" }\n",
+        "p = false\nx = if $p { if (1 == \"1\") { 1 } else { 2 } } else { \"s\" }\n",
+        // Arithmetic has no kind here, but bad operands still rule it out.
+        "p = false\nx = if $p { (\"a\" + \"b\")..3 } else { \"s\" }\n",
+        // **Arithmetic's kind is known to operand checking even though it is
+        // never reported as a branch kind**, so an operator that cannot take an
+        // int is still refused: `not (1 + 1)` is *an int is not a condition*.
+        "p = false\nx = if $p { not (1 + 1) } else { 7 }\n",
+        "p = false\nx = if $p { \"s\" == (1 + 1) } else { 7 }\n",
+        // A match reads its subject as a string, not only its pattern.
+        "p = false\nx = if $p { [1] ~ /a/ } else { 7 }\n",
+        // A compound that cannot pick a branch yields nothing, and an operator
+        // around it cannot hand it a kind.
+        "p = false\nx = if $p { not (if 7 { true } else { false }) } else { 7 }\n",
+        // A pattern that cannot compile matches nothing — *invalid regex*
+        // rather than a value, so the match has no kind either.
+        "p = false\nx = if $p { \"a\" ~ /[/ } else { 7 }\n",
+        // A wrapper cannot rescue an operand that can only error: `...` is
+        // transparent where a value is read, a modifier evaluates its subject
+        // first, and a bare glob is a pattern like a regex.
+        "p = false\nx = if $p { not (...:capture) } else { 7 }\n",
+        "p = false\nx = if $p { not (...7) } else { 7 }\n",
+        "p = false\nx = if $p { \"a\" ~ /[/:i } else { 7 }\n",
+        "p = false\nx = if $p { \"a\" ~ a[ } else { 7 }\n",
+        // Subscripting, a modifier's arguments, and an interpolation are the
+        // same wrapper again: each evaluates something that can only error
+        // before it has anything of its own to give.
+        "p = false\nx = if $p { not (:capture[0]) } else { 7 }\n",
+        "xs = [1]\np = false\nx = if $p { not ($xs[:capture]) } else { 7 }\n",
+        "p = false\nx = if $p { not (:capture.name) } else { 7 }\n",
+        "p = false\nx = if $p { not (\"a\":split(:capture)) } else { 7 }\n",
+        "p = false\nx = if $p { not (\"${:capture}\") } else { 7 }\n",
+        // **Every branch failing is the compound failing**, whichever way its
+        // own condition falls — so there is no value for `not` to read.
+        "p = false\nq = false\nx = if $p { not (if $q { :capture } else { not 7 }) } else { 7 }\n",
+        // **An exit reads its operand as a tail does**, failure included, so a
+        // compound that only ever `return`s something impossible yields nothing.
+        "any func fr(p, q) { if $p { not (if $q { return not 7 } else { return :capture }) } else { return 7 } }\na = fr(false, false)\n",
+        // A call evaluates its arguments, so one that can only error is what
+        // happens instead of the call.
+        "p = false\nx = if $p { not status(:capture) } else { 7 }\n",
+        // **Only a list or a map can be subscripted at all**, a list wants an
+        // integer, a map wants a key a scalar can spell, and only a list can be
+        // sliced — each rule is one `eval_index` states in its own diagnostic.
+        "p = false\nx = if $p { not ((7)[0]) } else { 7 }\n",
+        "p = false\nx = if $p { not ((\"ab\")[0]) } else { 7 }\n",
+        "p = false\nx = if $p { not ([1][\"a\"]) } else { 7 }\n",
+        "p = false\nx = if $p { not ([1][true]) } else { 7 }\n",
+        "p = false\nx = if $p { not ([a: 1][1..]) } else { 7 }\n",
+        "p = false\nx = if $p { not ([a: 1][[1]]) } else { 7 }\n",
+        // **A member access needs a map**, and **only a map can be spread into
+        // a map** — where a list takes `...7` as an element quite happily.
+        "p = false\nx = if $p { not ((7).x) } else { 7 }\n",
+        "p = false\nx = if $p { not ((\"s\").x) } else { 7 }\n",
+        "p = false\nx = if $p { [a: 1, ...7] } else { \"s\" }\n",
+        "p = false\nx = if $p { [a: 1, ...[1 2]] } else { \"s\" }\n",
+        // **A callee written as a value has to be one that can be called.** A
+        // callee written as a *word* is a name, so it is left alone — `true()`
+        // runs the `true` command and `7()` is *command not found: 7*.
+        "p = false\nx = if $p { not ((7)()) } else { 7 }\n",
+        "p = false\nx = if $p { not ([1 2]()) } else { 7 }\n",
+        // **`:capture` wraps a call**, so any other subject — and any argument —
+        // is the same nothing a bare `:capture` is.
+        "p = false\nx = if $p { not (\"x\":capture) } else { 7 }\n",
+        "func cg() { }\np = false\nx = if $p { not (cg():capture(\"a\")) } else { 7 }\n",
+        // **A key is judged by its kind, not by its spelling** — a compound
+        // yielding a list is the same bad key a written `[]` is.
+        "p = false\nq = true\nx = if $p { [(if $q { [1] } else { [2] }): 1] } else { \"s\" }\n",
+        // **A double-quoted interpolation has to have a text form**, which a
+        // list, a map and a func do not.
+        "p = false\nx = if $p { not (\"${[1 2]}\") } else { 7 }\n",
+        "p = false\nx = if $p { not (\"${[a: 1]}\") } else { 7 }\n",
+        "p = false\nx = if $p { not (\"${&puts}\") } else { 7 }\n",
+        // **A spread argument is unpacked**, so a scalar is refused before the
+        // call happens at all.
+        "func fs(x) { return $x }\np = false\nx = if $p { not fs(...7) } else { 7 }\n",
+        "func fs(x) { return $x }\np = false\nx = if $p { not fs(...\"s\") } else { 7 }\n",
+        // **A `$(…)` is a string**, so it is refused everywhere a string is —
+        // as a condition, a range endpoint, an arithmetic operand.
+        "p = false\nx = if $p { not $(puts hi) } else { 7 }\n",
+        "p = false\nx = if $p { $(puts 1)..3 } else { \"s\" }\n",
+        "p = false\nx = if $p { $(puts 1) + 1 } else { \"s\" }\n",
+        // **An operand can leave before the operator around it runs**, so the
+        // operator's kind describes a value no run produces.
+        "any func fl(p, q) { if $p { (if $q { return 1 } else { return 2 }) == 1 } else { \"s\" } }\na = fl(false, true)\n",
+        // **An arm's value can carry a control too**, so a `match` written in an
+        // operand is walked for exits like every other compound.
+        "any func fm(p, q) { if $p { (match 1 { 1 => if $q { return 1 } else { return 2 } }) == 1 } else { \"s\" } }\na = fm(false, true)\n",
+        // **A loop reads its iterable and a `match` its subject** before
+        // anything else happens, and **a capture whose body can only error
+        // captures nothing** rather than the empty string.
+        "p = false\nx = if $p { (for i in :capture { $i }) == [1] } else { 7 }\n",
+        "p = false\nx = if $p { (match :capture { 1 => 2 }) == 1 } else { 7 }\n",
+        // **The first pattern is tried whatever the subject is**, so one that
+        // cannot compile is what happens rather than a match.
+        "p = false\nx = if $p { (match \"a\" { /[/ => 1 }) == 1 } else { 7 }\n",
+        "p = false\nx = if $p { (match \"a\" { a[ => 1 }) == 1 } else { 7 }\n",
+        "p = false\nx = if $p { (match \"a\" { :capture => 1 }) == 1 } else { 7 }\n",
+        // **A loop needs a collection, and the bindings say which** — one for a
+        // list, two for a map — so a scalar or a mismatched count cannot loop.
+        "p = false\nx = if $p { (for i in 7 { $i }) == [1] } else { \"s\" }\n",
+        "p = false\nx = if $p { (for i in \"ab\" { $i }) == [1] } else { \"s\" }\n",
+        "p = false\nx = if $p { (for i in [a: 1] { $i }) == [1] } else { \"s\" }\n",
+        "p = false\nx = if $p { (for k, v in [1 2] { $k }) == [1] } else { \"s\" }\n",
+        // **A guard runs once its pattern has matched**, so a first arm that
+        // matches anything has one this can be sure of.
+        "p = false\nx = if $p { (match 1 { _ if not 7 => 1 }) == 1 } else { \"s\" }\n",
+        // A guard can carry a control out of the branch, like an arm's value.
+        "any func fmg(p) { if $p { (match 1 { _ if (if true { return 1 }) => 2 }) == 1 } else { \"s\" } }\na = fmg(false)\n",
+        // A **pattern** is an expression too, so it can carry one out as well.
+        "any func fmp(p) { if $p { (match 1 { (if true { return 1 }) => 2 }) == 1 } else { \"s\" } }\na = fmp(false)\n",
+        // **A condition that leaves picks no branch either**, so there is no
+        // pair to compare — and every condition in the chain counts, not just
+        // the head.
+        "any func fc(q) { if (if $q { return 1 } else { return 2 }) == 1 { true } else { 7 } }\na = fc(true)\n",
+        "any func fe(q) { if $q { (if $q { true } else if (if true { return 1 }) { false } else { true }) == true } else { 7 } }\na = fe(false)\n",
+        // The same chain in a statement *before* the tail, which is the only
+        // place the exit walk answers it alone — as an operand the condition
+        // check reaches it first.
+        "any func fz(q) { if $q { z = if $q { 1 } else if (if true { return 1 }) { 2 } else { 3 }; true } else { 7 } }\na = fz(false)\n",
+        // **A word is built by evaluating its pieces**, and **a loop reads its
+        // iterable before the first pass** — a control in either leaves first.
+        "any func fw(p) { if $p { \"x${if true { return 1 }}\" == \"x\" } else { \"s\" } }\na = fw(false)\n",
+        "any func fi(p) { if $p { for x in (if true { return 1 }) { }; true } else { 7 } }\na = fi(false)\n",
+        // **A compound statement in a capture body fails like an expression
+        // does**, so a capture built on one produces nothing to compare.
+        "p = false\nx = if $p { $(if 7 { puts x }) == \"x\" } else { 7 }\n",
+        "p = false\nx = if $p { $(for i in 7 { puts $i }) == \"x\" } else { 7 }\n",
+        "p = false\nx = if $p { $(while 7 { puts x }) == \"x\" } else { 7 }\n",
+        "p = false\nx = if $p { $(match :capture { 1 => 2 }) == \"x\" } else { 7 }\n",
+        "p = false\nx = if $p { $(y = not 7) == \"s\" } else { 7 }\n",
+        // **Every shape that writes a value counts**, not just the plain one.
+        "p = false\nx = if $p { $($env.X = not 7) == \"x\" } else { \"s\" }\n",
+        "p = false\nx = if $p { $(export X = not 7) == \"x\" } else { \"s\" }\n",
+        "m = [k: 1]\np = false\nx = if $p { $($m.k = not 7) == \"x\" } else { \"s\" }\n",
+        // **A loop's binders are checked before its iterable is evaluated**, so
+        // a duplicate name is what happens whatever it was going to loop over.
+        "p = false\nx = if $p { (for [i i] in [[1 2]] { $i }) == [1] } else { \"s\" }\n",
+        // **An assignment's binders are the same question**, and no right-hand
+        // side can rescue one — the `for` path had learned this and the
+        // assignment path had not.
+        "p = false\nx = if $p { $([x x] = [1 2]) == \"x\" } else { 7 }\n",
+        "p = false\nx = if $p { $([env] = [1]) == \"x\" } else { 7 }\n",
+        "p = false\nx = if $p { $(global [x x] = [1 2]) == \"x\" } else { 7 }\n",
+        // **A guard is worked out before the statement it guards**, in a value
+        // statement, an exit, or any command of a pipeline.
+        "p = false\nx = if $p { $(puts hi if not 7) == \"x\" } else { 7 }\n",
+        "p = false\nx = if $p { $(puts a | cat if not 7) == \"x\" } else { 7 }\n",
+        // **A command's value arguments are expanded before it runs**, and a
+        // `with` evaluates its header before the block.
+        "p = false\nx = if $p { $(puts (not 7)) == \"x\" } else { 7 }\n",
+        "p = false\nx = if $p { $(puts a (not 7) b) == \"x\" } else { 7 }\n",
+        // **Every expression a command evaluates counts**, not just a value
+        // argument: an interpolated word, a redirect's target, an env prefix.
+        "p = false\nx = if $p { $(puts \"${not 7}\") == \"x\" } else { 7 }\n",
+        "p = false\nx = if $p { $(X=(not 7) puts) == \"x\" } else { 7 }\n",
+        "p = false\nx = if $p { $(puts > \"${not 7}\") == \"x\" } else { 7 }\n",
+        // **An invalid glob is fatal only where something compiles it**, which
+        // is a `match` against a string subject — including a subject only the
+        // run knows — and the right of `~` / `!~`. Building the value compiles
+        // nothing, so the glob itself carries no failure.
+        "p = false\nx = if $p { (match \"z\" { a[ => 1; _ => 2 }) == 1 } else { \"s\" }\n",
+        "any func gs() { \"z\" }\np = false\nx = if $p { (match (gs()) { a[ => 1; _ => 2 }) == 1 } else { \"s\" }\n",
+        "p = false\nx = if $p { (\"z\" ~ a[) } else { 7 }\n",
+        "p = false\nx = if $p { (\"z\" !~ a[) } else { 7 }\n",
+        // A regex pattern is *not* conditional the same way: `eval_expr`
+        // compiles it to build the value, before the subject is consulted.
+        "p = false\nx = if $p { (match 1 { /[/ => 1; _ => 2 }) == 1 } else { \"s\" }\n",
+        // **The last statement of a capture body is the one that decides**, so
+        // a failure there takes the capture with it however much ran first —
+        // and a `with`'s block always runs, so its own last statement counts
+        // the same way.
+        "p = false\nx = if $p { $(puts hi; y = not 7) == \"x\" } else { 7 }\n",
+        "p = false\nx = if $p { $(with X=x { y = not 7 }) == \"x\" } else { 7 }\n",
+        // **The environment carries bytes**, so a list, a map or a func cannot
+        // cross into it however well it evaluated — and the rule is the same in
+        // all four places an entry is written.
+        "p = false\nx = if $p { $(export X=([1 2])) == \"x\" } else { 7 }\n",
+        "p = false\nx = if $p { $($env.X = [1 2]) == \"x\" } else { 7 }\n",
+        "p = false\nx = if $p { $(X=([1 2]) puts hi) == \"x\" } else { 7 }\n",
+        "p = false\nx = if $p { $(with X=([1 2]) { puts hi }) == \"x\" } else { 7 }\n",
+        "p = false\nx = if $p { $(export X=([a: 1])) == \"x\" } else { 7 }\n",
+        "p = false\nx = if $p { $(export X=(&puts)) == \"x\" } else { 7 }\n",
+        // **The path-variable exception reaches one level deeper than the outer
+        // kind**: `join_path` renders a scalar and refuses anything nested.
+        "p = false\nx = if $p { $(export PATH=([[1]])) == \"x\" } else { 7 }\n",
+        "p = false\nx = if $p { $(export PATH=([[a: 1]])) == \"x\" } else { 7 }\n",
+        // **A command's `...` takes a list and nothing else** — argv is flat, so
+        // this is narrower than a call's spread, which also takes a map.
+        "p = false\nx = if $p { $(puts ...(7)) == \"x\" } else { 7 }\n",
+        "p = false\nx = if $p { $(puts ...([a: 1])) == \"x\" } else { 7 }\n",
+        // **A write *into* an entry has three ways to be impossible** before its
+        // value matters: the name, the entry not being a path variable (nothing
+        // else reads as a list), and an element that cannot render.
+        "p = false\nx = if $p { $($env[\"A=B\"][0] = \"x\") == \"x\" } else { 7 }\n",
+        "p = false\nx = if $p { $($env.PATH[0] = [1]) == \"x\" } else { 7 }\n",
+        "p = false\nx = if $p { $($env.X[0] = \"z\") == \"x\" } else { 7 }\n",
+        // **And the path below the entry has one shape that can land**: one
+        // subscript, with an index the runtime can parse.
+        "p = false\nx = if $p { $($env.PATH[bad] = \"x\") == \"x\" } else { 7 }\n",
+        "p = false\nx = if $p { $($env.PATH[0][0] = \"x\") == \"x\" } else { 7 }\n",
+        // **A spread contributes its elements**, so a nested list reaches the
+        // entry through `...` just as it does written out — in either spelling.
+        "p = false\nx = if $p { $(export PATH=(...[[1]])) == \"x\" } else { 7 }\n",
+        "p = false\nx = if $p { $(export PATH=([...[[1]]])) == \"x\" } else { 7 }\n",
+        // A spread of a map or a func is **not** flattened — it arrives whole,
+        // as the nested element `join_path` refuses.
+        "p = false\nx = if $p { $(export PATH=([... [a: 1]])) == \"x\" } else { 7 }\n",
+        "p = false\nx = if $p { $(export PATH=([... &puts])) == \"x\" } else { 7 }\n",
+        // **Every alternative before the first that could match is evaluated**,
+        // so a kind that cannot match the subject does not stop the walk.
+        "p = false\nx = if $p { (match 1 { \"a\" | :capture => 1; _ => 2 }) == 1 } else { \"s\" }\n",
+        // **A duplication names a descriptor**, not a path, so a target written
+        // as anything else can only error.
+        "p = false\nx = if $p { $(puts 2>&bad) == \"x\" } else { 7 }\n",
+        "p = false\nx = if $p { $(puts 2>&-1) == \"x\" } else { 7 }\n",
+        // **An exit's operand can leave before the exit does**, so the branch
+        // leaves with the inner value and this statement settles no kind.
+        "any func fr(p, q) { if $p { return (if $q { return 1 } else { return 2 }) == 1; return \"dead\" } else { return \"s\" } }\na = fr(false, true)\n",
+        // **Any alternative that matches anything makes the arm certain**, not
+        // only the first — `2 | _` falls through to the wildcard.
+        "p = false\nx = if $p { (match 1 { 2 | _ => not 7 }) == 1 } else { \"s\" }\n",
+        // **The head of an `&&` chain runs whatever happens**, so a head that
+        // can only error takes the statement with it.
+        "p = false\nx = if $p { $(y = not 7 && puts hi) == \"x\" } else { 7 }\n",
+        "p = false\nx = if $p { $(y = not 7 && puts a && puts b) == \"x\" } else { 7 }\n",
+        // **A name the environment cannot hold is refused before the value is
+        // written**, and a quoted subscript names the same entry every run.
+        "p = false\nx = if $p { $($env[\"A=B\"] = x) == \"x\" } else { 7 }\n",
+        // **An arm that matches anything runs its body**, so when no guard can
+        // turn it away that body is the `match`'s own answer — in either
+        // spelling.
+        "p = false\nx = if $p { (match 1 { _ => not 7 }) == 1 } else { \"s\" }\n",
+        "p = false\nx = if $p { (match 1 { _ => { y = not 7 } }) == 1 } else { \"s\" }\n",
+        // **A name written out is judged before the definition is made**, by
+        // the same two vocabularies the definition itself uses: the command set
+        // for a plain name, the built-in modifiers for a `func _s:name()`.
+        "p = false\nx = if $p { $(alias true = puts hi) == \"x\" } else { 7 }\n",
+        "p = false\nx = if $p { $(alias puts = puts hi) == \"x\" } else { 7 }\n",
+        "p = false\nx = if $p { $(alias a.b = puts hi) == \"x\" } else { 7 }\n",
+        "p = false\nx = if $p { $(func _s:upper() { $_s }) == \"x\" } else { 7 }\n",
+        // **A computed alias name is evaluated to decide what is defined**, so
+        // a piece that can only error happens instead of the definition — and a
+        // control in one leaves before anything is defined. Both walks read the
+        // same word; only `alias` takes a computed name, and a definition cannot
+        // carry a guard, so there is no quantifier to differ over.
+        "p = false\nx = if $p { $(alias \"${not 7}\" = puts hi) == \"x\" } else { 7 }\n",
+        "any func fal(p) { if $p { alias \"${if true { return 1 }}\" = puts; true } else { 7 } }\na = fal(false)\n",
+        // The exit walk reads the same positions — a command's operands and a
+        // compact export, neither of which it reached before.
+        "any func fa(p) { if $p { puts (if true { return 1 }); true } else { 7 } }\na = fa(false)\n",
+        "any func fx(p) { if $p { export X=(if true { return 1 }); true } else { 7 } }\na = fx(false)\n",
+        "any func fi(p) { if $p { puts \"${if true { return 1 }}\"; true } else { 7 } }\na = fi(false)\n",
+        "any func fv(p) { if $p { X=(if true { return 1 }) puts; true } else { 7 } }\na = fv(false)\n",
+        "p = false\nx = if $p { $(with X=(not 7) { puts hi }) == \"x\" } else { 7 }\n",
+        // **A condition is a statement, and a statement can fail before it
+        // answers** — not only the expression form.
+        "p = false\nx = if $p { if puts hi if not 7 { true } else { false } } else { 7 }\n",
+        // **A compact `export A=… B=…` writes each value**, like the singular
+        // spelling beside it.
+        "p = false\nx = if $p { $(export X=(not 7)) == \"x\" } else { 7 }\n",
+        // **An operand leaves before the `return` around it does**, and a
+        // `with` evaluates its header before its body.
+        "any func fr(p, q) { if $p { return (if $q { return 1 } else { return 2 }) == 1 } else { return \"s\" } }\na = fr(false, true)\n",
+        "any func fh(p) { if $p { with X=(if true { return 1 }) { }; true } else { 7 } }\na = fh(false)\n",
+        // **Arithmetic is not classified**, though it is integer-only: calling
+        // it an `int` makes `if $n < 3 { $n + 1 } else { false }` disagree, and
+        // answering `false` to end a `while` is an idiom `DESIGN.md` pins a
+        // contract on. Whether that idiom should be exempt is a language
+        // question, not one to settle by widening a lint.
+        "any func nx(_n) { if $_n < 3 { $_n + 1 } else { false } }\nn = 0\nwhile n = nx($n) { }\n",
+        // **A key is a string, and a collection or a function is not one.**
+        "p = false\nx = if $p { [[]: 1] } else { \"s\" }\n",
+        "p = false\nx = if $p { [[a: 1]: 1] } else { \"s\" }\n",
+        "p = false\nx = if $p { [&puts: 1] } else { \"s\" }\n",
         "p = false\nx = if $p { if (007) { 1 } else { 2 } } else { \"s\" }\n",
         "p = false\nx = if $p { if (a) { 1 } else { 2 } } else { \"s\" }\n",
         // **`:capture` applies to a call, so alone it can only error** — in a
