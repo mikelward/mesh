@@ -843,6 +843,10 @@ pub enum ReturnType {
     /// `Duration` are values too, and each joins when a boundary wants to name
     /// it, not before.
     Job,
+    /// `regex func f()` — a compiled pattern, the kind `re(…)` and a `/…/`
+    /// literal produce. Joins on the same rule `job` did: a boundary named one,
+    /// so the word exists.
+    Regex,
     /// `any func f()` — a value channel of unstated kind. **Being retired**: the
     /// migration reached for it as a blanket, and each site it covers has a true
     /// type to state instead. Kept only until those sites are re-typed.
@@ -862,6 +866,7 @@ impl ReturnType {
         ReturnType::List,
         ReturnType::Map,
         ReturnType::Job,
+        ReturnType::Regex,
         ReturnType::Value,
     ];
 
@@ -875,6 +880,7 @@ impl ReturnType {
             ReturnType::List => "list",
             ReturnType::Map => "map",
             ReturnType::Job => "job",
+            ReturnType::Regex => "regex",
             ReturnType::Value => "any",
         }
     }
@@ -889,6 +895,7 @@ impl ReturnType {
             "list" => Some(ReturnType::List),
             "map" => Some(ReturnType::Map),
             "job" => Some(ReturnType::Job),
+            "regex" => Some(ReturnType::Regex),
             "any" => Some(ReturnType::Value),
             _ => None,
         }

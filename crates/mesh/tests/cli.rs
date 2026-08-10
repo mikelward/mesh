@@ -34312,3 +34312,25 @@ fn an_anonymous_lambda_warns_under_the_modifier_that_ran_it() {
         "mesh: warning: :map: declared `int`, returned a string\n"
     );
 }
+
+/// `regex` joins the vocabulary on the same rule `job` did — a boundary named
+/// one, so the word exists. It was the last kind the type-warning harvest found
+/// flowing out of an `any func` with no word to describe it, alongside function
+/// values.
+#[test]
+fn a_regex_can_be_declared_and_is_checked() {
+    let honest = run_with_input("regex func p() { re(\"a+\") }\nx = p()\nputs done\n");
+    assert_eq!(honest.status.code(), Some(0));
+    assert!(
+        honest.stderr.is_empty(),
+        "unexpected warning: {}",
+        String::from_utf8_lossy(&honest.stderr)
+    );
+
+    let dishonest = run_with_input("regex func p() { 42 }\nx = p()\nputs done\n");
+    assert_eq!(dishonest.status.code(), Some(0));
+    assert_eq!(
+        String::from_utf8_lossy(&dishonest.stderr),
+        "mesh: warning: p: declared `regex`, returned an int\n"
+    );
+}
