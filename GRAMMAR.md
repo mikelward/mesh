@@ -547,7 +547,7 @@ binds a variable named `global`.
 ```ebnf
 definition      = return-type? "wrapper"? "func" definition-name parameter-list capture-list? NL* block
                 | "alias" alias-name capture-list? "=" NL* alias-command ;
-return-type     = "status" | "int" | "str" | "bool" | "list" | "map" | "job" | "regex" | "func" | "any" ;
+return-type     = "status" | "int" | "str" | "bool" | "list" | "map" | "job" | "regex" | "glob" | "stream" | "func" | "any" ;
 definition-name = bare-WORD ;                 # unjudged here; checked when it runs
 alias-name      = definition-name
                 | computed-name ;             # a word holding an interpolation
@@ -591,8 +591,8 @@ joins the set **on use at a function boundary**, not on existing in the runtime,
 which is what keeps a styled string and an `Instant` out until something
 declares one. `any` says only that there is a value channel. It is kept mostly
 for a function whose kind is not what the code is about, and is still the sole
-spelling for a glob, a stream handle, a flag or the flag terminator, none of
-which has a word yet.
+spelling for a flag or the flag terminator, neither of which has a word while
+`Flag`'s own future is open.
 
 Parameters are comma-separated, and the comma is required between two of them
 with no trailing one allowed: `func f(a b)` and `func f(a,)` are both errors.

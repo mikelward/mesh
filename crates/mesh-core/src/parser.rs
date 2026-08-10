@@ -847,6 +847,22 @@ pub enum ReturnType {
     /// literal produce. Joins on the same rule `job` did: a boundary named one,
     /// so the word exists.
     Regex,
+    /// `glob func f()` — a pattern value.
+    ///
+    /// **Nothing can satisfy this yet, and that is the point of having it.**
+    /// `Expr::Glob` is built only inside a match operand, so in value position
+    /// `*.rs` is a command word or a file-list expansion and a body ending in
+    /// one yields a status or a list. The word is here because the repo owner
+    /// asked for it ahead of that: it names the kind now, and the gap it
+    /// exposes — a glob is not a first-class value outside a match — is filed
+    /// in `TODO.md` rather than hidden by the absence of a word.
+    Glob,
+    /// `stream func f()` — one of the shell's own streams.
+    ///
+    /// Narrow by nature: `Value::Stream` has no constructor, and the only ones
+    /// that exist are `$sh.stdin`, `$sh.stdout` and `$sh.stderr`, so this says
+    /// "hands back one of those three" rather than "makes a stream".
+    Stream,
     /// `func func f()` — a function value, the kind a lambda and an `&name`
     /// reference are. The doubled word is the honest spelling: the first is the
     /// type, the second the keyword, and `typed_definition_lead` tells them
@@ -857,10 +873,10 @@ pub enum ReturnType {
     /// on the repo owner's decision, and it means less than it used to: every
     /// kind the declared-type harvest saw flowing out of one — a job, a regex, a
     /// function value — now has a word, so this is no longer where *those* gaps
-    /// hid. It is still the only way to declare a glob, a stream handle, a flag
-    /// or the flag terminator — all four returnable, none with a word. The first
-    /// two wait on the joining rule; the flag kinds wait on whether `Flag`
-    /// survives at all (`docs/TYPES.md` §8), since a word would settle that.
+    /// hid. `glob` and `stream` have since joined too, so the only kinds left
+    /// without a word are a flag and the flag terminator — both returnable, and
+    /// both waiting on whether `Flag` survives at all (`docs/TYPES.md` §8),
+    /// since a word would settle that sideways.
     ///
     /// What is left besides that is the honest case — a function, and especially
     /// a test fixture, that needs a value channel and is not about the type
@@ -883,6 +899,8 @@ impl ReturnType {
         ReturnType::Map,
         ReturnType::Job,
         ReturnType::Regex,
+        ReturnType::Glob,
+        ReturnType::Stream,
         ReturnType::Func,
         ReturnType::Value,
     ];
@@ -898,6 +916,8 @@ impl ReturnType {
             ReturnType::Map => "map",
             ReturnType::Job => "job",
             ReturnType::Regex => "regex",
+            ReturnType::Glob => "glob",
+            ReturnType::Stream => "stream",
             ReturnType::Func => "func",
             ReturnType::Value => "any",
         }
@@ -914,6 +934,8 @@ impl ReturnType {
             "map" => Some(ReturnType::Map),
             "job" => Some(ReturnType::Job),
             "regex" => Some(ReturnType::Regex),
+            "glob" => Some(ReturnType::Glob),
+            "stream" => Some(ReturnType::Stream),
             "func" => Some(ReturnType::Func),
             "any" => Some(ReturnType::Value),
             _ => None,

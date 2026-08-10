@@ -5541,7 +5541,7 @@ before `func` is the slot `wrapper func` and `fork func` already use. The postfi
 entry records what each costs.
 
 - [x] **The type vocabulary is `status`, `int`, `str`, `bool`, `list`, `map`,
-      `job`, `regex`, `func`, `any`** — *(landed — `ReturnType` in `parser.rs`, closed at exactly
+      `job`, `regex`, `glob`, `stream`, `func`, `any`** — *(landed — `ReturnType` in `parser.rs`, closed at exactly
       this set; the sub-items below record what each one cost. `any` was spelled
       `value` until the narrowing landed — see the rename below — and is **kept**,
       on the repo owner's decision, for a value channel whose kind is not the
@@ -5590,17 +5590,38 @@ entry records what each costs.
             knowing `any`.
       - [ ] Still open: whether a compound kind is writable at all (`list`, or a
             list of what).
+      - [ ] **A glob is not a first-class value outside a match operand**, which
+            `glob func` now exposes. `Expr::Glob` is built only by match-operand
+            parsing (`parser.rs:2860`, `:4884`), so in value position `*.rs` is a
+            command word or a file-list expansion: `p = *.rs` binds `[]`, and
+            `glob func sources() { *.rs }` warns `returned a status` because the
+            body ran the pattern as a command. The word was added ahead of the
+            capability on the repo owner's decision, so **every `glob func`
+            warns today** — deliberately, since the alternative was to leave the
+            kind unnameable and the gap unrecorded. Closing it means deciding how
+            a pattern is written where a value is wanted; `re("…")` is the
+            precedent a `glob("…")` constructor would follow, and a bare `*.rs`
+            cannot be it without breaking the command reading.
+      - [ ] **Is there a `flag` type — and does `Flag` survive to need one?**
+            The vocabulary now names every value kind the runtime has except
+            `Flag` and `FlagTerminator` (`x = --force` binds the first). A word
+            is *not* the first question: §8 of `docs/TYPES.md` has a live
+            three-way call on `Flag` itself — delete it, keep it as a marked
+            string with the payload typing dropped, or keep it as today — and
+            minting `flag` now would quietly settle that by making the type
+            declarable at a boundary. So this waits on §8, then follows the
+            joining rule like any other kind. Raised when `stream` and `glob`
+            were added, as the only remaining gap.
       - [x] **Decided: `any` is kept.** The repo owner asked for it to go, then
             kept it once the cost was measured. It had been doing two jobs and
             only one was bad — standing in for kinds the vocabulary could not
             name, and saying "a value channel, kind not the point". `job`,
             `regex` and `func` took the first away for every kind the harvest
             saw, so that is no longer where those gaps hide; the second is
-            honest and is what it now means. A glob, a stream handle, a flag
-            and the flag terminator still have no word, and all four are
-            returnable. The first two wait on the joining rule — no boundary has
-            declared one — and the flag kinds wait on whether `Flag` survives at
-            all, which a word would settle sideways.
+            honest and is what it now means. `glob` and `stream` have since
+            joined as well, leaving a flag and the flag terminator as the only
+            returnable kinds without a word — both waiting on whether `Flag`
+            survives at all, which a word would settle sideways.
 
             *The counts, with the method, because they are the argument.*
             Counting the word `any`, an optional `wrapper`, then the keyword
@@ -5661,10 +5682,9 @@ entry records what each costs.
             until something declares one, and the set stays closed. `regex` and
             `func` joined on that same rule afterwards, which between them took
             away every *previously unnameable kind the declared-type harvest
-            observed*. Not every case `any` covers: a glob, a stream handle, a
-            flag and the flag terminator still have no word, and a polymorphic
-            identity function still wants `any` because no concrete kind is true
-            of it. The reasoning that had
+            observed*. Not every case `any` covers: a flag and the flag
+            terminator still have no word, and a polymorphic identity function
+            still wants `any` because no concrete kind is true of it. The reasoning that had
             kept `job` out follows, unchanged.
 
             A **job is a real value kind**: `$j`
@@ -5948,7 +5968,7 @@ once there is a type vocabulary in the language to reason with.
 
 **How the current proposal works, in one paragraph.** A `func` may declare a
 return type drawn from a closed set (`status`, `int`, `str`, `bool`, `list`,
-`map`, `job`, `regex`, `func`, `any`, with `float` reserved). Declaring none means no value channel: the result
+`map`, `job`, `regex`, `glob`, `stream`, `func`, `any`, with `float` reserved). Declaring none means no value channel: the result
 is a `Status`, and the body's last expression stops being its value. The type
 rides on the definition, so `help` can print it and a caller can read it without
 opening the body.
