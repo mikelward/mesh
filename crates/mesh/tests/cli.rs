@@ -34334,3 +34334,43 @@ fn a_regex_can_be_declared_and_is_checked() {
         "mesh: warning: p: declared `regex`, returned an int\n"
     );
 }
+
+/// `func func f()` — the doubled word is the honest spelling of a function
+/// type: the first is the type, the second the keyword. Four sites in the
+/// declared-type harvest returned a function value with no word to describe
+/// them, which is what earned it a place.
+///
+/// The three spellings that all begin `func` have to stay apart, which is the
+/// part worth pinning: the doubled header is typed, a plain one is untyped, and
+/// a definition whose *name* starts with `func` is neither.
+#[test]
+fn a_function_value_can_be_declared_as_func_func() {
+    let honest = run_with_input(
+        "func func make() { return int func(n) { $n * 2 } }\n\
+         d = make()\nr = $d(21)\nputs $r\n",
+    );
+    assert_eq!(honest.status.code(), Some(0));
+    assert_eq!(String::from_utf8_lossy(&honest.stdout), "42\n");
+    assert!(
+        honest.stderr.is_empty(),
+        "unexpected warning: {}",
+        String::from_utf8_lossy(&honest.stderr)
+    );
+
+    let dishonest = run_with_input("func func bad() { 42 }\nx = bad()\nputs done\n");
+    assert_eq!(
+        String::from_utf8_lossy(&dishonest.stderr),
+        "mesh: warning: bad: declared `func`, returned an int\n"
+    );
+
+    // A plain `func` still declares nothing, so its body's last value is not a
+    // result and the call answers with a status — unchanged by the new word.
+    let plain = run_with_input("func plain() { 42 }\nx = plain()\nputs $x\n");
+    assert_eq!(String::from_utf8_lossy(&plain.stdout), "0\n");
+    assert!(plain.stderr.is_empty());
+
+    // A name that merely starts with `func` is a name, not a marker.
+    let named = run_with_input("int func funcy() { 7 }\nx = funcy()\nputs $x\n");
+    assert_eq!(String::from_utf8_lossy(&named.stdout), "7\n");
+    assert!(named.stderr.is_empty());
+}
