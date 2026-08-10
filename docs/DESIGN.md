@@ -6829,14 +6829,30 @@ to avoid" rather than promising the latter as done.
   Adding the type later may still invalidate scripts written against its absence,
   and that is accepted.
 
-  **`job` is in the set, and `any` is being retired** *(decided by the repo
+  **`job` is in the set** *(decided by the repo
   owner, who asked for `job` directly and did not want the top type)*. A job is a
   real value kind — `$j`, `$j.status`, `$sh.jobs` — so `job func find-server()`
   is the sentence to write, and it settles the boundary question the closed set
   posed: a kind joins **on use at a function boundary**, not on existing in the
   runtime, which is what keeps a styled string, an `Instant` and a `Duration`
-  out until something declares one. `any` survives only until the sites that
-  reached for it are re-typed; each has a true type to state instead.
+  out until something declares one.
+
+  **`any` is kept, and means less than it used to** *(decided by the repo owner,
+  who first asked for it to go and then, given the numbers below, kept it)*. It
+  was doing two jobs: standing in for kinds the vocabulary could not name, and
+  saying "a value channel, kind not the point". `job`, `regex` and `func` took
+  the first job away *for every kind the harvest observed* — but not entirely:
+  a glob, a stream handle, a flag and the flag terminator have no concrete type,
+  so a function returning any of them still declares `any`, and so does a
+  polymorphic identity function, which no word can reach. The two flag kinds are
+  a separate case again: a word for them would prejudge whether `Flag` survives
+  at all, which §8 of `docs/TYPES.md` has open. What the decision rests on is the second job, which
+  is honest wherever it is used. Most of the sites that reach for it
+  are test fixtures that need a value channel and are testing something else
+  entirely; re-typing those to `int` or `str` would assert something the test
+  never checked, and for the roughly two-thirds that never execute, nothing
+  would catch a wrong guess. A top type that names a real case is worth more
+  than a concrete one that is quietly false.
 
   **`regex` joined next, on that same rule and on a measurement.** The
   declared-type warning cannot report on `any` — the top type matches

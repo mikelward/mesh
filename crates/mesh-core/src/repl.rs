@@ -11669,15 +11669,20 @@ fn yields_status(declared: Option<ReturnType>) -> bool {
 
 /// Does a value leaving a call answer to what the function declared?
 ///
-/// `any` accepts everything, which is what makes it the top type and what the
-/// retirement is about. A `Styled` answers to `str` because it *is* a string
+/// `any` accepts everything, which is what makes it the top type — kept for the
+/// case where a value channel is wanted and its kind is not the point. A
+/// `Styled` answers to `str` because it *is* a string
 /// everywhere bytes are wanted (`DESIGN.md` §"Hooks and the prompt") — the
 /// attributes are rendering-only, so refusing it here would split a type the
 /// rest of the language deliberately does not split.
 ///
-/// The kinds with no word — a regex, a glob, a stream handle, a function — can
-/// only be declared `any` today. That is worth knowing before `any` goes: they
-/// are the residue the vocabulary has no way to name.
+/// The kinds still with no word — a glob, a stream handle, a flag, and the flag
+/// terminator — can only be declared `any`. All four are returnable: `x = --force`
+/// binds a flag and `return $x` hands it back. A regex and a function value were
+/// in that list until `regex` and `func` joined; the rest stay out under the same
+/// rule, which admits a kind when a boundary declares one rather than when the
+/// runtime has one — and for the two flag kinds a word would also prejudge
+/// whether `Flag` survives at all (`docs/TYPES.md` §8).
 fn declared_matches(declared: ReturnType, value: &Value) -> bool {
     match declared {
         ReturnType::Value => true,
@@ -18338,8 +18343,9 @@ mod tests {
         // **The other direction**, which matters as much: a word left here after
         // the parser stopped accepting it goes on being stripped as a definition
         // marker, so a header the parser reads as an ordinary command has its
-        // body quarantined. That is live rather than hypothetical — `any` is
-        // being retired, and without this the reader would keep claiming it.
+        // body quarantined. Nothing is in that state today — every word here is
+        // either a `ReturnType` or reserved `float` — and this pass is what
+        // keeps it that way when a word is next removed.
         for word in TYPE_MARKER_WORDS {
             assert!(
                 *word == "float"
