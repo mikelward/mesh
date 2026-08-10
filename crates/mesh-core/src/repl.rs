@@ -6000,6 +6000,7 @@ fn run_modifier_body<'p>(
     // evaluated once, by the caller; this is the copy each element's frame gets.
     let (positionals, switches_on, flag_values) = scanned.clone();
     run_call_body_for_value(
+        label,
         body,
         declared,
         caller_result,
@@ -6241,7 +6242,7 @@ fn eval_modifier_with_arguments(
         // does, so a `return`, a bad arity, or an `exit` inside the callable behaves
         // exactly as it would anywhere else.
         "map" | "filter" | "each" => {
-            let Some(callable) =
+            let Some((callable, written_as)) =
                 single_callable_argument(name, arguments, last, in_function, shell)?
             else {
                 return Ok(control_placeholder());
@@ -6252,7 +6253,11 @@ fn eval_modifier_with_arguments(
                 ));
             };
             // Named once, not per element: the label only reaches a diagnostic.
-            let label = format!(":{name}");
+            // A callable written as `$d` is named `d`, so a warning about the
+            // lambda's declared type points at the variable the reader wrote
+            // rather than at the builtin running it. Raised in review as a P2,
+            // once for `&f` and again for this arm.
+            let label = written_as.unwrap_or_else(|| format!(":{name}"));
             // `:each` never pushes, so it reserves nothing: holding a second
             // list-sized allocation for a vector that is discarded would double the
             // peak for the one modifier that produces no list.
@@ -6481,21 +6486,35 @@ fn replace_modifier(name: &str, subject: Value, old: Value, new: &str) -> Result
     expand::map_strings(subject, name, &mut *transform).map_err(runtime_message)
 }
 
+/// The callable a higher-order modifier was handed, and **the name it was
+/// written as** where there is one.
+///
+/// A bare `$d` carries the variable it came from, which is the name a
+/// diagnostic about the lambda's declaration should use: blaming `:map` points
+/// at a builtin for a type the caller wrote. Anything else — an inline lambda,
+/// a call returning one — has no name to keep, and the modifier's own label is
+/// then the closest thing to a location.
 fn single_callable_argument(
     name: &str,
     arguments: &[parser::Argument],
     last: u8,
     in_function: bool,
     shell: &mut Shell,
-) -> Result<Option<vars::FuncValue>, Step> {
+) -> Result<Option<(vars::FuncValue, Option<String>)>, Step> {
     let [parser::Argument::Positional(expression)] = arguments else {
         return runtime_error(format!("modifier :{name} takes exactly one argument"));
+    };
+    let written_as = match expression {
+        // Without the sigil, so the same lambda reads the same whether it is
+        // called directly (`$d(1)` reports `d`) or handed to a modifier.
+        parser::Expr::Variable(variable) => Some(variable.value.trim_start_matches('$').to_owned()),
+        _ => None,
     };
     let Some(value) = eval_operand(expression, last, in_function, shell)? else {
         return Ok(None);
     };
     match value {
-        Value::Function(function) => Ok(Some(function)),
+        Value::Function(function) => Ok(Some((function, written_as))),
         other => runtime_error(format!(
             "modifier :{name} argument must be a function, got {}",
             value_kind(&other)
@@ -11612,6 +11631,7 @@ fn call_signature_for_value(
     };
 
     run_call_body_for_value(
+        name,
         body,
         declared,
         caller_result,
@@ -11645,6 +11665,59 @@ fn bind_captured(captured: &[(String, Value)], shell: &mut Shell) {
 /// never be spelled separately at a call site.
 fn yields_status(declared: Option<ReturnType>) -> bool {
     matches!(declared, None | Some(ReturnType::Status))
+}
+
+/// Does a value leaving a call answer to what the function declared?
+///
+/// `any` accepts everything, which is what makes it the top type and what the
+/// retirement is about. A `Styled` answers to `str` because it *is* a string
+/// everywhere bytes are wanted (`DESIGN.md` §"Hooks and the prompt") — the
+/// attributes are rendering-only, so refusing it here would split a type the
+/// rest of the language deliberately does not split.
+///
+/// The kinds with no word — a regex, a glob, a stream handle, a function — can
+/// only be declared `any` today. That is worth knowing before `any` goes: they
+/// are the residue the vocabulary has no way to name.
+fn declared_matches(declared: ReturnType, value: &Value) -> bool {
+    match declared {
+        ReturnType::Value => true,
+        ReturnType::Status => matches!(value, Value::Status(_)),
+        ReturnType::Int => matches!(value, Value::Integer(_)),
+        ReturnType::Str => matches!(value, Value::String(_) | Value::Styled(_)),
+        ReturnType::Bool => matches!(value, Value::Boolean(_)),
+        ReturnType::List => matches!(value, Value::List(_)),
+        ReturnType::Map => matches!(value, Value::Map(_)),
+        ReturnType::Job => matches!(value, Value::Job(_)),
+    }
+}
+
+/// Warn — and hand the value back anyway — when a call answers with something
+/// its declaration does not describe.
+///
+/// **A warning rather than a refusal**, decided by the repo owner. The
+/// declaration has constrained nothing until now, so every script written
+/// against it is unverified: `int func f() { "x" }` returns the string today and
+/// exits 0. Refusing outright would break working code on a rule it never had to
+/// obey, and there is no way to know how much until something reports it. The
+/// warning is what turns that unknown into a list, and it can tighten to a
+/// refusal once the list is short.
+///
+/// It fires where the value is **taken**, not where the body ends, because that
+/// is the only place both the declaration and the value exist at once.
+fn warn_declared_type(name: &str, declared: Option<ReturnType>, value: &Value) {
+    let Some(declared) = declared else {
+        // Nothing was declared, so there is nothing to disagree with — a typeless
+        // func has no value channel and never reaches here with a body's value.
+        return;
+    };
+    if declared_matches(declared, value) {
+        return;
+    }
+    note!(
+        "mesh: warning: {name}: declared `{}`, returned {}",
+        declared.as_str(),
+        type_phrase(value)
+    );
 }
 
 /// The **callee half** of a value-mode call: a fresh scope, the binding, the body,
@@ -11691,6 +11764,7 @@ fn run_status_body(body: &parser::Source, shell: &mut Shell) -> Result<Value, St
 }
 
 fn run_call_body_for_value(
+    name: &str,
     body: &parser::Source,
     declared: Option<ReturnType>,
     caller_result: Value,
@@ -11749,9 +11823,15 @@ fn run_call_body_for_value(
         // command position — `run_status_body` never sees it, since it unwinds
         // past `run_source`.
         Err(Step::Return(_, code)) if yields_status(declared) => Ok(Value::Status(code)),
-        Ok(value) => Ok(value),
+        Ok(value) => {
+            warn_declared_type(name, declared, &value);
+            Ok(value)
+        }
         // An explicit `return val` yields its value; a runtime step unwinds.
-        Err(Step::Return(value, _)) => Ok(value),
+        Err(Step::Return(value, _)) => {
+            warn_declared_type(name, declared, &value);
+            Ok(value)
+        }
         Err(other) => Err(other),
     }
 }
@@ -11828,7 +11908,12 @@ fn call_callable_for_value(
         };
         let caller_result = shell.result.clone();
         let caller_produced = shell.produced;
+        // `referenced`, not `name`: `name` here is the modifier doing the calling
+        // (`:map`), while the declaration being checked is the referenced
+        // function's. Naming the modifier implicates a builtin for a type its
+        // caller wrote, which is the opposite of a traceable diagnostic.
         return run_call_body_for_value(
+            referenced,
             &body,
             declared,
             caller_result,
@@ -11849,6 +11934,7 @@ fn call_callable_for_value(
     let caller_result = shell.result.clone();
     let caller_produced = shell.produced;
     run_call_body_for_value(
+        name,
         body,
         function.return_type(),
         caller_result,

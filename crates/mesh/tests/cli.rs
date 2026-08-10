@@ -34184,3 +34184,131 @@ fn a_modifier_subject_is_checked_against_the_rest_of_the_signature() {
         );
     }
 }
+
+/// A declaration that disagrees with the value **warns and hands the value
+/// back**, which is the whole shape of this check: every script written before
+/// it is unverified, since the declaration constrained nothing, so refusing
+/// would break working code on a rule it never had to obey.
+#[test]
+fn a_declared_type_that_disagrees_warns_and_still_yields() {
+    let out = run_with_input("int func f() { \"not an int\" }\nx = f()\nputs $x\n");
+
+    assert_eq!(out.status.code(), Some(0), "the call still succeeds");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "not an int\n");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stderr),
+        "mesh: warning: f: declared `int`, returned a string\n"
+    );
+}
+
+/// The same through a **lambda**, which reaches the check by a different call
+/// path and names the variable it was bound to.
+#[test]
+fn a_lambda_that_disagrees_warns_under_the_name_it_was_bound_to() {
+    let out = run_with_input("d = int func(n) { \"text\" }\nx = $d(1)\nputs $x\n");
+
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "text\n");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stderr),
+        "mesh: warning: d: declared `int`, returned a string\n"
+    );
+}
+
+/// Nothing warns when the declaration is honest — including `job`, and
+/// including a **styled** string against `str`, which is deliberate: a styled
+/// string *is* its text everywhere bytes are wanted, so splitting it here would
+/// split a type the rest of the language does not.
+#[test]
+fn an_honest_declaration_is_silent() {
+    let out = run_with_input(
+        "int func i() { 42 }\n\
+         str func s() { \"text\" }\n\
+         bool func b() { true }\n\
+         list func l() { [1 2] }\n\
+         map func m() { [a: 1] }\n\
+         str func styled() { style(\"x\", fg: blue) }\n\
+         a = i()\nb = s()\nc = b()\nd = l()\ne = m()\ng = styled()\n\
+         puts done\n",
+    );
+
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "done\n");
+    assert!(
+        out.stderr.is_empty(),
+        "unexpected warning: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// `any` accepts every kind, which is what makes it the top type — and what its
+/// retirement is about. A **typeless** func is silent for a different reason:
+/// it has no value channel, so there is no declaration to disagree with.
+#[test]
+fn the_top_type_and_a_typeless_func_never_warn() {
+    let out = run_with_input(
+        "any func a() { 42 }\n\
+         any func b() { \"text\" }\n\
+         any func c() { [1] }\n\
+         func t() { 42 }\n\
+         w = a()\nx = b()\ny = c()\nz = t()\n\
+         puts done\n",
+    );
+
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "done\n");
+    assert!(
+        out.stderr.is_empty(),
+        "unexpected warning: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// A **referenced** function warns under its own name, not the modifier calling
+/// it. `name` at that call site is the modifier's label, so passing it through
+/// would blame a builtin for a declaration its caller wrote — and `&f` is
+/// exactly the case where the definition is somewhere else entirely, so the
+/// warning is the only thing pointing at it. Raised in review as a P2.
+#[test]
+fn a_referenced_function_warns_under_its_own_name() {
+    let out = run_with_input("int func f(n) { \"text\" }\nr = [1]:map(&f)\nputs done\n");
+
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "done\n");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stderr),
+        "mesh: warning: f: declared `int`, returned a string\n"
+    );
+}
+
+/// A lambda handed to a modifier **through a variable** warns under that
+/// variable, matching what a direct `$d(…)` call reports. The callable's own
+/// value carries no name, so the name has to come from how it was *written* at
+/// the call site — `single_callable_argument` keeps it for exactly this.
+/// Raised in review as a P2, the second of two on naming higher-order warnings.
+#[test]
+fn a_bound_lambda_warns_under_its_variable_not_the_modifier() {
+    let out = run_with_input("d = int func(n) { \"text\" }\nr = [1]:map($d)\nputs done\n");
+
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "done\n");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stderr),
+        "mesh: warning: d: declared `int`, returned a string\n"
+    );
+}
+
+/// An **anonymous** lambda has no name to keep, so the modifier's label is the
+/// closest thing to a location — and unlike `$d` or `&f`, the declaration is
+/// written at the call site the reader is already looking at. Pinned so the
+/// fallback is a decision on the record rather than an accident.
+#[test]
+fn an_anonymous_lambda_warns_under_the_modifier_that_ran_it() {
+    let out = run_with_input("r = [1]:map(int func(n) { \"text\" })\nputs done\n");
+
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(
+        String::from_utf8_lossy(&out.stderr),
+        "mesh: warning: :map: declared `int`, returned a string\n"
+    );
+}
