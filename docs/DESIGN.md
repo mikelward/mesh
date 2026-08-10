@@ -7613,6 +7613,429 @@ to avoid" rather than promising the latter as done.
 
   **Not urgent.** The surface is one builtin plus the widening, and nothing is
   built yet — `gets()` returns `false` in the code today.
+- **Should stream absence be `none`, declared `str?`, rather than `status(1)`? —
+  open, written up, not decided.** The entry above chose a nonzero `Status` and is
+  **unbuilt**, so the spelling is still cheap to change: `gets()` would be written
+  once rather than written and rewritten. What follows is the case for `none`,
+  with the alternatives kept beside it because none of them is ruled out.
+
+  **The shape.** `none` is a value with its own literal, and the one-word return
+  slot takes a `?` suffix for a function that can answer it:
+
+  ```mesh
+  str? func gets()
+
+  while line = gets() { puts $line }      # unchanged: the presence-bind refuses none
+  if line = gets() { puts $line } else { puts "eof" }
+  line = gets()                            # may be none; `$line:upper` fails right here
+
+  str  func first-line() { gets() }        # diagnosed: the body can answer none
+  str? func first-line() { gets() }        # the possibility propagates, visibly
+  ```
+
+  **Diagnosed at the call, not at the definition — and this is the proposal's
+  weakest joint.** A declared type is enforced by `warn_declared_type`, which runs
+  only where a call's *value is taken*, compares the value that call actually
+  produced, and hands it over anyway. So `str func f() { status(1) }` prints
+  *declared `str`, returned a status* — but only when it is **called**, and only
+  on a call that really returns one. Measured: defined and never called, silent;
+  and `str func g(p) { if $p { status(1) } else { "s" } }` called as `g(false)` is
+  silent too, because that invocation answered a string.
+
+  What the mark therefore buys, stated at its true strength: **documentation plus
+  a call-time warning on the invocations that actually come up empty.** It is not
+  static detection of a function that *can* answer `none`, and the propagation
+  story above — `str func first-line() { gets() }` being caught — only holds on a
+  call that reaches EOF. Making it a definition-site check needs **body analysis**
+  the proposal does not add. That analysis is not hypothetical: the branch check's
+  `yields` walk already answers "what kinds can this body produce", so the
+  machinery exists and would have to be pointed at declarations. Worth costing
+  before leaning on the propagation argument, since without it the `?` is a
+  comment the compiler mostly does not read.
+
+  Tightening the call-time warning to a **refusal** is a separate change again,
+  with its own compatibility cost; folding it in here would smuggle it past its
+  own argument.
+
+  The [`T | Status(n≠0)` widening](#open-questions) is **retired** with it. Absence
+  stops being admitted into every declared type and is admitted only by `?`.
+
+  **What that fixes, in the order it matters.**
+
+  1. **The declaration stops lying.** The widening admits absence into every
+     declared type, *spelled nowhere because it holds everywhere* — which is the
+     property that made null the billion-dollar mistake, arriving by the back door
+     this document warned about when the same move was proposed for `false`. A
+     `?` that has to be written is the difference between an option type and a
+     null.
+  2. **A read that ended stops being a command that failed.** `status(1)` means
+     both, and nothing distinguishes them.
+  3. **It generalizes.** A `:match` miss and a `:kind` on an unresolved name are
+     absences too, and neither is an *ending* — so a stream-shaped name like
+     `end` would be wrong at both, while `none` fits. This matters only if
+     [`false`'s remaining uses](#modifiers) move, which is a further question, but
+     the name should not foreclose it.
+  4. **The branch check can see it.** `status(1)` is invisible to that check
+     because a call is `Yields::Unknown` under late binding; a bare `none`
+     literal is classifiable, which is what an
+     [open lint question](../TODO.md) currently turns on.
+
+  **What it costs.** A new value kind, which is the thing the
+  [no-null rule](#variables-and-assignment) exists to resist — so the rule is
+  restated rather than broken: **no *implicit* null.** An `Option` written in the
+  type is what the languages usually credited with fixing null actually shipped;
+  what they removed was the universal implicit kind. Also: a **third** member of
+  the absent set — the presence-bind already refuses `false` *and* every nonzero
+  `Status`, and this proposal keeps the status refusal, so `none` joins rather
+  than replaces, and "what fails a presence-bind" grows to three answers unless
+  [`false` leaves](#modifiers); a migration for `:match` and `:kind` if absence
+  generalizes; and `?` is a glob metacharacter, though it sits in a fixed slot
+  before `func`, so the lexer's job is bounded.
+
+  **Two costs that are easy to miss, and neither is small.**
+
+  First, **`none` is a bare word today, so the literal takes a word out of the
+  string namespace.** A bare word in value position is a string, and
+  `$env:get(MESH_NOPE, none)` answers the string `none` right now; after the
+  change, text that spells it must be quoted. The tree has sites to update — a
+  pinned `:get` default, some signature defaults — but *that* part is not a cost
+  worth weighing: this document already settles it, since **the language has no
+  users and nothing here is owed backward compatibility**, so "what would break"
+  is the wrong question to judge a spelling by. What survives the discount is
+  ergonomic and permanent: one more word a script cannot use as bare text, and
+  the same is true of `end` or any other bare-word literal. Small, but it is the
+  kind of cost that does not go away.
+
+  Second, **the status projection has to be decided with it, not after.**
+  `status_of` maps every value except `false` and a `Status` to success, so a
+  `Value::None` added without an arm would be *absent to a presence-bind and
+  successful to a command chain*: `while x = f()` would take the absent path while
+  `f || fallback` skipped the fallback, on the same value. Adding a failing arm
+  instead changes what a function that answers `none` leaves as its status, which
+  reaches command chaining. Value and status are independent channels here, so
+  specifying only the bind leaves a real choice unmade — the same trap the
+  [`""` entry](#open-questions) walked into with its third dial.
+
+  **The alternatives, and what each gives up.**
+
+  | | EOF ≠ failed command | declaration honest | visible to the branch check | fits a `:match` miss |
+  | --- | --- | --- | --- | --- |
+  | **`none` + `str?`** | yes | yes | yes, a literal | yes |
+  | **A nonzero status, implicit** (the entry above) | no | no | no, a call | awkward — a miss is not a failure |
+  | **A named in-band status** (`end = status(255)`) | **no** — the code is reachable, so a failing command lands on the same `Status(255)` | only if `?` is added too | only if a literal | no — `end` is not a miss |
+  | **A named out-of-band status** (a code above 255) | yes, *by construction* | only if `?` is added too | only if a literal | no |
+  | **The hybrid** — declare `?`, produce a status, consume under a binding | no, unless paired with an out-of-band code | yes — but only if the enforcement tightening ships with it | n/a — no literal to see | yes, though the absence arm has no spelling |
+
+  The out-of-band variant deserves its own note, because it answers the objection
+  to the in-band one properly: a process status is **8 bits** at the OS level, so
+  a code above 255 is unreachable by any real program, and the collision is gone
+  by construction rather than by picking a rare number. (`255` in particular is
+  not rare — `exit -1` yields it and `ssh` uses it for its own failures.) Its
+  price is that `Value::Status` is a `u8` in three enums and `status(256)` is
+  refused today, so the representation widens and stops matching this document's
+  own "a status is the OS's 8-bit process status"; that it needs a name, a
+  rendering rule, a `:code` answer and an `exit` rule of its own — `exit`
+  truncates mod 256, so an out-of-band sentinel would silently become an
+  arbitrary code — is most of the cost of a distinct value, paid to keep a
+  representation that then misdescribes itself. What it genuinely buys is that
+  **nothing else moves**: the presence-bind already refuses a nonzero status, and
+  every existing `Status` match keeps working.
+
+  **The hybrid, written out — it was drafted as the strongest of the four, and
+  review has since charged it five costs it did not start with.** They are marked
+  where they arise rather than tallied at the end, and together they are the
+  reason this entry no longer recommends it: read the five and decide, rather than
+  inheriting the sentence it was drafted with. Take the declaration from the
+  option and the value from the status, and add one rule about where such a call
+  may appear:
+
+  - **Declare** it — `str? func gets()`. And **the `T | Status(n≠0)` widening goes
+    with it**, exactly as the `none` proposal retires it: only `T?` admits a
+    failing status. Without that the rule is a no-op — `str func find() { fail }`
+    would stay valid unmarked, be treated as not option-returning, and so pass
+    straight into a bare assignment or an argument with neither the declaration
+    nor the consumption check ever engaging. The mark has to be the *only* way in.
+
+    **And an unmarked `T` has to be *refused*, not warned about** — which is a
+    fourth cost, and the one the `none` write-up above deliberately keeps out of
+    its own proposal. `warn_declared_type` warns and **hands the value back**, so
+    a warning leaves `find()` returning its `Status` to a caller that was never
+    treated as consuming an option: the hole reopens one line after being closed.
+    So the hybrid needs the enforcement tightening as a **prerequisite**, with
+    the cost that tightening carries in its own right, rather than inheriting the
+    existing warning-only behavior and calling the matter settled.
+  - **Produce** it with the status channel. `fail` already makes a failing status
+    and the presence-bind already refuses one, so no literal is minted:
+    `str? func find(k) { if … { $hit } else { fail } }`.
+  - **Consume** it in one of exactly two positions — *discharge* or *propagate*:
+
+    ```mesh
+    if    line = gets() { … } else { … }    # discharge: a narrowing consumes it
+    while line = gets() { … }               # the same rule
+    match gets() { … }                      # only if the match covers the absence
+    str? func first-line() { gets() }       # propagate: the tail of a func declaring `?`
+    ```
+
+    **`match` needs a condition the other two do not.** A non-exhaustive `match`
+    falls through and yields `""` ([Matching](#matching-match)), so a subject with
+    no arm for the absence would let the obligation vanish silently — the opposite
+    of discharging it. So the match position counts only with a `_` or an explicit
+    absence arm, which also ties this rule to the
+    [`match` totality question](#open-questions): whatever answer that gets has to
+    be at least this strong, or `match` becomes the hole `any` would otherwise
+    have been.
+
+    **And "an explicit absence arm" currently has no spelling**, which is the
+    hybrid's own cost showing up: it mints no literal, so the absence *is* "any
+    nonzero status", while a value pattern like `status(1)` matches one exact
+    code and a callee is free to `fail 2`. So either discharge is **`_`-only**
+    — simple, and honest about what the option can carry — or the hybrid owes a
+    pattern that matches *any* failing status, which is a piece of syntax it was
+    supposed to avoid needing. That is the option spelling's advantage arriving
+    by the back door: `none` is one literal and therefore one pattern.
+
+    Everything else is refused — `line = gets()` as a bare statement,
+    `f(gets())`, `$env:get(K, gets())`. The obligation is either handled or
+    passed up; it cannot leak into a name un-narrowed.
+
+    **And "in a binding position" is not enough — the call has to be the
+    *direct* operand.** A modifier wrapping it satisfies the shape test and
+    defeats the rule, because `condition_status` evaluates the whole operand
+    before testing presence, so the modifier meets the failing status first.
+    Measured:
+
+    ```
+    any func f() { fail 5 }
+    if line = f():upper { … } else { … }   → mesh: :upper: requires a string
+    if line = f()       { … } else { … }   → else
+    ```
+
+    The wrapped form errors where the direct form branches, so the obligation
+    was never discharged. The rule therefore has to say **direct operand or
+    subject**, which refuses `gets():upper` outright — a fifth restriction, and
+    a real ergonomic one. The alternative is defining how a modifier *lifts*
+    over an absence (apply to the value, pass the absence through), which is
+    `Option::map` and a good deal more than a shape test. Either way the
+    "enforcement is syntactic, so it is cheap" claim gets narrower: still
+    syntactic, but stricter than it first reads.
+
+  **What that buys over the other three.** The enforcement is **syntactic**, so
+  it does not wait on [inference](#open-questions): "is this call in a binding
+  position" is answerable from the shape of the call site, where
+  `warn_declared_type` only fires at a call that already returned the wrong thing.
+  It mints **no new value kind**, so it costs no bare word and leaves the status
+  projection question untouched. And it keeps the one thing a status-only answer
+  lacks — a declaration that says the function can come up empty.
+
+  **What it gives up, and this is the honest part: the code becomes
+  unreachable.** With the absence confined to a narrowing, and the `else` branch
+  binding nothing, there is no position left from which to read `$s:code` — the
+  assign-first shape that
+  [reading a failed code](#tests-and-comparisons) documents is itself a bare
+  assignment, and this rule refuses it for an option-returning call. **And
+  `$sh.status` is not the way back** — measured, not assumed: an
+  `any func f() { fail 5 }` consumed as `if x = f() { } else { … }` leaves `0` in
+  a fresh shell and `3` after an earlier `sh -c "exit 3"`. The `5` never appears,
+  because a value call restores the standing status. The one shape where it
+  *looks* available — `if s = sh("-c", "exit 5")` leaving `5` — is an **external**
+  callee setting the status as a side effect of running, which is a leak rather
+  than a contract, and a mesh `func` failing with the same code gives nothing.
+  That is
+  defensible rather than accidental: **`T?` is an option, not a result.** A shape
+  that carries *why* it failed is a different type, and mesh does not have one —
+  the status channel carries that for **commands**, not for values. But it should
+  be chosen knowingly, since it forecloses a coded failure on the value side.
+
+  **`any` does not block this**, which is worth saying because it is the obvious
+  hole: an `any func` accepts everything, so it would swallow the obligation
+  unless it inherits one. It has since been said in discussion that `any` is
+  expendable — narrow it, or retire it — rather than a constraint this rule has
+  to design around. But that is a **reopening, not a free move**, and the entry
+  it reopens is explicit: *"Decided: `any` is kept"* records the repo owner
+  asking for it to go and then keeping it once the cost was measured, across 247
+  declarations, with the surviving job — "a value channel, kind not the point" —
+  called honest. So the hole is closable, and closing it is a prerequisite of the
+  hybrid rather than a footnote to it: whoever picks this up reopens that
+  decision on its own merits first.
+
+  **Open with it.** Whether the
+  propagate position is the tail only or any `return`; and how the check behaves
+  for a **late-bound** callee, where the declaration is not known until the name
+  resolves — that lands as a loud error *at the call*, which is the same resolver
+  limit the [check table](#open-questions) already accepts for `x = f()`, but it
+  means the rule is parse-time for builtins and run-time for the rest.
+
+  **Open details, either way.** Whether `any?` is meaningful or a parse error,
+  since `any` is the top type and may admit `none` already; whether `end` survives
+  as a stream-specific spelling beside a general `none`; and whether `false`
+  leaves the absent set entirely once it no longer encodes absence, which would
+  leave the presence-bind refusing `none` and a failing status and nothing else.
+
+  **The tiebreaker, if the [inference direction](#open-questions) below holds:**
+  `T?` is what inference calls an option, and the implicit widening is the shape
+  it cannot express. That entry says so in full; this one defers to it rather than
+  repeating the argument.
+- **Type inference is the intended destination — a direction, not a plan.** The
+  return-type work is deliberately **channel checking**, not type checking: what a
+  declaration makes checkable is "the shape of a function's exits, not the types
+  flowing through its body". The direction beyond it is ordinary Hindley–Milner
+  style inference, and naming it now is worth one entry, because it already
+  settles a live question and rules out one tempting move.
+
+  **What it settles.** `T?` is what inference calls an **option** — a constructor
+  over a type, with `none` as its nullary case, which is what the ML family has
+  instead of a null. The [`T | Status(n≠0)` widening](#open-questions) is the move
+  pointing the other way: it says every declared type is *secretly* a union, so
+  `str` never quite means `str`, and a union that holds universally and is spelled
+  nowhere has no principal type to infer. Unification would have to bake it into
+  every rule, at which point the annotation stops carrying information. So the
+  widening should be read as **provisional** — a way to keep `str func gets()` one
+  word until there is a real option type — rather than as the resting place.
+
+  **The obstacle is late binding, and it is specific.** `func f { g }` resolves
+  `g` when `f` *runs*, so a name's meaning is not fixed at its definition; that is
+  a deliberate property ([Variables and assignment](#variables-and-assignment)),
+  and it is why the [check table](#open-questions) puts `x = f()` at run time and
+  why the branch classifier answers `Unknown` for every call. Inference across
+  calls wants the call graph closed enough to unify over, which would cost
+  define-in-any-order and re-sourcing. That trade is **not** proposed here.
+
+  **What is tractable without touching it**, and it is nearer than it sounds:
+  infer *within* a body; unify the exits against the declared return type at the
+  **definition**; and give a call whose callee is **not visible** a type that
+  carries no information.
+
+  **But that type is not a fresh unification variable**, and the difference is
+  the whole point. A variable does not decline to answer — it *unifies*. In
+  `str func f() { g() }` the variable for `g()` unifies with the declared `str`,
+  the definition passes, and inference has now concluded "`f` returns `str`" on
+  no evidence; a later `int func g() { 1 }` makes that false with nothing
+  rechecking `f`, and `warn_declared_type` hands the value through at run time
+  besides. So a fresh variable does not skip late binding — it *assumes past* it,
+  and every caller that reads `str` off `f` inherits the assumption. What is
+  wanted is the **unknown type of gradual typing**: compatible with everything,
+  but blocking the conclusion rather than supplying one, so `f`'s declaration
+  stays a run-time claim instead of quietly becoming a static fact. Anything
+  stronger needs what the sound half cannot give here — run-time enforcement, or
+  rechecking dependents when a name is rebound.
+
+  **A call whose callee *is* visible has to supply its type, or the subset checks
+  nothing worth having.** If every call is an unconstrained variable it unifies
+  with whatever the declaration says, so `str func first-line() { gets() }` —
+  the example this whole entry turns on — would pass. **Builtins are the sound
+  half**: their signatures are known and cannot move, since `gets` is a reserved
+  word (`func gets() { … }` is refused outright), so nothing can rebind one out
+  from under a body already checked.
+
+  **A user-defined callee is a snapshot, and that is the weak half.** Checking
+  `str func f() { g() }` against the `str func g()` visible *now* is not sound
+  under late binding: `g` can be replaced by an `int func g()` fifty lines later,
+  or by a re-sourced file, with `f` already checked and nothing rechecking it. So
+  the choice is explicit rather than glossed —
+
+  - **take only builtins**, giving every user-defined callee the unknown type:
+    sound with no bookkeeping, and it still catches
+    `str func first-line() { gets() }`, which is the case this entry turns on; or
+  - **take visible `func`s too**, and accept it as a *warning against what was
+    visible at the definition* — the same standard `warn_declared_type` already
+    meets, one binding earlier — unless it is paid for with dependency tracking:
+    recheck every definition whose body names a callee when that callee is
+    rebound. That is a real cost to weigh, not a free tightening.
+
+  The first is the honest default and loses little, since the option check the
+  entry needs is a builtin's. Either way a name **not yet defined** takes the
+  unknown type above — never a fresh variable, which would unify with the
+  declaration and manufacture the conclusion it has no evidence for. That is the
+  residue of late binding, stated as a refusal to conclude rather than as a
+  blanket. Without
+  at least the builtin half, the subset buys nothing the present checks do not
+  already do.
+
+  So scoped, it buys definition-site checking for everything whose types are
+  visible in the body — including the check the option spelling needs and does not
+  currently have, since `warn_declared_type` only fires at a call that actually
+  produced the wrong value. It is also a *growth path for machinery that exists*
+  rather than a new pass: `Yields::{Never, Known, Unknown}` is a three-point
+  lattice, and making its middle a term with variables is the step.
+
+  **How the three binding forms read under it**, since that is where the model
+  either holds together or does not:
+
+  - **Plain assignment takes the whole type.** `x = f()` where `f` answers `str?`
+    gives `x : str?`, option included, so any use of `$x` as a string has to
+    narrow first. That is the propagation an option buys and the reason the mark
+    is worth writing: the obligation lands at the assignment rather than at a
+    crash later. Note this is *flow-sensitive*, not classic HM — mesh lets `x = 5`
+    be followed by `x = "s"`, and each `=` is a fresh binding of the name rather
+    than a second use of one type. Inference types the *uses between* assignments;
+    it does not force one type per name per scope, and it should not, since
+    creating-on-assign is the language's own rule.
+  - **The presence-bind is a narrowing, and it is already the right shape.**
+    `if x = f() { … } else { … }` consumes a `str?` and binds `x : str` **in the
+    true branch only** — which is `if let Some(x)` under different punctuation,
+    and types by the same standard rule. The `else` branch binds nothing, which is
+    what makes it sound: a branch that bound `x` to the absence would leave `x`
+    a `str` on one path and an absence on the other, the union inference cannot
+    express. That contract [changed recently](#tests-and-comparisons) for the
+    guarantee it bought a declared type, and it turns out to be the shape
+    inference wants for an independent reason.
+
+    **It does not, however, dispose of the join — an existing binding survives
+    the miss.** Measured:
+
+    ```
+    any func f() { fail 5 }
+    x = 1
+    if x = f() { … } else { puts "else $x" }   → else 1
+    ```
+
+    So with a prior `x = 1`, the true branch has a `str` and the `else` branch
+    still has the `int` — a union after the `if`, arriving from the *old* value
+    rather than from a bound absence. Refusing to bind the absence removes one
+    source of it, not the join itself. Typing this needs a real answer:
+    branch-local bindings, definite assignment, or a control-flow join at the
+    merge. A fresh name has the same problem from the other side, bound on one
+    path only.
+  - **A destructuring bind stays partly dynamic.** `if [a b] = f()` asks for a
+    list *and* an arity, and arity is not something the classic algorithm carries
+    — a `list` is a list however long. So the shape miss stays what it is today, a
+    run-time refinement that selects `else` without binding, unless tuples ever
+    become a type of their own.
+
+  **The status *channel* stays outside; a `Status` *value* does not.** The
+  distinction matters and an earlier draft of this entry collapsed it. `status(1)`
+  is a value expression in the value language, and inference should type it as
+  `status` or those expressions go unchecked. `$sh.status` is in the value
+  language too, but **it is not typed by this subset**, and saying otherwise
+  would contradict the maps paragraph below: `$sh` is an ordinary `Value::Map`
+  (`Vars::shell_namespace`), so `$sh.status` is a member read like any `$m.key`
+  and stays unknown until row polymorphism — or until the built-in namespaces
+  get a **closed schema** of their own, which is a smaller and more tractable
+  step, since their fields are fixed and known. **There is no third case, and no way to declare
+  one.** `status` in the return slot parses only as `status func`
+  (`ReturnType::Status`), and that spelling declares *no value channel at all*:
+  it discards an incidental tail and takes its status from its last statement
+  ([Types](TYPES.md)). Calling one in value position **projects** its outcome
+  into a `Status` — measured, `status func f() { status(1) }` then `r = f()`
+  gives `1` — but a projection is not a return type, and typing it as one would
+  have inference check exits the design deliberately discards. What stays outside
+  is
+  the **channel**: the status a *command* leaves is not an expression at all, so
+  nothing there is unified. `$(cmd)` is a `str` for the same reason — the bytes are
+  the value; how the command went is the other channel.
+
+  **What does not come along.** The status **channel**, per above — a command's
+  own status is not an expression, and unifying it into the value world would
+  undo the two-channel model that keeps "how it went" out of "what it is". (A
+  `Status` *value* is in, which is the distinction to hold on to.) And **maps**
+  want row polymorphism before
+  `$m.key` could be typed at all, which is past the classic algorithm; a map stays
+  a map until someone wants that fight.
+
+  Nothing here is scheduled, and no syntax is proposed. The entry exists so that
+  decisions taken meanwhile — the absence spelling above, most immediately — are
+  judged against where the types are going rather than only against what is cheap
+  today.
 - **Hook API — decided** ([Hooks and the prompt](#hooks-and-the-prompt)): hook
   points are insertion-ordered maps of named callables (the key is the handler's
   identity → re-source-safe, individually removable). Events `preprompt`,
