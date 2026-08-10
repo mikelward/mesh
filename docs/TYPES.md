@@ -96,7 +96,7 @@ each of which every type must answer separately.
 | 1 | **operator equality** | `==` / `!=` | refuses across types; one declared cross-type pair (status/int); scoped to the top-level operand pair only |
 | 2 | **total equality** | `Value::eq` | never refuses — backs `in`, `:has`, `:dedup`, list `-`, hashing, and `match` literal arms |
 | 3 | **condition** | `if` / `while` / `and` / `or` / `not` | a bool, a status, or a command's exit status; everything else is an error |
-| 4 | **presence** | the `if lhs = rhs` RHS | everything binds and passes except `false`; a nonzero status binds *and* fails |
+| 4 | **presence** | the `if lhs = rhs` RHS | everything binds and passes except `false` and a nonzero status, which take `else` and bind nothing |
 | 5 | **status projection** | `return v`, command position | `false`→1, status→its code, **everything else**→0 |
 | 6 | **order** | `<` `<=` `>` `>=` | int/int numeric, string/string lexical, otherwise a fall-through to text |
 
@@ -414,13 +414,24 @@ Under one failure:
   value and take the branch; otherwise bind nothing and take `else`.** Relation
   4 disappears into relation 3.
 
-  The "bind nothing" half is load-bearing and is a change from today's design,
-  which has a failing status bind anyway "so the `else` branch can read the
-  code". Binding unconditionally would leave `while line = gets() { … }` with
-  `$line` holding a **`Status`** after the loop ends — the EOF sentinel written
-  over the string the name is for, which is the absence-shaped value B3 exists
-  to abolish, smuggled back in through the binder. Under B3 the `else` branch
-  reads `$sh.status` instead, so nothing is lost by refusing to bind.
+  The "bind nothing" half is load-bearing, and it has since **shipped ahead of
+  the rest of B3**: a failing status now takes `else` and binds nothing. It used
+  to bind anyway "so the `else` branch can read the code". Binding
+  unconditionally would leave `while line = gets() { … }` with `$line` holding a
+  **`Status`** after the loop ends — the EOF sentinel written over the string the
+  name is for, which is the absence-shaped value B3 exists to abolish, smuggled
+  back in through the binder.
+
+  One thing *is* lost, and an earlier draft of this paragraph got it wrong: the
+  `else` branch cannot read the code, and **`$sh.status` is not a substitute**. A
+  value condition leaves the standing status alone, so what is there depends on
+  what ran: `0` in a fresh shell, `3` after an earlier failing command, and `5` —
+  the rejected code itself — when the right-hand side *is* the command that
+  failed. `reading_a_failed_codes_value_takes_a_plain_assignment` pins all three,
+  because any one alone reads like a rule and none of them is. Unreliable rather
+  than unavailable, which is the worse of the two. A caller who wants the code
+  assigns first and tests the name, which binds unconditionally because it is a
+  statement.
 - A predicate that answers "not found" returns a failing status, so
   `if rootdir { … }` means what a shell reader thinks it means. If the same
   name is also to *hand back* the directory it found, that is a `str func`
@@ -1036,15 +1047,14 @@ Five consequences worth stating rather than discovering:
   offered as the reason no `string | false` is needed, and if the exact check
   applied to every `return` it would be the one function that cannot report a
   miss. So the annotation reads **"when this succeeds, it produces a
-  `str`"** — and `if p = find-up("x") { … }` takes the **false** path on a failing
-  status, so no *successful* binding is ever a `Status` and the true branch always
-  has its `str`. What the annotation does **not** promise is the name's type on
-  every path: per `DESIGN.md`'s presence-bind contract a failing status **binds**
-  while selecting `else`, being a result rather than an absence, so the `else`
-  branch can read the code it failed with — and under
-  `DESIGN.md`'s `T | Status(n≠0)` widening that is the declared shape rather than
-  an escape from it. A name-shaped `lhs` only: a destructuring pattern the status
-  cannot fit is an ordinary shape miss and binds nothing.
+  `str`"** — and `if p = find-up("x") { … }` still binds only on success, so
+  no caller ever sees a `Status` in a `str`-typed name. That holds because the
+  presence-bind refuses a failing status outright: it takes `else` and binds
+  nothing, exactly as a `false` does. It used to bind, which would have made this
+  sentence false the moment `DESIGN.md`'s `T | Status(n≠0)` widening let a declared
+  type answer one — the binding contract was changed rather than this guarantee
+  given up. The price is that the `else` branch cannot read the failing code; a
+  caller who wants it assigns first and tests the name.
 - **A tail value *is* a return, and is checked as one.** A typed func whose
   body ends in an expression of its declared type has returned it — `return` is
   not required, and `str func f() { "x" }` is exactly `str func f()

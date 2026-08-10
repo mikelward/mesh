@@ -3410,8 +3410,8 @@ if [head ...tail] = $items { puts $head ...$tail }
 ```
 
 An **assignment condition over a value** asks whether there *is* one, not
-whether it is true: only `false` is absent, so `""`, `[]` and `0` all bind and
-take the branch. That is what lets a function answer `false` for "found
+whether it is true: `false` is absent, and so is a nonzero status (below), so
+`""`, `[]` and `0` all bind and take the branch. That is what lets a function answer `false` for "found
 nothing" and be tested for it where bash would test a status — and what ends a
 `while` that binds its sentinel:
 
@@ -3428,18 +3428,38 @@ while line = next-line() { puts $line }   # ends when `next-line` answers false
 
 A **status** is the other value-level failure, so a failing one takes `else`
 here exactly as it does when it is the condition itself — otherwise `if s =
-f()` would succeed where `if f()` fails, on the same value. Unlike `false` it
-still **binds**, since a status is a result rather than an absence, so the
-`else` branch can read the code:
+f()` would succeed where `if f()` fails, on the same value. Like `false`, it
+**binds nothing**, so a name never comes back holding a failure:
 
 ```mesh
-if s = build() { puts done } else { puts "build failed: $s" }
+if s = build() { puts "built $s" } else { puts "build failed" }
 ```
+
+The `else` branch therefore cannot read the code, and **`$sh.status` is not a
+substitute** — a value condition leaves the standing status alone, so what is
+there depends on what ran rather than on what was rejected. It happens to be the
+rejected code when the right-hand side *is* the failing command
+(`if s = sh("-c", "exit 5")` leaves `5`), and is unrelated to it otherwise. Don't
+read it; assign first, since a plain assignment always binds — then test the name
+with a **second presence bind**:
+
+```mesh
+s = build()
+if kept = $s { puts "built $kept" } else { puts "build failed: $s:code" }
+```
+
+The inner bind is what makes this work for any success value. A bare `if $s`
+would do for a bool or a status, but `build()` returning a **string** makes it an
+error — *a string is not a condition* — and a string is exactly the case this
+rule exists for. `if kept = $s` asks the presence question again, passes for any
+successful value, and leaves `$s` itself in hand to read `:code` from on the
+failure path.
 
 An absent value binds nothing, so the `else` reads whatever the name held
 before — the same rule a list-pattern mismatch and a `gets` at end of input
 already follow. A **capture** right-hand side is unaffected: `if out = $(cmd)`
-still branches on the command's status, with the output bound either way.
+still branches on the command's status, with the output bound either way — the
+value bound there is the output, never a status.
 
 A **command** condition is a command that ran, so the body it selects reads its
 status — the code, not just the fact that it failed:

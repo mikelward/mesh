@@ -16016,22 +16016,86 @@ fn a_later_sibling_stands_on_what_an_earlier_one_left() {
 }
 
 #[test]
-fn an_assignment_condition_branches_on_a_bound_status() {
+fn an_assignment_condition_branches_on_a_status_without_binding_a_failing_one() {
     // A status is the other value-level failure, so it answers here as it does
     // when it *is* the condition — a nonzero one takes `else` — while `""`, `[]`
     // and `0` are still present-and-bound, since only `false` is absent.
+    //
+    // A **failing** status binds nothing, so the name keeps what it held: the
+    // `T | Status(n≠0)` widening lets a declared type answer one, and binding it
+    // would put a `Status` into a `str`-typed name on the failure path. A
+    // **successful** status is an ordinary value and binds.
     let out = run_with_input(
-        "if s = status(5) { puts success } else { puts \"failure with $s:repr\" }\n\
+        "s = before\nc = before\n\
+         if s = status(5) { puts success } else { puts \"failure keeps $s\" }\n\
          if z = status(0) { puts \"success with $z:repr\" } else { puts failure }\n\
-         if c = sh(\"-c\", \"exit 5\") { puts success } else { puts \"command $c:repr\" }\n\
+         if c = sh(\"-c\", \"exit 5\") { puts success } else { puts \"command keeps $c\" }\n\
          if e = \"\" { puts bound-empty }\n\
          if n = 0 { puts bound-zero }\n\
          if b = false { puts bad } else { puts absent }\n",
     );
     assert_eq!(
         String::from_utf8_lossy(&out.stdout),
-        "failure with status(5)\nsuccess with status(0)\ncommand status(5)\n\
+        "failure keeps before\nsuccess with status(0)\ncommand keeps before\n\
          bound-empty\nbound-zero\nabsent\n",
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn a_failing_status_condition_leaves_a_fresh_name_unbound() {
+    // The other half of not binding: with no prior value there is nothing to
+    // read, so the `else` branch meets the ordinary unbound-name error rather
+    // than a `Status` wearing the name's type.
+    let out = run_with_input(
+        "if fresh = status(5) { puts success } else { puts took-else }\nputs $fresh\n",
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "took-else\n",
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("fresh"),
+        "want the unbound read to name it: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn reading_a_failed_codes_value_takes_a_plain_assignment() {
+    // What the non-binding costs, and the shape that pays it. The `else` branch
+    // of a binding condition cannot reach the code, and **`$sh.status` is
+    // unreliable rather than a substitute**: a value condition leaves the
+    // standing status alone, so what is there depends on what ran, not on what
+    // was rejected.
+    //
+    // All three readings are pinned, because any one alone reads like a rule and
+    // none of them is: `0` from a fresh shell, `3` from an earlier failing
+    // command with a constructed value on the right, and `5` — the rejected code
+    // itself — when the right-hand side *is* the command that failed. That last
+    // one is why the docs say unreliable and not "never the code".
+    //
+    // The shape that does reach the code assigns first — a statement binds
+    // unconditionally — and then asks presence again with an inner bind. That
+    // inner bind is the load-bearing part: a bare `if $t` serves a bool or a
+    // status and **errors on a string**, which is the case this whole rule exists
+    // for, so the success arm here uses one to prove it carries arbitrary values.
+    let out = run_with_input(
+        "if s = status(5) { puts success } else { puts \"fresh $sh.status\" }\n\
+         sh -c \"exit 3\"\n\
+         if s = status(5) { puts success } else { puts \"standing $sh.status\" }\n\
+         if c = sh(\"-c\", \"exit 5\") { puts success } else { puts \"command-rhs $sh.status\" }\n\
+         t = status(5)\n\
+         if kept = $t { puts success } else { puts \"code $t:code\" }\n\
+         u = hello\n\
+         if kept = $u { puts \"string kept $kept\" } else { puts lost }\n",
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "fresh 0\nstanding 3\ncommand-rhs 5\ncode 5\nstring kept hello\n",
         "{}",
         String::from_utf8_lossy(&out.stderr)
     );

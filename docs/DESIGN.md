@@ -2017,12 +2017,13 @@ hyphen between — the third payoff of that one spacing rule.
   arrived, so the sort is by *what question each one answers*:
 
   - **`false` is what *encodes* absence** — mesh's ["no result"](#functions), and
-    the one value an `if x = f()` presence-bind treats as nothing-there.
+    what an `if x = f()` presence-bind treats as nothing-there, along with a
+    nonzero `Status`.
     (**Stream reads are the exception, decided separately**: `gets()` at EOF
     answers [`status(1)`](#open-questions), not `false`, so the one place the
     encoding was load-bearing no longer uses it.) `""`, `[]` and `0` all bind and take the branch; a
-    nonzero `Status` takes `else` but still binds, being a result rather than an
-    absence. The encoding is **contextual, not a property of the value**: a
+    nonzero `Status` takes `else` and, like `false`,
+    [binds nothing](#tests-and-comparisons). The encoding is **contextual, not a property of the value**: a
     `bool func` answers `false` as a complete result, and `:filter` reads it as
     "does not match" rather than "no answer". That it reuses the boolean instead
     of adding a value of its own is what the `false | T` duality pays to avoid a
@@ -3200,13 +3201,10 @@ $line:match(/\d+\.\d+\.\d+\.\d+/)` pulls an address out of the middle of a line;
   As a *condition*, `lhs = rhs` is true iff the RHS is **truthy** (a `false` — the
   no-match — fails it, as does a nonzero `Status`, which is what
   [`gets()` answers at EOF](#open-questions)) **and** its shape fits `lhs`; on true the
-  names bind for the block. On a `false` or a shape miss it skips and binds
-  nothing — but a **nonzero `Status` still binds** while taking the false path,
-  being a result rather than an absence
-  ([Tests and comparisons](#tests-and-comparisons)), so a read loop's binding is
-  left holding the EOF status. That is for a **name-shaped `lhs`**; a
-  destructuring pattern the status cannot fit is an ordinary shape miss and binds
-  nothing, so `if [x] = gets() { … }` leaves `x` alone. A shape mismatch in
+  names bind for the block. On a `false`, a shape miss, **or a nonzero `Status`**
+  it skips and binds nothing ([Tests and comparisons](#tests-and-comparisons)) —
+  so at EOF `while line = gets() { … }` leaves `line` holding the last line read,
+  not the status that ended it. A shape mismatch in
   the condition (`[a b]` against a three-element list) is a **soft false → skip** —
   deliberately unlike the bare statement below. This isn't regex-specific:
   `if line = gets() { … }` falls out of the same rule. The longer
@@ -4176,12 +4174,9 @@ Decisions:
   command / nonzero `Status` fails it — *a nonzero **int** does not, under the
   [status decision](#open-questions), since `return 5` is data with status `0`*)
   **and** its shape **fits** `lhs`; on true the
-  names bind for the block. On a `false` or a shape miss it skips and binds
-  nothing; a **nonzero `Status` still binds** while taking the false path, being a
-  result rather than an absence — so at EOF `if line = gets() { … }` skips *and*
-  leaves `line` holding the [`status(1)`](#open-questions). That binding needs a
-  **name-shaped `lhs`**: a pattern the status cannot fit is a shape miss like any
-  other, so `if [x] = gets() { … }` binds nothing. `lhs` may be a
+  names bind for the block. On a `false`, a shape miss, **or a nonzero `Status`**
+  it skips and binds nothing, so at EOF `if line = gets() { … }` skips and leaves
+  `line` exactly as it was. `lhs` may be a
   name (always fits) or a `[…]` [destructuring](#destructuring) pattern, so
   `if [one two] = $s:match(/…/) { … }` and `if line = gets() { … }` both test-and-bind
   in one step, RHS written once. Crucially, **pattern-fit is part of the test**: a
@@ -4568,13 +4563,27 @@ canonical homes:
   is no emptiness rule left to decide. The question survives only for the
   **assignment-condition RHS** (`if xs = f() { … }`), which tests *presence* rather
   than truth — and there the answer follows from `false` being mesh's "no result":
-  only `false` is absent, so `""`, `[]` and `0` all bind and take the branch. That
+  `false` is absent — and so is a nonzero `Status`, per the addition below — so
+  `""`, `[]` and `0` all bind and take the branch. That
   also keeps `gets()`'s pinned contract, where a blank line must not end a read
   loop. A **`Status`** is the one addition the [status
   decision](#open-questions) makes here, and it is not an exception to the
   presence reading: a nonzero status is a *value-level failure* like `false`, so
-  it takes `else` — but unlike `false` it still binds, being a result rather than
-  an absence, so the `else` branch can read the code.
+  it takes `else` — **and binds nothing, like `false`.** It used to bind, on the
+  grounds that a status is a result rather than an absence and the `else` branch
+  might want the code. The [`T | Status(n≠0)` widening](#open-questions) retired
+  that: a declared type now admits a failing status, so binding one would put a
+  `Status` into a `str`-typed name and the annotation would stop meaning anything
+  on the failure path. The guarantee is worth more than the code — and the code is
+  genuinely gone: **`$sh.status` is not a substitute**, since a value condition
+  leaves the standing status alone, so what is there depends on what ran rather
+  than on what was rejected. It coincides with the rejected code only when the
+  right-hand side *is* the failing command, which makes it unreliable rather than
+  unavailable — the worse of the two. A caller who wants it assigns first, since a
+  statement binds unconditionally, and then asks the presence question again:
+  `t = f()`, then `if kept = $t { … } else { $t:code }`. The **inner bind** is
+  load-bearing — a bare `if $t` serves only a bool or a status, and errors on a
+  string, which is the very case this rule exists for.
 - **An explicit coded-failure spelling** *(deferred)* — any such value must stay a
   **channel-1** failure (a testable value) and so **cannot** reuse the name "error"
   (channel-2: fail-loud, no value, aborts); defining it touches the two-channel
@@ -5508,9 +5517,10 @@ programs or user functions:
     `""` — only EOF ends the loop — so blank lines don't end it. With no `var`
     it just yields the line (or that `status(1)`). *(Decided, not yet built: the
     code returns `false` at EOF today. The status carries the same `1`, so the
-    loop terminates identically; what changes is that `false` stops meaning "no
-    result" — and that `line = gets()` **binds** the status at EOF where the
-    `false` did not.)* **`--nulls` reads a NUL-terminated item
+    loop terminates identically, and it binds nothing either way — a failing
+    status is [absent for a presence-bind](#tests-and-comparisons) exactly as a
+    `false` is, so `while line = gets() { … }` leaves `line` holding the last line
+    read. What changes is only that `false` stops meaning "no result".)* **`--nulls` reads a NUL-terminated item
     instead** — the read a `find -print0` stream needs, where a newline inside a name
     is data and a line read would tear the name in half. The separator is *named*
     rather than passed as a character because `\0` is deliberately not one of the
@@ -7235,10 +7245,12 @@ to avoid" rather than promising the latter as done.
     which `pattern_bindings` already treats as a plain no-match rather than an
     error, and a missed [`:match`](#destructuring).
 
-    It inherits the binding asymmetry with it: a `false` binds nothing, while a
-    nonzero `Status` **does** bind, since a status is a result rather than an
-    absence. So `s = build() otherwise { puts "build failed: $s" }` can read `$s`
-    in the fallback, exactly as the `else` of `if s = build() { … }` can.
+    It inherits the binding rule with it, and there is no asymmetry left to
+    inherit: a `false` binds nothing and so does a nonzero `Status`
+    ([Tests and comparisons](#tests-and-comparisons)). So
+    `s = build() otherwise { … }` cannot read `$s` in the fallback, exactly as the
+    `else` of `if s = build() { … }` cannot — the fallback is for *what to do
+    instead*, and a caller who needs the code assigns first and tests the name.
 
     What it does **not** catch is a failure in *evaluating* the right-hand side:
     `[a b] = 1 + "x" otherwise { … }` aborts, because the type error happens
@@ -7436,8 +7448,8 @@ to avoid" rather than promising the latter as done.
   **One escape from the `gets()` cost — at the strength where that cost exists —
   was considered and does not reach it:**
   routing EOF through a `Status` rather than `false`. It would terminate a read
-  loop cleanly — a nonzero `Status` already takes `else` while still binding — but
-  what ends the loop under a falsy `""` is the **blank line**, not the EOF, so the
+  loop cleanly — a nonzero `Status` takes `else` — but what ends the loop under a
+  falsy `""` is the **blank line**, not the EOF, so the
   casualty is untouched. The version that *would* work moves the presence-bind off
   value-falsity altogether, failing only on a nonzero `Status`; that costs the
   `false | T` encoding everywhere else, since `if m = lookup(k) { … }` would then
@@ -7518,12 +7530,13 @@ to avoid" rather than promising the latter as done.
   because a `Status` in hand is *already* ambiguous between failure modes and
   nobody expects otherwise, while a `false` in hand looked like an answer.
 
-  Second, and more visible in daily use: **a `Status` binds where `false` did
-  not**. `while line = gets() { … }` leaves `$line` holding `status(1)` after the
-  loop, where today the failed bind leaves the last line read. Anything reading
-  `$line` after a read loop changes meaning. The `gets var` form is unaffected — it
-  leaves `var` alone at EOF either way — so the fix at a call site is to use it, or
-  to keep the last line in a variable of your own.
+  A second cost was recorded here and has since been **paid off rather than
+  accepted**: a `Status` used to bind where `false` did not, so
+  `while line = gets() { … }` would have left `$line` holding `status(1)` after the
+  loop. The [presence-bind contract](#tests-and-comparisons) now refuses a failing
+  status the same way it refuses a `false`, so `$line` keeps the last line read and
+  this decision costs nothing there. What that change cost instead is named where
+  it was made: the `else` branch can no longer read the failing code.
 
   **The declaration is where the question stops being about streams**, and it cuts
   less cleanly than it first appears. The [return-type decision](#open-questions)
