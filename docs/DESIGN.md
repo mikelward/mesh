@@ -2012,6 +2012,51 @@ hyphen between — the third payoff of that one spacing rule.
   back for, e.g., "key present but unset"? Current answer: no; `:has` +
   `:get(key, default)` cover it.)*
 
+  **Three values look null-shaped, and only one of them is absence.** They get
+  mistaken for each other because each turns up where a value was wanted and none
+  arrived, so the sort is by *what question each one answers*:
+
+  - **`false` is what *encodes* absence** — mesh's ["no result"](#functions):
+    what `gets()` yields at EOF, and the one value an `if x = f()` presence-bind
+    treats as nothing-there. `""`, `[]` and `0` all bind and take the branch; a
+    nonzero `Status` takes `else` but still binds, being a result rather than an
+    absence. The encoding is **contextual, not a property of the value**: a
+    `bool func` answers `false` as a complete result, and `:filter` reads it as
+    "does not match" rather than "no answer". That it reuses the boolean instead
+    of adding a value of its own is what the `false | T` duality pays to avoid a
+    null, and the reason nothing can tell the two uses apart.
+  - **`status(0)` is an outcome, not an absence.** `puts(1 + 2)` binding
+    `Status(0)` does not say "nothing came back"; it says the command ran and
+    went fine — the [status decision](#open-questions)'s own grounds, that a
+    command's result "is not *missing* — it is **how the command went**." It has
+    a type, an equality class and a truth test, none of which an absent value
+    needs.
+  - **`""` is the one that breaks the rule.** A no-`else` `if` and an unmatched
+    `match` manufacture an empty string on a path the author never wrote, and it
+    is indistinguishable from an empty string someone meant
+    ([Error handling](#error-handling)). A `func` with nothing to yield produces
+    the same `""`, but it is a different case on both counts: only a func
+    declaring a **value** return type can — a typeless one has no value channel to
+    hand it through, and `status func` is that same typeless function said out
+    loud, both answering `Status(0)` — and an **empty body** is *written*, so that
+    producer is the asking half of the [strict/soft pairs](#error-handling)
+    rather than a gap. A **bare `return` before anything ran** yields the same
+    `""` and is *not* settled along with it: the author wrote the exit, but "the
+    result so far" is implicit, so the path is theirs while the value on it is
+    not. That one is left open where it is analyzed
+    ([Open questions](#open-questions)), not decided here.
+
+  Stated once, the rule those three obey: **absence is `false`; everything else
+  is a value.** `status(0)` obeys it, which is why the live question is the
+  empty string and not the status — see [Open questions](#open-questions).
+
+  The residual cost on the status side is a lost *diagnostic*, not a null: with
+  every call yielding a value, `:map(&puts)` produces a list of `Status(0)` where
+  it used to report an error, so using an effect-only callable for its value
+  stops being catchable. That trade is
+  [made knowingly](#calling-for-a-value-and-lambdas) and introduces no absent
+  value.
+
 **Special variables live in two namespace maps** — the *(decided)* way to keep
 the shell's built-in state out of your variable namespace. The whole lowercase
 top-level is **yours**; the built-ins hang off two reserved roots:
@@ -7283,6 +7328,8 @@ to avoid" rather than promising the latter as done.
   | **Leave it lenient** (today) | The terse one-liner survives; nothing to migrate | Keeps both manufactured silent empties — the no-`else` `if` and the unmatched `match` — in the language whose pitch is that absence is loud |
   | **Require `else` wherever the value is used** | Closes the `if` half of it — the `match` half needs the totality question answered the same way | "Wherever the value is used" includes func tails, `match` arms and `for` bodies, so it fires far beyond the case it was aimed at, and breaks the documented prompt-segment idiom |
   | **Require `else` in binding position only** | Narrow, syntactic, and checkable at parse time | Already weighed and declined once under [Error handling](#error-handling); and it misses the func-tail case, so it buys explicitness without closing the hole |
+  | **Yield `false` instead of `""`** | The only option that changes the *value*, so the only one that closes the hole the *what it buys* paragraph below concedes the others leave open: `""` stops standing for both "empty" and "absent", `if tag = if $root { "[root]" } { … }` becomes a real presence test (today it always takes the branch), and the gap joins `gets()` on the one absent value the language already has — no new type, no null. [Error handling](#error-handling) already calls the no-`else` `if` "exactly parallel to `gets()` producing `false`"; this is that parallel taken literally | `false` renders as the text `false`, so `"$tag"` reads `false` rather than nothing — the terse tag idiom breaks loudly instead of quietly. The [prompt-segment idiom](INTRO.md) needs its "empties dropped" rule to become "absent dropped". And it does not stop a value being manufactured on an unwritten path, it changes which one: an author who wanted `""` now writes `else { "" }`. **Nor is it value-only** — `false` is the [one value that fails](#functions), so wherever the gap's value projects to a status the omitted branch starts reporting failure: a typed `func` tailing in one answers nonzero, and a `… \|\| fallback` chained off that answer runs the fallback where `""` left it alone. Either that is accepted as correct — an unwritten branch *did* produce no result — or the gap's `false` is exempted from the projection, which splits `false` into two kinds and hands back the single absent value the option exists to reach |
+  | **Make `""` false** | Collapses the three to two without touching a single construct: the gap goes on yielding `""` — and at the stronger of the two strengths below, becomes testable anyway — so the terse tag idiom, the [prompt segment](INTRO.md) and every hand-written `else { "" }` survive unchanged. It is also the shell-native reading — in POSIX, `[ -z "$x" ]` and an unset name are near-interchangeable — and Python, JavaScript and Perl all take it | Reopens [truthiness](#conditionals-if-is-an-expression), settled and shipped as *no truthy values* — `if "" { … }` is an error today naming the comparison to write, and a falsy `""` makes `if $x` legal for a string, putting `"0"` and `"false"` back on the table with the three disagreeing rules that section retired. And it negates the principle the two-arg `$xs:get(i, default)` was reasoned from — *don't let one value stand in for both "empty" and "absent"* — so where the row above gives that distinction up **in the gap**, this gives it up **language-wide**. (`:get` itself survives, its bounds check being internal; what goes is every test written *on* the value it hands back.) **What it costs past that depends on how far it reaches**, and only the stronger of its two strengths touches `gets()` — below the table |
 
   **What it buys is smaller than it first looks.**
   `tag = if $root { "[root]" } else { "" }` still produces an empty string
@@ -7293,6 +7340,79 @@ to avoid" rather than promising the latter as done.
   function body still yields one, and that is fine, since writing an empty body
   *is* the asking. Real, but it is explicitness at the write site rather than
   absence-safety.
+
+  **That last paragraph is why the fourth option is worth its row: it is on a
+  different axis.** The `else` options change *where a branch may be omitted*;
+  yielding `false` changes *what the gap yields* when one is — and, per that row's
+  last cost, what status it leaves. So it is not a rival
+  to the three above it so much as the question they never ask, and both axes can
+  be taken at once — require `else` in binding position *and* yield `false`
+  elsewhere. What recommends it is the [absence rule](#variables-and-assignment):
+  `false` is already the language's absent value, so a gap that yields it agrees
+  with `gets()` and with presence-binding instead of minting a second answer. It
+  carries the same coupling as everything else here — whatever `if` does, an
+  unmatched `match` does. The valueless `func` body is not dragged along: that
+  producer is already the *asking* half of the
+  [strict/soft pairs](#error-handling), so it is a separate call.
+
+  **The fifth row is a third axis again**, and the widest: making `""` false
+  leaves every construct alone and changes what the *value* means, so the gap
+  needs no answer at all — at the stronger of the two strengths below, it becomes
+  testable wherever it already is. One
+  sub-question it raises is settled by precedent rather than standing against it:
+  a value may be falsy without comparing equal to `false`, since `status(0)` is
+  true in a condition while `status(0) == true` stays refused, truth and equality
+  going through different projections. `"" == false` is the part that is *not*
+  available, equivalence classes needing a lossless projection and
+  String → Boolean having none. What the row is judged on is everything below:
+  the reopened truthiness, which holds at any strength, and the costs that depend
+  on how far the change reaches.
+
+  **The fifth row has two strengths, and they cost differently.** *Truthiness
+  only* — `""` is false in an ordinary condition — leaves `if x = f()` alone: an
+  [assignment condition](#matching-match) tests **presence**, not truth, and keys
+  on `false` itself, so a blank line still binds and `gets()`'s contract is
+  untouched. But then the gap is not testable by a presence-bind either —
+  `if tag = if $root { "[root]" } { … }` still always takes the branch — and what
+  the option buys is the explicit `if $tag { … }` and nothing more. *Truthiness
+  plus absence* — `""` counts as absent in the presence-bind too — is the strength
+  that makes the gap testable, and it is the one that ends
+  `while line = gets() { … }` at the first blank line and migrates every
+  conditional bind of a legitimately empty value. **So the blank-line casualty
+  belongs to the stronger reading alone, and the weaker one buys correspondingly
+  less** — which is the trade to weigh, not a single verdict on the row.
+
+  **A third dial is independent of both, and the option as named does not turn
+  it:** the [status projection](#functions). `status_of` maps `""` to `0`, so
+  `str func f() { "" }; f || fallback` goes on succeeding at either strength and
+  `f():capture.status` is unchanged — the status churn the row above carries is
+  simply absent here, which is a point in this row's favor rather than an
+  oversight. What it leaves, though, is a real inconsistency, and the `Status`
+  precedent does **not** cover it: a `Status` agrees with itself — `status(0)` is
+  true in a condition *and* successful, a nonzero one false *and* failing — and
+  what that type splits is **equality**, a different question. Here
+  `str func f() { "" }` would make `if f() { … }` take `else` while
+  `f() || fallback` skips the fallback, so truth and status disagree about one
+  value. That is exactly the invariant the total projection exists to hold —
+  ["success must be truthy on both sides"](#matching-match), so that `if X { … }`
+  means "did X succeed" whether `X` is `grep -q …` or a mesh function — and
+  breaking it is a cost of this row rather than something it inherits. Turning
+  the third dial as well, mapping `""` to status `1`, restores the agreement at
+  the price of the status churn the row above carries.
+
+  **One escape from the `gets()` cost — at the strength where that cost exists —
+  was considered and does not reach it:**
+  routing EOF through a `Status` rather than `false`. It would terminate a read
+  loop cleanly — a nonzero `Status` already takes `else` while still binding — but
+  what ends the loop under a falsy `""` is the **blank line**, not the EOF, so the
+  casualty is untouched. The version that *would* work moves the presence-bind off
+  value-falsity altogether, failing only on a nonzero `Status`; that costs the
+  `false | T` encoding everywhere else, since `if m = lookup(k) { … }` would then
+  take the branch with `m` bound to `false`. (Whether `gets()` should answer EOF
+  with a `Status` on its own merits is a separate question, and it does not buy a
+  read-error distinction: a failed read is already a **runtime error** — channel
+  two, fail-loud — so a clean end and a failure are distinguishable today, with
+  `false` marking only the clean one.)
 
   **Independent of the flat soft bind above.** That construct is unambiguous with
   a distinct fallback word whether or not this changes, so the two should not be
