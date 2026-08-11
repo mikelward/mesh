@@ -16065,39 +16065,157 @@ fn a_failing_status_condition_leaves_a_fresh_name_unbound() {
 }
 
 #[test]
-fn reading_a_failed_codes_value_takes_a_plain_assignment() {
-    // What the non-binding costs, and the shape that pays it. The `else` branch
-    // of a binding condition cannot reach the code, and **`$sh.status` is
-    // unreliable rather than a substitute**: a value condition leaves the
-    // standing status alone, so what is there depends on what ran, not on what
-    // was rejected.
+fn a_rejected_status_publishes_its_code_to_the_branch_it_picks() {
+    // The presence-bind still binds nothing when it rejects — a `str`-typed name
+    // must not end up holding a `Status` — but the code is no longer lost with
+    // it: **the right-hand side ran, so it publishes**, on the same terms the
+    // assignment statement does.
     //
-    // All three readings are pinned, because any one alone reads like a rule and
-    // none of them is: `0` from a fresh shell, `3` from an earlier failing
-    // command with a constructed value on the right, and `5` — the rejected code
-    // itself — when the right-hand side *is* the command that failed. That last
-    // one is why the docs say unreliable and not "never the code".
-    //
-    // The shape that does reach the code assigns first — a statement binds
-    // unconditionally — and then asks presence again with an inner bind. That
-    // inner bind is the load-bearing part: a bare `if $t` serves a bool or a
-    // status and **errors on a string**, which is the case this whole rule exists
-    // for, so the success arm here uses one to prove it carries arbitrary values.
+    // Pinned across four histories, because the old behavior was not "the wrong
+    // number" but an *unrelated* one: the `else` used to show whatever ran before
+    // the `if`, so it read `0` fresh, `3` after an `exit 3`, `5` only in the one
+    // case where the right-hand side happened to be the failing command itself.
+    // All four now read the rejected code, which is the point — a reading that
+    // tracks unrelated history is worse than no reading at all.
     let out = run_with_input(
         "if s = status(5) { puts success } else { puts \"fresh $sh.status\" }\n\
          sh -c \"exit 3\"\n\
          if s = status(5) { puts success } else { puts \"standing $sh.status\" }\n\
          if c = sh(\"-c\", \"exit 5\") { puts success } else { puts \"command-rhs $sh.status\" }\n\
-         t = status(5)\n\
+         puts hi\n\
+         if s = status(5) { puts success } else { puts \"after-a-command $sh.status\" }\n",
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "fresh 5\nstanding 5\ncommand-rhs 5\nhi\nafter-a-command 5\n",
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // The same statement in the two positions now agrees, which is the
+    // inconsistency this closes: `x = f()` reported the code and `if x = f()`
+    // did not, on identical text.
+    let both = run_with_input(
+        "any func f() { fail 5 }\n\
+         sh -c \"exit 9\"\n\
+         x = f()\n\
+         puts \"statement $sh.status\"\n\
+         sh -c \"exit 9\"\n\
+         if y = f() { puts t } else { puts \"condition $sh.status\" }\n",
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&both.stdout),
+        "statement 5\ncondition 5\n",
+        "{}",
+        String::from_utf8_lossy(&both.stderr)
+    );
+
+    // **Every** binding-condition path publishes, not just the failing-status
+    // one. A `false`-returning call and a list-pattern condition each returned
+    // from `condition_status` before the recording step, so they still showed
+    // unrelated history while their statement forms reported `0`. Raised in
+    // review — the first fix closed one early return of three.
+    let paths = run_with_input(
+        "any func f() { false }\n\
+         any func g() { [1] }\n\
+         any func h() { [1 2] }\n\
+         sh -c \"exit 7\"\n\
+         if x = f() { puts t } else { puts \"false-cond $sh.status\" }\n\
+         sh -c \"exit 7\"\n\
+         if [y] = g() { puts \"list-match $sh.status\" } else { puts e }\n\
+         sh -c \"exit 7\"\n\
+         if [z] = h() { puts t } else { puts \"list-miss $sh.status\" }\n",
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&paths.stdout),
+        "false-cond 0\nlist-match 0\nlist-miss 0\n",
+        "{}",
+        String::from_utf8_lossy(&paths.stderr)
+    );
+
+    // Publishing must not *flatten* what the operand already recorded. A callee
+    // ending in a pipeline has a per-stage breakdown, and a condition that
+    // overwrote it with a single entry would leave `$sh.pipestatus` disagreeing
+    // with the statement form on the identical call — the same guard
+    // `run_recorded` uses. Raised in review.
+    let piped = run_with_input(
+        "any func f() { true | sh -c \"exit 5\" }\n\
+         x = f()\n\
+         puts $sh.pipestatus:repr\n",
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&piped.stdout),
+        "[status(0), status(5)]\n",
+        "{}",
+        String::from_utf8_lossy(&piped.stderr)
+    );
+    for condition in ["if f()", "if y = f()"] {
+        let out = run_with_input(&format!(
+            "any func f() {{ true | sh -c \"exit 5\" }}\n\
+             {condition} {{ puts t }} else {{ puts $sh.pipestatus:repr }}\n"
+        ));
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout),
+            "[status(0), status(5)]\n",
+            "{condition}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    // A `match` arm guard is a condition too, reached by a different path —
+    // `run_ast_match` and `eval_match_expr` evaluate it directly rather than
+    // through `condition_status`, so it needed the same publishing. Both the
+    // statement and the value form. Raised in review.
+    let guarded = run_with_input(
+        "sh -c 'exit 3'\n\
+         match 1 { 1 if true => { puts \"stmt $sh.status\" } }\n\
+         sh -c 'exit 3'\n\
+         v = match 1 { 1 if true => { $sh.status } }\n\
+         puts \"value $v\"\n",
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&guarded.stdout),
+        "stmt 0\nvalue 0\n",
+        "{}",
+        String::from_utf8_lossy(&guarded.stderr)
+    );
+
+    // A **postfix guard** is the fifth route, and `guard_allows` evaluates it
+    // directly. A guard that lets its statement run publishes, so the two
+    // spellings of one conditional agree — `puts $sh.status if true` had read the
+    // stale standing status where the block form read `0`. A guard that *skips*
+    // its statement publishes nothing: a skipped statement ran nothing and
+    // reports nothing, which is §Guards' existing rule. Raised in review.
+    let guards = run_with_input(
+        "sh -c 'exit 7'\n\
+         puts \"postfix $sh.status\" if true\n\
+         sh -c 'exit 7'\n\
+         if true { puts \"block $sh.status\" }\n\
+         sh -c 'exit 7'\n\
+         puts skipped if false\n\
+         puts \"after-skip $sh.status\"\n",
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&guards.stdout),
+        "postfix 0\nblock 0\nafter-skip 7\n",
+        "{}",
+        String::from_utf8_lossy(&guards.stderr)
+    );
+
+    // Binding is unchanged: the rejected status leaves the name as it was, and an
+    // ordinary value is still kept — including a string, which a bare `if $t`
+    // could not test.
+    let binds = run_with_input(
+        "t = status(5)\n\
          if kept = $t { puts success } else { puts \"code $t:code\" }\n\
          u = hello\n\
          if kept = $u { puts \"string kept $kept\" } else { puts lost }\n",
     );
     assert_eq!(
-        String::from_utf8_lossy(&out.stdout),
-        "fresh 0\nstanding 3\ncommand-rhs 5\ncode 5\nstring kept hello\n",
+        String::from_utf8_lossy(&binds.stdout),
+        "code 5\nstring kept hello\n",
         "{}",
-        String::from_utf8_lossy(&out.stderr)
+        String::from_utf8_lossy(&binds.stderr)
     );
 }
 
@@ -28591,10 +28709,20 @@ fn a_command_condition_publishes_its_status_to_the_branch_it_picks() {
     );
     assert_eq!(String::from_utf8_lossy(&looped.stdout), "4\n4\n");
 
-    // A **value** condition is not a command and has no status to report, so the
-    // previous command's still stands — the rule a skipped guard already follows.
+    // A **value** condition publishes too, on the same rule: `$sh.status` is the
+    // status of the last *expression*, and this one was evaluated. It used to
+    // leave the standing status, on the grounds that a bool is not a command —
+    // which drew the line at *command* rather than at *evaluated*, so the branch
+    // read whatever had run earlier instead of what it just tested.
     let boolean = run_with_input("sh -c 'exit 3'\nif 1 == 1 { puts \"then=$sh.status\" }\n");
-    assert_eq!(String::from_utf8_lossy(&boolean.stdout), "then=3\n");
+    assert_eq!(String::from_utf8_lossy(&boolean.stdout), "then=0\n");
+
+    // And a value that *is* a failure reports as one, the same as it does when
+    // written as a statement.
+    let falsey = run_with_input(
+        "sh -c 'exit 3'\nx = false\nif $x { puts t } else { puts \"else=$sh.status\" }\n",
+    );
+    assert_eq!(String::from_utf8_lossy(&falsey.stdout), "else=1\n");
 
     // The `if` itself still reports its *body's* status, not its condition's.
     assert_eq!(

@@ -2483,12 +2483,29 @@ fn guard_allows(
         // statement it guards does not run: the caller reports it as skipped and
         // the flag travels on to the loop it belongs to.
         Some(guard) => {
+            let records = shell.status_records;
             let value = eval_operand_of(&guard.condition, last, in_function, shell)?;
             if shell.control.is_some() {
                 return Ok(false);
             }
             let truth = condition_bool(&value).map_err(runtime_message)?;
-            Ok(truth != guard.unless)
+            let allows = truth != guard.unless;
+            // A guard that **lets its statement run** publishes, so the postfix
+            // form matches the block one: `puts $sh.status if true` had read the
+            // stale standing status where `if true { puts $sh.status }` reads `0`,
+            // which made the two spellings of one conditional disagree for any
+            // statement whose expansion reads the status. Raised in review.
+            //
+            // A guard that **skips** its statement publishes nothing, and that is
+            // the statement being the unit rather than an exception: a skipped
+            // statement ran nothing and reports nothing, which is the rule
+            // `docs/REFERENCE.md` §Guards already states. The guard's own truth is
+            // not a result the statement produced — it is the reason there is no
+            // statement.
+            if allows {
+                publish_condition_status(status_of(&value), records, shell);
+            }
+            Ok(allows)
         }
     }
 }
@@ -2580,6 +2597,7 @@ fn run_ast_match(node: &parser::MatchExpr, last: u8, in_function: bool, shell: &
         let snapshot = shell.vars.active_snapshot();
         commit_bindings(bindings, &mut shell.vars);
         if let Some(guard) = &arm.guard {
+            let records = shell.status_records;
             match eval_operand_of(guard, last, in_function, shell) {
                 // The guard raised `break`/`continue`, so it produced no truth
                 // value. Its falsy placeholder must not be read as "this arm does
@@ -2589,17 +2607,25 @@ fn run_ast_match(node: &parser::MatchExpr, last: u8, in_function: bool, shell: &
                     shell.produced = Produced::Nothing;
                     return Step::Continue(last);
                 }
-                Ok(value) => match condition_bool(&value) {
-                    Ok(true) => {}
-                    Ok(false) => {
-                        shell.vars.restore_active(snapshot);
-                        continue;
+                Ok(value) => {
+                    // A guard is a condition, so it publishes like one — the same
+                    // rule `condition_status` follows, reached by a different path.
+                    // A guard that *rejects* its arm publishes too, exactly as an
+                    // `if` condition does when the `else` branch is taken: what was
+                    // evaluated is what reports. Raised in review.
+                    publish_condition_status(status_of(&value), records, shell);
+                    match condition_bool(&value) {
+                        Ok(true) => {}
+                        Ok(false) => {
+                            shell.vars.restore_active(snapshot);
+                            continue;
+                        }
+                        Err(message) => {
+                            shell.vars.restore_active(snapshot);
+                            return runtime_message(message);
+                        }
                     }
-                    Err(message) => {
-                        shell.vars.restore_active(snapshot);
-                        return runtime_message(message);
-                    }
-                },
+                }
                 Err(step) => return step,
             }
         }
@@ -2681,6 +2707,21 @@ fn tests_a_value(condition: &parser::Executable) -> bool {
     )
 }
 
+/// Publish a condition's own status without flattening a nested breakdown.
+///
+/// The same guard [`run_recorded`] uses for a statement, and for the same reason:
+/// when the operand's evaluation already recorded — a pipeline inside the callee,
+/// say — that record describes the run stage by stage, and overwriting it with a
+/// single entry would leave `$sh.pipestatus` disagreeing with the statement form
+/// on the identical call. `records` is the count taken *before* the operand ran.
+/// Raised in review, which measured `if f()` on a piped body reporting
+/// `[status(5)]` where `x = f()` reported `[status(0), status(5)]`.
+fn publish_condition_status(reported: u8, records: u64, shell: &mut Shell) {
+    if shell.status_records == records || shell.vars.status() != reported {
+        shell.record_status(reported, vec![reported]);
+    }
+}
+
 fn condition_status(
     condition: &parser::Executable,
     last: u8,
@@ -2730,10 +2771,19 @@ fn condition_status(
     {
         // What this condition asks is whether the value has the requested shape
         // (`docs/REFERENCE.md` §Conditionals); a capture's status is no part of it.
-        let value = eval_operand_of(value, last, in_function, shell)?;
+        let subject = value;
+        let records = shell.status_records;
+        let value = eval_operand_of(subject, last, in_function, shell)?;
         if shell.control.is_some() {
             return Ok(None);
         }
+        // The right-hand side ran, so it publishes — before the shape question is
+        // asked, since whether the arity matched is no part of what the *call*
+        // exited with. Raised in review: the shape arm returned from three places
+        // without publishing, so `if [x] = f()` left unrelated history standing
+        // where `[x] = f()` reported `0`.
+        let reported = assignment_status_of(subject, &value, false, shell);
+        publish_condition_status(reported, records, shell);
         // Ahead of the match, because whether a name *may* be bound is a property
         // of the pattern and must not depend on what the right-hand side turned
         // out to be: `if [env] = [1]` reported the reserved name while
@@ -2783,6 +2833,7 @@ fn condition_status(
     } = condition
         && !capture_tail(value)
     {
+        let records = shell.status_records;
         let bound = eval_operand_of(value, last, in_function, shell)?;
         if shell.control.is_some() {
             return Ok(None);
@@ -2795,6 +2846,14 @@ fn condition_status(
         if let Err(message) = validate_patterns(std::slice::from_ref(pattern)) {
             return Err(runtime_message(message));
         }
+        // **Publishes before any of the answers below**, because every one of them
+        // is a question about the *value* — absent, failing, or bindable — and
+        // none of them is a question about what the call exited with. Placing it
+        // after the absent check left `if x = f()` on a `false`-returning `f`
+        // showing unrelated history where `x = f()` reported `0`. Raised in
+        // review, and the same slip in the shape arm above.
+        let reported = assignment_status_of(value, &bound, false, shell);
+        publish_condition_status(reported, records, shell);
         if bound == Value::Boolean(false) {
             return Ok(Some(1));
         }
@@ -2810,14 +2869,16 @@ fn condition_status(
         // binding one puts a `Status` into a `str`-typed name and the annotation
         // stops meaning anything on the failure path.
         //
-        // The code is genuinely lost here, and `$sh.status` is not a substitute:
-        // a value condition leaves the standing status alone, so what is there
-        // depends on what ran — `0` in a fresh shell, `3` after an earlier failing
-        // command, and the rejected code itself when the right-hand side *is* the
-        // failing command. Unreliable rather than unavailable, which is worse. All
-        // three are pinned by
-        // `reading_a_failed_codes_value_takes_a_plain_assignment`. A caller who
-        // wants it assigns first — a statement binds unconditionally — and then
+        // The *binding* is what is withheld; the code is not lost with it. The
+        // status channel is a separate one and the right-hand side ran, so it
+        // publishes above, before any of these answers, and the `else` branch
+        // reads the rejected code in
+        // `$sh.status`. That reading used to track whatever ran before the `if`
+        // instead — unreliable rather than unavailable, which is worse — and is
+        // pinned now by
+        // `a_rejected_status_publishes_its_code_to_the_branch_it_picks`. A caller
+        // who needs the code to outlive the branch assigns first — a statement
+        // binds unconditionally — and then
         // asks presence again: `t = f()` then `if kept = $t { … } else { $t:code }`.
         // The inner bind matters: a bare `if $t` serves a bool or a status and
         // errors on a string, which is the case this rule exists for.
@@ -2828,6 +2889,16 @@ fn condition_status(
         // The capture-tailed sibling is untouched, and is not an exception: `if
         // out = $(diff a b)` binds the *output*, a string, and branches on the
         // diff's status — the bound value was never a `Status` there.
+        // **The right-hand side ran, so it publishes**, on the same terms the
+        // assignment *statement* does — `assignment_status_of`, one line up the
+        // page. Without this the two positions disagreed about identical text:
+        // `x = f()` where `f` ends in `fail 5` reported `5`, while
+        // `if x = f() { … } else { … }` left whatever ran before the `if`
+        // standing, so the `else` showed `0` in a fresh shell, `3` after an
+        // earlier `exit 3`, `9` after an `exit 9` — tracking unrelated history
+        // rather than the call it just made. That is the worst place for it: the
+        // `else` branch is where the program knows `f` failed, and was the one
+        // place its code could not be read.
         if let Value::Status(code) = bound
             && code != 0
         {
@@ -2845,11 +2916,26 @@ fn condition_status(
         guard: None,
     } = condition
     {
+        let records = shell.status_records;
         let value = eval_operand_of(expression, last, in_function, shell)?;
         if shell.control.is_some() {
             return Ok(None);
         }
         let truth = condition_bool(&value).map_err(runtime_message)?;
+        // A value condition publishes too: `$sh.status` is the status of the last
+        // **expression**, and this one was evaluated. Nothing distinguishes
+        // `if 1 == 1` from any other expression that produced a value — it used to
+        // leave the standing status on the grounds that "a bool is not a command",
+        // which drew the line at *command* rather than at *evaluated*, and left
+        // the branch reading whatever ran earlier.
+        //
+        // A condition its own trailing guard **skipped** is still exempt, and the
+        // reason is the *statement*, not the expression: the guard itself does get
+        // evaluated, but a skipped statement ran nothing and so reports nothing.
+        // The guard's truth is why there is no statement, not a result one
+        // produced. `guard_allows` is where that lives.
+        let reported = status_of(&value);
+        publish_condition_status(reported, records, shell);
         return Ok(Some(u8::from(!truth)));
     }
     // A command condition **is** a command that ran, so it publishes its status
@@ -2858,12 +2944,16 @@ fn condition_status(
     // publishing normally happens in `run_recorded`, which a condition does not
     // pass through — the condition is not the statement's result, the branch is.
     //
-    // Two conditions are exempt, for the same reason: nothing ran. A bool is not a
-    // command and has no status to report, so `if $x == 1 { … }` leaves the
-    // previous command's standing; and a condition its own trailing guard skipped
-    // — `if cmd if false { … }` — never ran the command at all. Both are the rule
-    // `docs/REFERENCE.md` §Guards already states, and `Produced::Nothing` is what
-    // says which happened.
+    // **One** condition is exempt, and the test is "did anything run": a condition
+    // its own trailing guard skipped — `if cmd if false { … }` — never ran the
+    // command at all, so there is no expression whose status this could be and the
+    // previous run stands. `Produced::Nothing` is what says so.
+    //
+    // A **value** condition is no longer the second exemption. It used to be, on
+    // the grounds that "a bool is not a command and has no status to report" —
+    // which draws the line at *command* where the rule draws it at *evaluated*, so
+    // `if $x == 1 { … }` left the branch reading whatever had run earlier. It is
+    // handled in the arm above and publishes its own projection.
     let records = shell.status_records;
     shell.produced = Produced::Status;
     match run_executable(condition, false, last, in_function, shell) {
@@ -7763,7 +7853,12 @@ fn eval_match_expr(
         validate_bindings(&bindings).map_err(runtime_message)?;
         commit_bindings(bindings, &mut shell.vars);
         if let Some(guard) = &arm.guard {
+            let records = shell.status_records;
             let guard_value = eval_operand_of(guard, last, in_function, shell)?;
+            // As in `run_ast_match`: a guard is a condition and publishes like one.
+            if shell.control.is_none() {
+                publish_condition_status(status_of(&guard_value), records, shell);
+            }
             let passed =
                 shell.control.is_some() || condition_bool(&guard_value).map_err(runtime_message)?;
             // As in `run_ast_match`: a guard that raised `break`/`continue`
