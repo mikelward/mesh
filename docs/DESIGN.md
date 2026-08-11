@@ -7725,7 +7725,7 @@ to avoid" rather than promising the latter as done.
   | **A nonzero status, implicit** (the entry above) | no | no | no, a call | awkward — a miss is not a failure |
   | **A named in-band status** (`end = status(255)`) | **no** — the code is reachable, so a failing command lands on the same `Status(255)` | only if `?` is added too | only if a literal | no — `end` is not a miss |
   | **A named out-of-band status** (a code above 255) | yes, *by construction* | only if `?` is added too | only if a literal | no |
-  | **The hybrid** — declare `?`, produce a status, consume under a binding | no, unless paired with an out-of-band code | yes — but only if the enforcement tightening ships with it | n/a — no literal to see | yes, though the absence arm has no spelling |
+  | **The hybrid** — declare `?`, produce a status, consume under a binding | no, unless paired with an out-of-band code | yes — but only if the enforcement tightening ships with it | n/a — no literal to see | yes, and the absence arm is spelled `1..=255`, which also catches an `int` |
 
   The out-of-band variant deserves its own note, because it answers the objection
   to the in-band one properly: a process status is **8 bits** at the OS level, so
@@ -7790,14 +7790,17 @@ to avoid" rather than promising the latter as done.
     be at least this strong, or `match` becomes the hole `any` would otherwise
     have been.
 
-    **And "an explicit absence arm" currently has no spelling**, which is the
-    hybrid's own cost showing up: it mints no literal, so the absence *is* "any
-    nonzero status", while a value pattern like `status(1)` matches one exact
-    code and a callee is free to `fail 2`. So either discharge is **`_`-only**
-    — simple, and honest about what the option can carry — or the hybrid owes a
-    pattern that matches *any* failing status, which is a piece of syntax it was
-    supposed to avoid needing. That is the option spelling's advantage arriving
-    by the back door: `none` is one literal and therefore one pattern.
+    **An explicit absence arm has a spelling, and it is imprecise** — this
+    paragraph said it had none, twice, and that was wrong. The hybrid mints no
+    literal, so the absence *is* "any nonzero status"; `status(1)` matches one
+    exact code and a callee is free to `fail 2`, but **`1..=255`** matches all
+    of them, since a range asks `contains` and a status compares equal to its
+    code. Raised in review. What that range cannot do is tell a `status(7)`
+    from the `int` `7`, so in an `int?`-shaped option it swallows ordinary
+    results. So the hybrid owes no new syntax after all; what it owes is either
+    a **`_`-only** discharge or an arm that is right about the status and wrong
+    about a number. The option spelling's advantage survives at the reduced
+    size: `none` is one literal and therefore one *exact* pattern.
 
     Everything else is refused — `line = gets()` as a bare statement,
     `f(gets())`, `$env:get(K, gets())`. The obligation is either handled or
@@ -7890,6 +7893,334 @@ to avoid" rather than promising the latter as done.
   `T?` is what inference calls an option, and the implicit widening is the shape
   it cannot express. That entry says so in full; this one defers to it rather than
   repeating the argument.
+- **The mark and the value are two decisions, not one — and the first is the
+  one to take next, once its own prerequisites are settled.** The entries above
+  weigh five spellings as if picking one picks everything. Working through what
+  `?` has to admit shows they share a part, and separating it is what makes the
+  rest tractable.
+
+  **Not "ripe", which an earlier heading here said.** Raised in review against
+  the contradiction it created with this entry's own conclusion: the mark needs
+  the refusal, an interim on `false`, and an answer for `any` before a line of
+  it can be written, and the `any` one is a language decision rather than a
+  detail. What is true is narrower and still useful — the mark is the decision
+  that **unblocks** the others, and no answer to the value question makes it
+  wrong to build first.
+
+  **The correction that produced this.** The `none` proposal above says its
+  widening replaces `T | Status(n≠0)`. Retiring that widening outright is not
+  available: it is what lets a **fallible value func** exist at all. Retire it and
+  `str func find(k) { … fail … }` stops conforming to its own declaration, so
+  every lookup that can come up empty is either non-conforming or has to be
+  rewritten to answer something else. Raised by the repo owner against a draft
+  that had this write-up recommending `none` on the strength of "the widening
+  goes away" — it does not go away, and the recommendation was made on that
+  mistake.
+
+  **What is actually true: the widening moves behind the mark.**
+  `T | Status(n≠0)` stops holding everywhere unspelled and holds exactly where
+  `?` is written. So `?` reads **"may not give you a value"**, and it admits every
+  spelling of that — a failing status today, and a `none` if one is ever minted.
+  An unmarked `T` answering a status is then a plain declared-type mismatch, the
+  same kind of thing `int func f() { "x" }` already is.
+
+  **That invariant is the end state, and two things break it** — and they break
+  it for different reasons, which decides what has to be settled before the mark
+  is worth writing. Raised in review, twice: first that the invariant was stated
+  unqualified, then that the qualification made both exceptions look like one
+  problem.
+
+  - **`bool`, because of the interim.** The interim exempts it so a fallible
+    boolean function stays writable, and settling `false` removes the exemption
+    — a `false` that no longer fails a presence-bind makes `bool?` workable and
+    the exemption unnecessary.
+  - **`any`, independently of all of it.** `declared_matches` accepts every
+    value for `ReturnType::Value`, so `any func f() { fail 5 }` conforms no
+    matter what `false` means. Settling `false` does nothing here; only
+    narrowing `any`, requiring `any?`, or declaring `any` a deliberate opt-out
+    closes it.
+
+  So the ordering that actually reaches the invariant is **settle `false`, settle
+  `any`, then ship the mark** — two prerequisites, not one, and the reverse of
+  the ordering this entry proposes. Worth weighing against it: "ship the mark
+  now" buys a rule with two holes in it, and only one of them closes on its own.
+
+  ```mesh
+  str? func find(k)      # may come up empty; `fail` is how it says so
+  str  func find(k)      # promises a string; a `fail` here is a mismatch
+  ```
+
+  That is the *no implicit null* rule applied to the status channel rather than
+  abandoned: the union survives, and has to be declared. It is also the one
+  reading under which the repo owner's framing holds exactly — **a status is
+  doing an exception's or an `err`'s job; the question mark is doing an option's**
+  — because the mark is about the *slot* and the status is about the *outcome*.
+
+  **`false` is a third spelling, and the mark has to say something about it.**
+  [The ask/read rule](#modifiers) leaves `false` as what an *asking* operation
+  answers, and the [presence-bind](#tests-and-comparisons) refuses it alongside a
+  failing status — so a marked func that forwards one,
+  `str? func first(s) { $s:match(/…/) }`, answers an absence the stated
+  `T | Status(n≠0)` does not admit. Raised in review. Three ways out, none picked
+  here:
+
+  1. **Admit it** — `T?` means `T | none | Status(n≠0) | false`, which is four
+     arms and gives up on the mark naming one thing.
+  2. **Refuse it** — a value func may not answer a `false` unless it declares
+     `bool`, so forwarding an ask means converting: `if m = $s:match(/…/) { $m }`
+     with the absent arm spelling whatever this entry settles on. That keeps
+     `false` a *boolean answer*, which is what
+     [the absence decision](#open-questions) narrowed it to.
+  3. **Retire `false` from the absent set entirely**, which the entry above
+     already lists as open — then the presence-bind refuses a `none` and a
+     failing status and nothing else.
+
+  **Two and three are not the same work**, and an earlier draft here said they
+  were. Raised in review. *Refuse it* is a rule about what a **declaration may
+  answer**: asking operations go on producing `false`, the presence-bind goes on
+  refusing it, and `bool` goes on containing it. *Retire it* changes what
+  absence **is**, which reaches the presence-bind and every narrowing. Only the
+  second satisfies the end-state table below — a distinction the entry has to
+  keep, since an implementer taking the cheaper one would not get the property
+  the table promises.
+
+  They do point the same way: fewer spellings of absence a value can carry, the
+  closer `T?` is to one constructor with one nullary case.
+
+  **What that does to the five options: it collapses the axis they were arranged
+  on.** Every one of them needs the mark, or needs a reason not to have it, so the
+  mark is not what distinguishes them. What is left is one question:
+
+  > Once the declaration says a value might not come, does absence also need a
+  > **value** of its own?
+
+  A `none` on top of the mark buys four things, and each is about
+  *discrimination* rather than about declaration:
+
+  1. **One literal, therefore one *exact* pattern.** Without it, "absent" is
+     any nonzero status, which `1..=255` does match (below) — but that range
+     also matches an ordinary `int`, so in an `int?` the absence arm swallows
+     real results. A `none` arm can be wrong about nothing else.
+  2. **An ended read stops being a failed command.** With statuses alone, EOF is
+     `Status(1)` and so is a failed `grep`; nothing downstream tells them apart.
+  3. **The branch check can see it.** A `none` literal is classifiable where a
+     call is `Yields::Unknown` under late binding.
+  4. **`:kind` can answer it**, so the absence is inspectable as a value rather
+     than only as a code.
+
+  Against, and these are the costs the earlier write-up under-charged: a new value
+  kind and a bare word spent; a **third** member of the absent set beside `false`
+  and a failing status; a `status_of` arm that has to be decided *with* it, since
+  a `none` absent to a presence-bind and successful to a `||` chain would be two
+  answers about one value; and the plain fact that the status it would displace
+  **carries a code** and `none` does not, which is a loss exactly where absence
+  gets inspected.
+
+  **The candidates side by side, with the mark in all of them** — the comparison
+  the earlier draft should have made, instead of charging the mark's costs to one
+  side and its benefits to the other. There are **three** rather than two,
+  because adding `none` and retiring the status from the marked type are
+  separable moves and only doing both buys the single-pattern property. Both
+  points raised in review, the second against a two-column version that credited
+  "mark + `none`" with benefits that need the retirement as well:
+
+  | | **`none` only**<br>`T?` = `T \| none` | **both admitted**<br>`T?` = `T \| none \| Status(n≠0)` | **status only**<br>`T?` = `T \| Status(n≠0)` |
+  |---|---|---|---|
+  | absence is spelled | `none` | either, and the callee picks | a nonzero `Status`, from `fail` |
+  | matching it | one pattern, and it means only absence | `none` for its half; `1..=255` for the status half, with the same imprecision | `1..=255` matches every nonzero status — but also every `int` in that range |
+  | a `fail` in a `str? func` | a **type error**; rewrite it to answer `none` | legal | legal |
+  | EOF vs a failed command | distinguishable | distinguishable *if* the callee chose `none`, and nothing makes it | the same value; `Status(1)` either way |
+  | does absence carry *why* | no | only when it arrived as a status | yes — the code |
+  | the branch check | sees the literal | sees it for the `none` half only | sees `Yields::Unknown` for a call |
+  | new value kind | yes, plus a bare word and a `status_of` arm | same | none |
+  | exhaustive matching | one arm, exact | two arms, the second inexact | one arm, inexact — unsound as soon as `T` is `int` |
+
+  **These are end states, and every one of them assumes `false` has been
+  *retired* from the absent set** — option 3 above, and only that one. Raised in
+  review twice: first against reading the columns beside the interim, where
+  `str? func f() { false }` is valid and the absence is `T | none | false`, so
+  no column's matching claim holds; then against offering *refuse it* as
+  sufficient. It is not. Refusing a `false` from a non-`bool` value func leaves
+  asking operations producing one, the presence-bind refusing one, and `bool`
+  containing one — so the exact-single-pattern claims still fail for `bool` and
+  for anything forwarding an ask. The interim is a way station, not a fourth
+  candidate; the comparison is between destinations, and it has a precondition.
+
+  **A class pattern for "any failing status" already exists**, and earlier
+  drafts of this entry said twice that it did not. `match_bindings` treats a
+  range as a list and asks `contains`, and a `Status(code)` compares equal to
+  its `code`, so `1..=255` matches every nonzero status today. Raised in
+  review; measured:
+
+  ```mesh
+  t = f()                                    # status 7
+  match $t { 1..=255 => "absent" ; _ => … }  # "absent"
+  t = 7
+  match $t { 1..=255 => "absent" ; _ => … }  # "absent" as well — an ordinary int
+  ```
+
+  The last line is what survives of the argument. The pattern exists but is
+  **imprecise**: it matches the value `7` as readily as `status(7)`, so in an
+  `int? func` the absence arm swallows ordinary results. So the `none` column's
+  advantage is *precision*, not existence — a smaller claim than the one it
+  replaces, and one that only bites where `T` overlaps the status range.
+
+  Read that way the middle column is the expensive one: it pays for the value
+  kind *and* keeps the imprecise arm, and it leaves two ways to say the same
+  thing with nothing choosing between them. The real choice is between the
+  outer two, and it is **precision against information** — a `none` is matched
+  exactly and told apart from a failure but says nothing about why; a status
+  says why, and is matchable only by a range that cannot tell it from an `int`.
+
+  Everything else that used to separate them — the declaration, the widening,
+  the refusal, and the consumption rule if one ships — belongs to the mark,
+  which all three have. So does the `any` hole.
+
+  **The ordering this suggests: the mark is decidable now, and how far the value
+  is decidable later depends on which `T?` is meant.** Shipping `?` does not
+  presume an answer about `none` — adding one afterwards adds a value the mark
+  already admits, and no signature written in the meantime changes, so `gets()`
+  can answer `status(1)` under the mark today and a `none` later without touching
+  a `str? func` line. The five-way comparison hid that, because it treated the
+  mark as one option's feature rather than as the common part.
+
+  **But "decidable later" is not "optional", and the
+  [inference direction](#open-questions) is why.** That entry already reads `T?`
+  as what ML calls an option — a constructor with `none` as its **nullary case** —
+  and calls the widening *provisional*, a way to keep `str func gets()` one word
+  until a real option type exists. Raised in review against a draft of this entry
+  that read as though `none` could be declined indefinitely. It cannot, under that
+  destination, and the two readings are a genuine fork:
+
+  | | `T?` means | a `fail` inside a `str? func` | inference |
+  |---|---|---|---|
+  | **Option-only** — the inference entry's reading | `T \| none` | a **type error**; a fallible func answers `none` instead | one constructor, one nullary case, principal types |
+  | **Option-or-status** — this entry's reading | `T \| none \| Status(n≠0)` | legal, and the mark is what makes it legal | three arms, one of them matchable only by a range that also catches ints |
+
+  Option-only is cleaner to infer over and costs the thing the repo owner's
+  correction was about: `fail` stops being how a value func says "nothing here",
+  so every fallible lookup is rewritten to answer `none`. Option-or-status keeps
+  today's code working and leaves the status arm matchable only imprecisely.
+
+  These are the first two columns of the comparison above; its third — **status
+  only**, no `none` at all — is the reading where the mark ships and the value is
+  never minted. All three are live, and the table there is the one to read for
+  what each costs.
+
+  **So the honest ordering is: ship the mark, then choose between all three** —
+  the two above and **status only**, which is the one the fork table leaves out
+  because the inference entry does not contemplate it. Under option-only,
+  shipping the mark without `none` is a *way station* rather than a resting
+  place; under status-only it is the destination. Raised in review, against a
+  sentence here that said "those two" and then "neither reading" while the
+  paragraph above kept all three live. No reading makes the mark wrong to build
+  first, which is the part that survives.
+
+  **What shipping the mark requires**, so its own cost is on the record: the `?`
+  suffix in the return-type slot; the widening narrowed to marked declarations;
+  and — the part the repo owner has agreed to — an unmarked `T` answering a
+  status becoming a **refusal** rather than `warn_declared_type`'s current
+  warn-and-hand-back, since a warning that hands the value over leaves the
+  declaration meaning nothing. That refusal is a real behavior change with its own
+  blast radius, and it is the prerequisite for the mark being worth writing.
+
+  **If the mark ships *before* `false` is settled, it needs an interim answer —
+  and the rest of this bullet is that branch only.** Raised in review against
+  reading it as the recommendation: the ordering above concludes the opposite,
+  that `false` and `any` are settled first precisely so the mark does not ship
+  with exceptions in it. This paragraph is what to do if that conclusion is
+  rejected, not a second plan sitting beside it.
+
+  Enforcement cannot be written without an answer either way: the same
+  body — `str? func first(s) { $s:match(/…/) }` — either conforms or is rejected
+  depending on which way the question goes, so shipping first is only honest
+  with a stated default. The interim that costs least to
+  reverse is **admit it**: a marked declaration accepts a `false` alongside a
+  failing status, recorded as provisional. Tightening later is the same
+  refusal-shaped change the mark already contemplates, whereas starting strict
+  refuses code that works today and has to be loosened by hand if the answer goes
+  the other way. That is an interim, **not** the answer to the question above.
+
+  **And the interim has to exclude `bool?`, which is where admitting `false`
+  breaks down.** A `false` is both an ordinary member of `bool` and an absence
+  the presence-bind refuses, so `bool? func pred() { false }` followed by
+  `if answer = pred() { … } else { … }` takes the **absent** branch on a
+  perfectly good boolean answer — the value cannot say which it is, and no
+  amount of care at the call site recovers it. Raised in review. So `bool?` is
+  refused for as long as the interim stands, which is a real limit and worth
+  stating as one rather than discovering: it is the same collision that makes
+  `false` a poor absence marker generally, arriving in the one type where the
+  two meanings cannot be told apart at all.
+
+  **Only *retiring* `false` lifts the restriction — not *refuse it*.** Raised
+  in review against a claim here that either alternative would. Refusing a
+  `false` from a non-`bool` value func changes nothing for `bool` itself: a
+  `bool func` may still answer `false`, and the presence-bind still refuses
+  that value, so `bool? func pred() { false }` stays indistinguishable from
+  absence. What lifts it is `false` leaving the absent set entirely.
+
+  **And that is an argument for retiring `false`, not for minting `none`** — a
+  draft here claimed the latter and it does not follow. Raised in review. Once
+  `false` is retired, `bool?` is unambiguous under **all three** end states: a
+  boolean `false` is present and a nonzero `Status` is absent, and those are
+  distinct value kinds at run time, so the narrowing can tell them apart with
+  or without a `none` in the language. Since every column already presupposes
+  the retirement, `bool?` discriminates between none of them. What it does
+  discriminate is the **interim** against the end states, which is where the
+  exception below comes from.
+
+  **So the interim owes `bool` an exception, or it deletes a kind of function
+  the mark exists to protect.** Raised in review, and it is the one place the
+  interim was actively harmful rather than merely imprecise: with the widening
+  behind the mark, an unmarked `bool func check(x) { … fail 2 … }` becomes a
+  mismatch, and refusing `bool?` takes away the marked spelling — so a
+  **fallible boolean function has no legal declaration at all**, which is
+  exactly the regression the repo owner's correction was about, arriving by a
+  side door. The interim therefore keeps `bool` on the **old** rule: an
+  unmarked `bool` goes on admitting a failing status, unspelled, until `false`
+  leaves the absent set. Ugly, and deliberately so — it is a way station's
+  patch on a way station, and the ugliness is an argument for settling the
+  `false` question rather than shipping the mark on top of it.
+
+  **`any?` and `status?` need answers for the same reason, and both are
+  refused** — raised in review, and the general point is that the mark is not
+  uniform over the return words even though the syntax makes it look it:
+
+  - **`any?`** collides exactly as `bool?` does, and worse: `any` already
+    admits `false` and every failing status, so the suffix adds nothing to the
+    *type* while making the narrowing ambiguous for the same values. The
+    already-open question of whether `any?` is meaningful at all is the same
+    question; under the interim it is refused, which does not prejudge it.
+  - **`status?`** has no `T` to make optional. A `status func` says the answer
+    *is* the outcome, so "may not give you a value" is not a distinction it can
+    draw — every answer it has is a status, absent-looking or not. Refused, and
+    unlike the other two this one does not depend on the interim: it is
+    incoherent under all three readings.
+
+  So the mark applies to the **value** types and nothing else — and under the
+  interim, not even to all of those: `bool?` is refused while unmarked `bool`
+  keeps the old widening, so `bool` is outside the rule from both directions at
+  once. Raised in review. Worth stating outright, since "a `?` suffix in the
+  return-type slot" reads as though it composes with every word in it, and
+  because two exceptions in a rule this young is the strongest practical
+  argument for settling `false` before writing any of it.
+
+  **`any` is a prerequisite too, not a footnote, and this is where that becomes
+  concrete.** `declared_matches` accepts every value for `ReturnType::Value`, so
+  `any func f() { fail 5 }` conforms — tightening mismatches to refusals does
+  nothing to it, and the widening therefore does *not* hold exactly where `?` is
+  written: it also holds, unspelled, wherever `any` is. Raised in review. So the
+  claim above is true of the **named value types** and false of `any`, which
+  leaves three ways to go: narrow `any` so it excludes a failing status, require
+  `any?` for one (refused under the interim, so this needs the interim gone), or
+  accept `any` as a deliberate opt-out of the whole mechanism and say so. None
+  picked here, and the mark is not shippable until one is — the same reopening
+  the entry above already calls for, arriving with a specific reason rather than
+  as a general caveat.
+
+  **Still open under the mark**, and untouched by any of this: whether the
+  consumption rule (the hybrid's "discharge or propagate") ships with the mark or
+  not, which is what decides whether `x = find(k)` is refused or merely warned.
 - **Decided: `$sh.status` is the status of the last *expression*, not the last
   *call*.** Every statement that produces a value publishes one, and a call in a
   condition publishes exactly as it does in a statement. The rule is one line and
@@ -8025,6 +8356,28 @@ to avoid" rather than promising the latter as done.
   every rule, at which point the annotation stops carrying information. So the
   widening should be read as **provisional** — a way to keep `str func gets()` one
   word until there is a real option type — rather than as the resting place.
+
+  **Read this against the mark entry above**, which reaches the widening from the
+  other end: it cannot be retired outright, because it is what lets a fallible
+  value func exist, so it *moves behind the mark* rather than disappearing. The
+  two reconcile **either** way, and an earlier draft here wrongly said only one
+  of them worked. Under *option-or-status* the widening survives behind the
+  mark, which is the reading that entry tabulates. Under *option-only* — the
+  destination this entry names — it is retired **after** fallible funcs are
+  rewritten to answer `none`, so "it cannot be retired outright" and "it is
+  retired eventually" are both true, in that order. Raised in review against a
+  sentence that ruled out the principal reading. What this entry leans against
+  is still option-or-status, though not because inference cannot see the arm:
+  `Status` is
+  already a declared type and a type pass would infer and propagate it like any
+  other. Nor is the arm unmatchable — `1..=255` covers every nonzero status
+  today, since a range asks `contains` and a status compares equal to its code.
+  What it lacks is a **precise** class pattern: that range matches an ordinary
+  `int` in the same span, so the absence arm of an `int?` swallows real results.
+  So the cost lands on exhaustive matching, and on its exactness rather than its
+  existence. Raised in review twice, first against conflating this with
+  inference and then against claiming no pattern existed at all. Whoever settles
+  this settles both entries at once.
 
   **The obstacle is late binding, and it is specific.** `func f { g }` resolves
   `g` when `f` *runs*, so a name's meaning is not fixed at its definition; that is
