@@ -3764,6 +3764,18 @@ thing a reader takes on trust.*
       own `$UID` for free. Mesh now exposes the effective user id directly, captured
       with the shell's process identity and kept stable in a forked stage, so a
       prompt does not need to fork `id -u` or keep its own cache.
+- [ ] **A guarded bare `return` and its block form disagree.** `return if true`
+      and `if true { return }` answer different statuses — measured at `f`, `7`
+      against `0` after an `sh -c "exit 7"`. **Pre-existing**, not introduced by the
+      condition-publishing change: the same pair gives the same two numbers on the
+      commit before it. The cause is that bare `return` takes its code from the
+      `last` argument threaded down the call, while a bare `exit` reads the
+      published `$sh.status`, so the two controls default from different places
+      and only agree where nothing has published in between. Raised in review of
+      #500 and left out of it deliberately, since fixing it means changing what
+      `last` means on a path this branch does not otherwise touch. Whichever way
+      it goes, `return` and `exit` should default from the same place.
+
 - [x] **15. `$sh.status` was cleared while an `if` condition was evaluated**, so it
       read `0` in *both* arms and a command used as a condition could not have its
       status inspected afterwards — `if sh -c "exit 3" { … } else { … }` reported
