@@ -4574,16 +4574,17 @@ canonical homes:
   might want the code. The [`T | Status(n≠0)` widening](#open-questions) retired
   that: a declared type now admits a failing status, so binding one would put a
   `Status` into a `str`-typed name and the annotation would stop meaning anything
-  on the failure path. The guarantee is worth more than the code — and the code is
-  genuinely gone: **`$sh.status` is not a substitute**, since a value condition
-  leaves the standing status alone, so what is there depends on what ran rather
-  than on what was rejected. It coincides with the rejected code only when the
-  right-hand side *is* the failing command, which makes it unreliable rather than
-  unavailable — the worse of the two. A caller who wants it assigns first, since a
-  statement binds unconditionally, and then asks the presence question again:
-  `t = f()`, then `if kept = $t { … } else { $t:code }`. The **inner bind** is
-  load-bearing — a bare `if $t` serves only a bool or a status, and errors on a
-  string, which is the very case this rule exists for.
+  on the failure path. **And the code is not lost with the binding**, which two
+  earlier drafts of this entry claimed: the binding is what the rule withholds,
+  the status channel is a separate one, and the right-hand side *ran* — so it
+  publishes, and the `else` branch reads the rejected code in `$sh.status`. That
+  was previously unreliable rather than unavailable, the worse of the two: the
+  reading tracked whatever ran before the `if` rather than what was rejected. See
+  [the status of the last expression](#open-questions) for why that was an
+  omission rather than a policy. The assign-first shape still works and is still
+  what you want when the code must outlive the branch — `t = f()`, then
+  `if kept = $t { … } else { $t:code }`, where the **inner bind** is load-bearing
+  since a bare `if $t` serves only a bool or a status and errors on a string.
 - **An explicit coded-failure spelling** *(deferred)* — any such value must stay a
   **channel-1** failure (a testable value) and so **cannot** reuse the name "error"
   (channel-2: fail-loud, no value, aborts); defining it touches the two-channel
@@ -6144,7 +6145,7 @@ a script or a `-c` string, an `exit` from a startup file. It is where a session
 tears down what it set up, and a script cleaning up after itself is that case as
 much as an interactive session is, so tying it to the prompt loop would miss the
 half that needs it most. It is handed the status the shell is leaving with (the
-argument to `exit N`, or the last command's status otherwise) — bash's `$?`
+argument to `exit N`, or the last expression's status otherwise) — bash's `$?`
 inside a `trap … EXIT`, and a [`Status`](#open-questions) like the rest. A `fork { … }` subshell leaving is *not* the session
 ending and runs no handler.
 
@@ -7742,10 +7743,14 @@ to avoid" rather than promising the latter as done.
   every existing `Status` match keeps working.
 
   **The hybrid, written out — it was drafted as the strongest of the four, and
-  review has since charged it five costs it did not start with.** They are marked
-  where they arise rather than tallied at the end, and together they are the
-  reason this entry no longer recommends it: read the five and decide, rather than
-  inheriting the sentence it was drafted with. Take the declaration from the
+  review has since charged it five costs it did not start with — one of which has
+  since been withdrawn, leaving four.** They are marked where they arise rather
+  than tallied at the end, and together they are the reason this entry no longer
+  recommends it: read them and decide, rather than inheriting the sentence it was
+  drafted with. The withdrawn one is instructive: *the failing code is
+  unreachable* held only while a binding condition published nothing, and
+  [that changed](#open-questions) — the status channel was never what the rule
+  withheld. Take the declaration from the
   option and the value from the status, and add one rule about where such a call
   may appear:
 
@@ -7827,31 +7832,31 @@ to avoid" rather than promising the latter as done.
   projection question untouched. And it keeps the one thing a status-only answer
   lacks — a declaration that says the function can come up empty.
 
-  **What it gives up, and this is the honest part: the code becomes
-  unreachable.** With the absence confined to a narrowing, and the `else` branch
-  binding nothing, there is no position left from which to read `$s:code` — the
-  assign-first shape that
+  **What it was thought to give up — the failing code — it no longer does, and
+  this cost is withdrawn.** The reasoning was that with the absence confined to a
+  narrowing and the `else` branch binding nothing, no position was left from which
+  to read the code: the assign-first shape that
   [reading a failed code](#tests-and-comparisons) documents is itself a bare
-  assignment, and this rule refuses it for an option-returning call. **And
-  `$sh.status` is no longer a way *around* the rule, though it now carries the
-  code** — measured, not assumed. An assignment reports a bound `Status` as its
-  own status, so the assign-first shape reaches it:
+  assignment, which this rule refuses for an option-returning call.
+
+  What that missed is the **status channel**, which is not the binding and was
+  never what the rule withholds. `$sh.status` is
+  [the status of the last expression](#open-questions), so the rejected code is
+  read in the very `else` the hybrid requires — measured, not assumed:
 
   ```
-  any func f() { fail 5 }
-  sh -c "exit 3"
-  t = f()
-  if kept = $t { … } else { … }        # $sh.status is 5
-  if x = f()   { … } else { … }        # $sh.status is 3 — the standing one
+  str? func find(k) { … fail 5 … }
+  if hit = find(k) { … } else { puts "missing: $sh.status" }   # 5
   ```
 
-  The **condition** form still leaves the standing status alone, since a binding
-  condition publishes nothing of its own. So the code is reachable exactly where
-  the hybrid **refuses** to let the call appear: through a bare assignment. That
-  sharpens the cost rather than removing it — the failing code is not
-  intrinsically unreachable, it is unreachable *because this rule forbids the one
-  statement that would publish it*. That is
-  defensible rather than accidental: **`T?` is an option, not a result.** A shape
+  So the hybrid's first cost is gone rather than sharpened, which is worth
+  recording because it was the one that looked structural: an option carries no
+  reason, but mesh has a second channel that does, and confining the *value* to a
+  narrowing never confined the *status*. What survives is smaller and true — the
+  code does not outlive the branch, since the next expression publishes over it,
+  so anything needing it later still has to save it. And the underlying point
+  stands on its own without the cost attached: **`T?` is an option, not a
+  result.** A shape
   that carries *why* it failed is a different type, and mesh does not have one —
   the status channel carries that for **commands**, not for values. But it should
   be chosen knowingly, since it forecloses a coded failure on the value side.
@@ -7885,6 +7890,75 @@ to avoid" rather than promising the latter as done.
   `T?` is what inference calls an option, and the implicit widening is the shape
   it cannot express. That entry says so in full; this one defers to it rather than
   repeating the argument.
+- **Decided: `$sh.status` is the status of the last *expression*, not the last
+  *call*.** Every statement that produces a value publishes one, and a call in a
+  condition publishes exactly as it does in a statement. The rule is one line and
+  most of the tree already met it; what was left were two omissions, both now
+  closed — an assignment reported a constant instead of a bound `Status`, and a
+  **binding condition published nothing at all**.
+
+  **The second was the worse of the two, because it reported an unrelated number
+  rather than a wrong one.** `if x = f()` where `f` ends in `fail 5` left standing
+  whatever ran before the `if`, so the `else` branch read `0` in a fresh shell,
+  `3` after an earlier `exit 3`, `9` after an `exit 9` — tracking the script's
+  history rather than the call it had just rejected. The identical text as a
+  statement reported `5`. The cause was structural rather than deliberate:
+  `condition_status` returns from its presence-bind arm before reaching the
+  publishing code at the end of the function, and contained no `record_status`
+  call on any path. That is the worst possible place for the gap — the `else`
+  branch of a presence-bind is the one point where the program knows `f` failed,
+  and was the one place its code could not be read.
+
+  **The rejected alternative: "only calls have statuses."** It reads better than
+  the rule chosen — a status is what *running something* produces, so an
+  expression that runs nothing has none, and `if 1 == 1` would leave the standing
+  status because a comparison is not a call. The reason it loses is that it
+  **splits one number into two, and they then disagree about the same statement**.
+  Today the value a statement hands back as its `Step` does both jobs: it drives
+  `&&`/`||` *and* it is what `$sh.status` shows. A plain `false` value depends on
+  that — `x = false` then `$x || puts fallback` falls through, because
+  [`status_of`](#error-handling) projects `false` to `1`. Under a calls-only rule
+  either that projection goes, and a value stops driving a chain, or the chain
+  keeps using it while `$sh.status` stops — so `x = false` would skip a following
+  `&&` while leaving `$sh.status` showing some earlier call. One statement,
+  "failed" to one channel and invisible to the other. bash conflates the two
+  questions safely only because in bash *everything* is a command; mesh has
+  expressions that are not, so the conflation has to be either kept honestly or
+  broken deliberately, and breaking it costs more than the tidier sentence buys.
+  Its second cost is smaller but real: "what is a call" becomes a line to draw by
+  hand — a builtin, a func, an external, a capture that runs one, a declared
+  modifier that runs a body — where `runs_nothing` already exists and defaults
+  unlisted expressions to *"assume it runs"*, the opposite of what that rule
+  needs.
+
+  **`if 1 == 1` publishes too, and nothing distinguishes it.** The exemption it
+  used to have was stated as *"a bool is not a command and has no status to
+  report"* — which draws the line at **command** where the rule draws it at
+  **evaluated**. Under the rejected calls-only reading that exemption is
+  load-bearing; under this one it is just the old line surviving in a place the
+  new rule reaches, so the branch read whatever had run earlier rather than what
+  it had just tested. A value condition now reports its own projection: `if 1 == 1`
+  leaves `0`, and `if $x` on a `false` leaves `1`, the same as `$x` written as a
+  statement.
+
+  **A postfix guard is the same rule.** `guard_allows` evaluates it directly, so
+  it needed its own routing: a guard that lets its statement run publishes, and
+  `puts $sh.status if true` now matches `if true { puts $sh.status }` where it had
+  read the stale standing status. One consequence to know rather than trip over:
+  `unless` inverts the **decision**, not the expression, so `puts X unless false`
+  publishes `1` — the status of the expression `false` — while
+  `if not false { … }` publishes `0`, because there `not false` is the boolean
+  *operator* and the expression evaluated is a `true`. Different expressions,
+  different statuses; the rule reads what was written.
+
+  **One exemption is real and stays: a statement its own trailing guard skipped.**
+  `cmd if false` leaves the previous run standing — breakdown included, since
+  `$sh.pipestatus` and `$sh.status` always describe the same run. The reason is the
+  **statement**, not the expression, and an earlier draft of this entry had it
+  wrong: the guard itself *is* evaluated, so "nothing ran" is false. What is true
+  is that a skipped statement produced nothing, and the guard's truth is why there
+  is no statement rather than a result one produced. That is the rule at the
+  statement level, not an exception to it.
 - **Type inference is the intended destination — a direction, not a plan.** The
   return-type work is deliberately **channel checking**, not type checking: what a
   declaration makes checkable is "the shape of a function's exits, not the types

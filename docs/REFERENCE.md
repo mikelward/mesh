@@ -86,7 +86,7 @@ rather than by the parser, and neither carries a span to report yet.
 
 A script that cannot be found exits `127`; one that exists but cannot be read
 exits `126` — the same codes an unrunnable command yields. Otherwise the exit
-status is the last command's, or whatever `exit` was given.
+status is the last expression's, or whatever `exit` was given.
 
 Scripts can carry a shebang, since `#` starts a comment:
 
@@ -201,7 +201,7 @@ The rest of the read-only runtime surface:
 
 | Read | Value |
 |---|---|
-| `$sh.status` | The last command's exit status — see [Exit status](#exit-status) |
+| `$sh.status` | The last expression's exit status — see [Exit status](#exit-status) |
 | `$sh.pipestatus` | That run's per-stage statuses, as a list |
 | `$sh.pid` / `$sh.ppid` | This shell's process id, and its parent's |
 | `$sh.uid` | This shell's effective user id |
@@ -1036,7 +1036,7 @@ argument by hand, and repeating it walks back through earlier commands.
 | `clip [text …]` | Copy to the terminal's clipboard with `OSC 52`, so it works over `ssh`. Arguments join with a space; with none, stdin is read (`puts hi \| clip`). The bytes are copied as given, a trailing newline included. Goes to the terminal, not stdout, so a redirect cannot swallow it. Whether the copy lands is up to the terminal — xterm needs `allowWindowOps`, tmux `set-clipboard on` — and there is no reply, so success means "asked". |
 | `notify [text …]` | Raise a desktop notification through the terminal with `OSC 9`. Arguments or stdin, like `clip`. A command that runs for more than ten seconds notifies on its own, with its outcome and duration — `$sh.options.command-notify = false` turns that off. Inside tmux the sequence is wrapped for passthrough, which tmux forwards only with `allow-passthrough` set. Support is uneven and unreportable — iTerm2, WezTerm, Ghostty, kitty and ConEmu raise these; xterm and Alacritty discard them; tmux needs `allow-passthrough` — so success means "asked". |
 | `status code` · `status(code)` | A [**status value**](#exit-status) — how a command went — from a code between `0` and `255`. Out of range is refused rather than truncated, and so is a code that is not an integer: both spellings read the operand as a *value*, so `code = "5"; status $code` is refused exactly as `status($code)` is. The call is the constructor (`file-not-found = status(5)`), and the command form leaves the same value as the statement's result, which is what a `match` arm writes: `x = match $kind { missing => { status 5 } }`. `status(0)` is legal where `fail 0` is not: naming a zero status is reasonable, while a `fail` that succeeds is a mistake. It writes nothing and answers with a value, so — like `return` — it is refused in a pipeline, under a redirection, and in the background, where that value would be discarded. |
-| `exit [n]` · `exit status n` | Leave the shell with status `n` (default: the last command's status; masked to 0–255). **`exit status n` is the same thing**, written the way [`return status n`](#functions) is, so the two ways of leaving with a status read alike — it disambiguates nothing, since `exit` fills only the status channel. `exit status(n)` needs no rule: the call is one word that renders as its code. `exit status` with no code is an error, as `return status` is, and does not end the shell. `exit value n` is refused by name — `exit` has no value channel to fill, since a value needs somewhere to go and a leaving shell has nowhere. That message only changes what is *said*: `exit` reads words, so a quoted `exit "value"` cannot be told from the written one, and each keeps the outcome its operand would have had — alone it still exits `2`, with more after it the shell stays. Leaves the **whole shell**; to leave only the current function with a status, use `fail`. |
+| `exit [n]` · `exit status n` | Leave the shell with status `n` (default: the last expression's status; masked to 0–255). **`exit status n` is the same thing**, written the way [`return status n`](#functions) is, so the two ways of leaving with a status read alike — it disambiguates nothing, since `exit` fills only the status channel. `exit status(n)` needs no rule: the call is one word that renders as its code. `exit status` with no code is an error, as `return status` is, and does not end the shell. `exit value n` is refused by name — `exit` has no value channel to fill, since a value needs somewhere to go and a leaving shell has nowhere. That message only changes what is *said*: `exit` reads words, so a quoted `exit "value"` cannot be told from the written one, and each keeps the outcome its operand would have had — alone it still exits `2`, with more after it the shell stays. Leaves the **whole shell**; to leave only the current function with a status, use `fail`. |
 | `fail [n]` | Leave the current function (or sourced file) with a nonzero status — `1` by default, `n` when given — carrying that status as its value. A **validating wrapper** over `return status(n)`, not exact sugar for it: `fail 0` is refused, where `status(0)` is legal. `return true` is how a function leaves with success. |
 | `prompt [text]` | Set the interactive prompt to `text`. With no arguments, print the current prompt; `--reset` restores the status-sensitive default, and `prompt -- --reset` sets that literal text. |
 | `title text` | Name the window and tab with `OSC 0` — `ESC k` inside screen or tmux, where the name belongs to the pane. The shell titles itself already (`user@host: dir` at the prompt, the command line while one runs); this is how a [`preprompt` or `preexec` hook](#custom-prompts-and-hooks) says something else. Control characters become spaces and the text is cut at 96 characters, as it is for the automatic titles. `title ""` clears it. `$sh.options.osc-title = false` silences this along with the rest, and a terminal off the allowlist is sent nothing. There is no `--reset`: the shell holds no title of its own to restore and a terminal cannot be asked what its title is, so the only question `title` answers is "write this now". `title` is the **mechanism**, not the interface: it writes a title now, and the next prompt or `preexec` hook will write over it. To set a title that lasts, replace the shipped handler for that moment — see the hooks section above. Goes to the terminal rather than stdout, as `clip` and `notify` do, so a redirect cannot swallow it: `title x > file` names the window and leaves the file empty. **Refused in a forked pipeline stage** (`title x \| cat`): the write would reach the terminal but the clear mesh owes on the way out would die with the stage, leaving the window named after a shell that has gone. A pipeline's *last* stage runs in the shell itself, so it is allowed. |
@@ -1666,8 +1666,9 @@ on exit tmp clean-up
 ```
 
 `status` is what the shell is leaving with — the argument to `exit N`, or the
-last command's status for a bare `exit` or an end of input. It matches bash's
-`$?` inside a `trap … EXIT`.
+last expression's status for a bare `exit` or an end of input. It is bash's
+`$?` inside a `trap … EXIT` where the last thing to run was a command, and wider
+than it where the last thing was an expression that is not one.
 
 **Three ways get past it**, and the first is the one that catches people,
 because the session does end and the handler still does not run. A successful
@@ -1775,8 +1776,9 @@ styled segments, and `fill`/`rule`, described as the eventual prompt design in
 
 ## Exit status
 
-Every command leaves a status. mesh keeps the **last** one and returns it as its
-own exit code at end of input.
+Every command leaves a status, and so does every expression that is evaluated.
+mesh keeps the **last** one and returns it as its own exit code at end of
+input.
 
 | Status | Meaning |
 | --- | --- |
@@ -1853,8 +1855,16 @@ succeeds, and `status(1) || puts fallback` runs the fallback. Naming a status is
 
 ### `$sh.status` and `$sh.pipestatus`
 
-`$sh.status` is the last command's status — the readable replacement for `$?` — and
-a [status value](#exit-status) rather than an integer, so `return $sh.status`
+`$sh.status` is the status of the last **expression** — the readable replacement
+for `$?`, and wider than it, since mesh has expressions that are not commands and
+they report too. A command reports what it exited with; a value expression reports
+its own projection, so `x = f()` where `f` ends in `fail 5` leaves `5`, `if 1 == 1`
+leaves `0`, and a `false` leaves `1`. Only a **statement its guard skipped**
+leaves the previous status standing: nothing was produced, so nothing is
+reported. (The guard itself is evaluated — it is the reason there is no
+statement, not a result one produced.)
+
+It is a [status value](#exit-status) rather than an integer, so `return $sh.status`
 forwards a failure and `if $sh.status { … }` is how you ask whether it worked.
 `$sh.pipestatus` breaks the same run down by stage, as a **real list** of statuses:
 
@@ -3435,12 +3445,16 @@ f()` would succeed where `if f()` fails, on the same value. Like `false`, it
 if s = build() { puts "built $s" } else { puts "build failed" }
 ```
 
-The `else` branch therefore cannot read the code, and **`$sh.status` is not a
-substitute** — a value condition leaves the standing status alone, so what is
-there depends on what ran rather than on what was rejected. It happens to be the
-rejected code when the right-hand side *is* the failing command
-(`if s = sh("-c", "exit 5")` leaves `5`), and is unrelated to it otherwise. Don't
-read it; assign first, since a plain assignment always binds — then test the name
+The `else` branch therefore cannot read the code *from the name* — but it can
+read it from **`$sh.status`**, which reports the rejected code: the right-hand
+side ran, so it publishes exactly as it does when written as a statement.
+
+```mesh
+if s = build() { puts "built $s" } else { puts "build failed: $sh.status" }
+```
+
+Assign first when the code has to **outlive the branch**, since `$sh.status` moves
+on with the next expression. A plain assignment always binds, so test the name
 with a **second presence bind**:
 
 ```mesh
@@ -3472,9 +3486,13 @@ if diff old new {
 }
 ```
 
-A **value** condition has no status to report, so it leaves the previous
-command's standing — the same rule a guard that skipped its statement follows.
-The `if` itself still reports its *body's* status, not its condition's.
+A **value** condition publishes too: `$sh.status` is the status of the last
+*expression*, and a condition is one. `if 1 == 1` leaves `0`, and a condition on a
+`false` leaves `1`, the same as writing that value as a statement. Only a
+**statement its guard skipped** leaves the previous status standing, since it
+produced nothing. The guard is still evaluated; it is the reason there is no
+statement rather than a result one produced. The `if` itself still reports its *body's* status, not its
+condition's.
 
 `not` before a condition negates it. Before a **value** it is the boolean operator
 of [Operators and matching](#operators-and-matching); before anything else it

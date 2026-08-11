@@ -271,9 +271,10 @@ mesh$ <strong>test -e words.txt &amp;&amp; puts found || puts missing</strong>
 found
 </pre>
 
-`$sh.status` is the last command's exit status — the readable replacement for
-`$?`. It is a **status value**, so `if $sh.status { … }` asks whether the last
-command worked, and it prints as the bare number. A pipeline reports the
+`$sh.status` is the last **expression's** exit status — the readable replacement
+for `$?`, and wider than it, since mesh has expressions that are not commands and
+they report too. It is a **status value**, so `if $sh.status { … }` asks whether
+the last one worked, and it prints as the bare number. A pipeline reports the
 **pipefail** status, always: the last stage to fail, or `0` when none did.
 `$sh.pipestatus` is the per-stage breakdown, as a real list of them:
 
@@ -283,12 +284,15 @@ mesh$ <strong>puts $sh.status ...$sh.pipestatus</strong>
 3 3 0
 </pre>
 
-Read them in **one** command when you want both: reading either is itself a
-command, so a first `puts` would replace what a second one reports.
+Read them in **one** command when you want both: every statement publishes, so a
+first `puts` replaces what a second one would report. Saving the status alone is
+safe — `s = $sh.status` republishes the same code, so `$sh.status` still reads
+`3` after it — but `p = $sh.pipestatus` binds a list, which publishes `0` and
+takes the status with it.
 
 Because a status is a value, it travels: `exit status $sh.status` leaves the
-shell with the one the last command left, and `exit 3` is the same thing written
-out. `:code` gives the integer when you need to compare against a number, since
+shell with the one the last expression left, and `exit 3` is the same thing
+written out. `:code` gives the integer when you need to compare against a number, since
 a status compares only with another status — `$sh.status == 0` reports and tells
 you to write `$sh.status:code == 0` or `$sh.status == status(0)`, rather than
 quietly answering `false`.

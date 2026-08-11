@@ -422,16 +422,17 @@ Under one failure:
   name is for, which is the absence-shaped value B3 exists to abolish, smuggled
   back in through the binder.
 
-  One thing *is* lost, and an earlier draft of this paragraph got it wrong: the
-  `else` branch cannot read the code, and **`$sh.status` is not a substitute**. A
-  value condition leaves the standing status alone, so what is there depends on
-  what ran: `0` in a fresh shell, `3` after an earlier failing command, and `5` —
-  the rejected code itself — when the right-hand side *is* the command that
-  failed. `reading_a_failed_codes_value_takes_a_plain_assignment` pins all three,
-  because any one alone reads like a rule and none of them is. Unreliable rather
-  than unavailable, which is the worse of the two. A caller who wants the code
-  assigns first and tests the name, which binds unconditionally because it is a
-  statement.
+  The **code is not lost with it**, though two earlier drafts of this paragraph
+  said so. The binding is what the rule withholds; the status channel is a
+  separate one, and the right-hand side ran — so it publishes, and the `else`
+  branch reads the rejected code in `$sh.status`. That used to be unreliable
+  rather than unavailable, which is the worse of the two: the reading tracked
+  whatever ran before the `if` (`0` fresh, `3` after an earlier `exit 3`) and
+  coincided with the rejected code only when the right-hand side happened to *be*
+  the failing command. `a_rejected_status_publishes_its_code_to_the_branch_it_picks`
+  pins the fix across four histories, and pins the two positions agreeing: `x =
+  f()` and `if x = f()` report the same code on identical text, which they did
+  not before.
 - A predicate that answers "not found" returns a failing status, so
   `if rootdir { … }` means what a shell reader thinks it means. If the same
   name is also to *hand back* the directory it found, that is a `str func`

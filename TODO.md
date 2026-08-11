@@ -2051,8 +2051,10 @@ designed, and the cross-references say where the fuller note lives.
       `logout.mesh`.
 
       The status handed to the handler is **bash's `$?` in a `trap … EXIT`** —
-      the argument to `exit N`, the last command's status for a bare `exit` or
-      an end of input. Verified against bash rather than assumed.
+      the argument to `exit N`, the last status otherwise, for a bare `exit` or
+      an end of input. Verified against bash rather than assumed. (mesh's "last"
+      has since widened to the last *expression*, so the two agree wherever the
+      last thing to run was a command and mesh reports more where it was not.)
 
       Two follow-ups, both deliberately out of that change:
   - [ ] **Exiting because of a signal.** bash runs its EXIT trap for the
@@ -3437,8 +3439,15 @@ thing a reader takes on trust.*
       `$sh.status` here and reports one stage, by `run_recorded`'s existing invariant
       that the breakdown always describes the run that produced the status: a `0`
       explained by a `3` would break it. The two positions differing is the point
-      rather than a wart — the same split a value *condition* (publishes nothing) and
-      a value *statement* (publishes its truthiness) already have.
+      rather than a wart: in a condition the negation is a reading, so the operand
+      reports what it really exited with, while as a statement the negated code *is*
+      the result and there is no branch to carry the original.
+
+      This once appealed to a value *condition* publishing nothing against a value
+      *statement* publishing its truthiness. That analogy is gone — a value
+      condition publishes now, and `1 == 2` leaves `1` in both positions — which
+      makes `not` the only construct where the two still differ, and makes it rest
+      on the reading-versus-result argument above rather than on company.
 
       Where the two positions disagreed before `not` existed, the negation inherits
       the disagreement rather than papering over it: a spaced `>` is a comparison in
@@ -3767,9 +3776,15 @@ thing a reader takes on trust.*
       so the branch it picks reads the real code. The publishing happens in
       `condition_status`, which had been bypassing the `run_recorded` funnel that
       normally does it — a condition is not the statement's result, so it never
-      passed through. A *value* condition is exempt: a bool is not a command and
-      has no status to report, so it leaves the previous command's standing, as a
-      skipped guard does. A pipeline condition keeps its per-stage breakdown.
+      passed through. A pipeline condition keeps its per-stage breakdown.
+
+      *Value* conditions were left exempt here, on the grounds that a bool is not
+      a command — and that exemption was itself the next bug, since it drew the
+      line at *command* where the rule draws it at *evaluated*. Every value
+      condition publishes now, including a presence-bind, whose `else` branch had
+      been reading unrelated history rather than the code it just rejected. Only a
+      condition that ran **nothing at all** — a skipped guard — leaves the previous
+      status standing.
 - [x] **16. No path-resolving modifier.** `:type` reported `link` but nothing
       resolved one, so `realdir` shelled out to `readlink -f` — a fork for
       something the shell already has the syscall for.
@@ -9828,8 +9843,8 @@ a one-line edit. Every claim below was checked against the built shell.
       automatically at the external-command boundary. Decide it there, as one
       rule, rather than carving out a special case for path-type entries.
 - [x] **`return` with no argument — use the last status.** `exit` already does
-      this (a bare `exit` leaves the last command's status). Apply the same rule
-      to `return` when it lands with function bodies.
+      this (a bare `exit` leaves the last expression's status). Apply the same
+      rule to `return` when it lands with function bodies.
 - [x] **Glob qualifiers — the type and boolean halves.** `*(f)` / `*(d)` / `*(l)`
       / `*(p s b c)`, the long `type: file` names with their `file|dir`
       alternation, and the `x` / `exec:` / `empty:` tests, in both command and
