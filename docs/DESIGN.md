@@ -7914,7 +7914,10 @@ to avoid" rather than promising the latter as done.
   expression that runs nothing has none, and `if 1 == 1` would leave the standing
   status because a comparison is not a call. The reason it loses is that it
   **splits one number into two, and they then disagree about the same statement**.
-  Today the value a statement hands back as its `Step` does both jobs: it drives
+  Today one number does both jobs — **the code a statement answers with**, which
+  for `not sh -c "exit 3"` is the whole statement's answer, negation included, so
+  `0`. (`Step::Continue(u8)` in the source, but the design point does not need the
+  type.) It drives
   `&&`/`||` *and* it is what `$sh.status` shows. A plain `false` value depends on
   that — `x = false` then `$x || puts fallback` falls through, because
   [`status_of`](#error-handling) projects `false` to `1`. Under a calls-only rule
@@ -7959,6 +7962,53 @@ to avoid" rather than promising the latter as done.
   is that a skipped statement produced nothing, and the guard's truth is why there
   is no statement rather than a result one produced. That is the rule at the
   statement level, not an exception to it.
+- **Should `not` change `$sh.status`? — open, kept as is for now.** It changes it
+  in one position and not the other, which is deliberate on both counts but reads
+  as an inconsistency, and the repo owner has said the *ideal* is that it changes
+  nothing. Measured:
+
+  ```
+  sh -c "exit 3"                              # $sh.status 3
+  not sh -c "exit 3"                          # $sh.status 0   — the negated result
+  if not sh -c "exit 130" { … }               # $sh.status 130 — the real code
+  ```
+
+  **The condition half already meets the ideal**, and that is
+  [entry 15's guarantee](../TODO.md): the negation is a *reading*, not a second
+  run, so the command publishes what it really exited with and a `130` from
+  Ctrl-C survives where bash's `!` flattens it to `1`. The statement half does
+  not, because there is no branch to carry the original — the negated code is the
+  statement's result.
+
+  **What blocks the tidy rule is that the shell's exit code *is* `$sh.status`**,
+  not a channel beside it. Measured: a script ending in a statement its guard
+  skipped exits with the standing `3`. So "`not` never changes the status" makes
+  `not failing-cmd` as a last statement exit with the **operand's** code —
+  reporting failure for a negation that succeeded, and contradicting the recorded
+  decision that `not sh -c "exit 3"` exits `0`.
+
+  Three ways it could go:
+
+  | | `not` leaves the status alone | `not failing` exits | cost |
+  | --- | --- | --- | --- |
+  | **1. Keep as is** | condition only | `0` | the two positions differ, which has to be explained |
+  | **2. `not` never touches it** | yes | the operand's code | a successful negation reports failure |
+  | **3. Exit on what the last statement *answered*, not on what was published** | yes | `0` | separates two numbers that are one today |
+
+  **3 is the only one that gets the rule without giving something up**, and it
+  would also erase a wart this entry currently has to record: `puts X unless false`
+  publishes `1` while `if not false { … }` publishes `0`, because `unless` inverts
+  the decision while `not` is a value operator, so the two forms evaluate different
+  expressions. Under "`not` changes nothing" both read `1`.
+
+  Its price is the one this document rejected for
+  [the calls-only reading](#open-questions): the code a statement *answers with*
+  and the code it *publishes* stop being one number. For `not sh -c "exit 3"` the
+  answer stays `0` — so a following `&&` runs and the shell exits `0` — while the
+  published status becomes the `3` the command really left. The difference is scope — there
+  it was every statement, here it is the shell's exit at end of input, which is one
+  place and already conceptually "what the script is reporting" rather than "what
+  just ran". That is the argument to weigh, not a decision taken.
 - **Type inference is the intended destination — a direction, not a plan.** The
   return-type work is deliberately **channel checking**, not type checking: what a
   declaration makes checkable is "the shape of a function's exits, not the types
