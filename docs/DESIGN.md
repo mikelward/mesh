@@ -4562,7 +4562,7 @@ Rules:
   earlier draft summarized the fallthrough as if the displayed match had it, and
   the draft correcting that one wrote the int case for every integer rather than
   for `0` alone (Codex, #472). What does not exist is the **binder**. An arm pattern is parsed as an
-  ordinary expression (`match_pattern`, `parser.rs`:4658), so `status(n)` calls the
+  ordinary expression (`match_pattern`, `parser.rs`:4899), so `status(n)` calls the
   constructor with the *string* `"n"` and reports `` the code must be an integer,
   not a string `` — and it reports it whether or not `n` is bound, since the
   pattern never expands the word at all. `status($n)` does run, but that is a
@@ -4617,7 +4617,7 @@ Rules:
   the second time to say the clause was written too narrowly): the payload
   comparison **unwraps a status**, so a payload that *is* a status compares
   codes. Without that clause it is not free at all. `status_value`
-  (`repl.rs`:5645) carries an explicit identity arm for a status payload, with
+  (`repl.rs`:5780) carries an explicit identity arm for a status payload, with
   a comment naming `status($sh.status)` as the case it exists for, and it works
   today — verified: `n = status(1); match status(1) { status($n) => … }` hits.
   Under the rule as stated the pattern would match the subject's *code*, an
@@ -4961,7 +4961,7 @@ Rules:
   **`style` and a link are the *same* variant, which caps the variant reading at
   two and leaves a question inside the second.** `eval_style` and `eval_link`
   both return `Value::Styled(Box::new(StyledValue { text, style }))`
-  (`repl.rs`:5497 and :5570), and a link is a *field* on the style —
+  (`repl.rs`:5632 and :5705), and a link is a *field* on the style —
   `Style { foreground, background, bold, link: Option<String> }`
   (`vars.rs`:258) — not a parallel type. They compose, and `eval_link` reads an
   existing value's style to do it, so `link(style("text", fg: red), …)` is one
@@ -4980,7 +4980,7 @@ Rules:
   `Styled`.** When no attribute is named, `eval_style` returns a plain
   `Value::String` — *"a call that named no attribute yields a plain string rather
   than a styled value with nothing to render — one representation for one
-  meaning, so `style(x) == x` holds by type as well as by value"* (`repl.rs`:5490).
+  meaning, so `style(x) == x` holds by type as well as by value"* (`repl.rs`:5626).
   So under the rule above `match style("abc") { style(n) => … }` would **not**
   take the arm, because the subject its own constructor produced is a string.
   Found by Codex on #472. That is not obviously wrong — an unattributed
@@ -5053,7 +5053,7 @@ Rules:
        shared-variant note above — every styled value, only those whose
        `style.link` is `Some`, or exactly what `style(…)` matches.
      - *What its operands are.* `eval_link` takes **two required positionals**,
-       text and url (`repl.rs`:5512) — "because both are required and the pair
+       text and url (`repl.rs`:5647) — "because both are required and the pair
        reads in the order it renders" — so a `link(…)` pattern has to say whether
        the spelling is `link(t, u)`, whether either slot may be omitted, which of
        them bind, and whether the **normalized** URL is what a `u` binder sees,
