@@ -651,7 +651,7 @@ impl StartupOptions {
                 }
                 "-V" | "--version" => {
                     options.invocation =
-                        Invocation::Print(format!("mesh {}\n", env!("CARGO_PKG_VERSION")));
+                        Invocation::Print(format!("mesh {}\n", env!("MESH_VERSION")));
                     return Ok(options);
                 }
                 "--rcfile" => {
@@ -18793,6 +18793,21 @@ mod tests {
         assert!(variable_completions("$config.user.N", &variables).is_empty());
     }
 
+    /// Completions with whatever the current directory contributed dropped.
+    ///
+    /// `argument_completions` falls through to path completion, so its result
+    /// depends on the directory the test binary runs in — `crates/mesh-core`,
+    /// where `build.rs` answers to `bu`. The cases below are about what a
+    /// command's `--help` offers, so the candidates that name a real file are
+    /// filtered out rather than the fixtures being picked to dodge whatever the
+    /// package directory happens to hold.
+    fn from_help(completions: Vec<String>) -> Vec<String> {
+        completions
+            .into_iter()
+            .filter(|candidate| !std::path::Path::new(candidate.trim_end_matches('/')).exists())
+            .collect()
+    }
+
     #[test]
     fn completion_passes_subcommands_to_help_and_filters_option_prefixes() {
         assert_eq!(
@@ -18827,11 +18842,21 @@ mod tests {
             ..CompletionState::default()
         };
         assert_eq!(
-            argument_completions(&state, &["cargo".into(), "bu".into()], "bu", Lookup::Shell),
+            from_help(argument_completions(
+                &state,
+                &["cargo".into(), "bu".into()],
+                "bu",
+                Lookup::Shell
+            )),
             ["build"]
         );
         assert_eq!(
-            argument_completions(&state, &["cargo".into(), "bl".into()], "bl", Lookup::Shell),
+            from_help(argument_completions(
+                &state,
+                &["cargo".into(), "bl".into()],
+                "bl",
+                Lookup::Shell
+            )),
             ["build"]
         );
         let state = CompletionState {
@@ -18847,7 +18872,12 @@ mod tests {
             argument_completions(&state, &["tool".into(), "co".into()], "co", Lookup::Shell);
         assert_eq!(&completions[..2], ["commit", "checkout"]);
         assert_eq!(
-            argument_completions(&state, &["tool".into(), "bu".into()], "bu", Lookup::Shell),
+            from_help(argument_completions(
+                &state,
+                &["tool".into(), "bu".into()],
+                "bu",
+                Lookup::Shell
+            )),
             Vec::<String>::new()
         );
         assert!(

@@ -33,31 +33,12 @@ jobs:
 
       - name: Set release version
         run: |
+          # The checkout is detached at the pushed commit. The build script
+          # recognizes a released commit by finding it on `origin/main`, so make
+          # sure that ref is here rather than relying on how the checkout action
+          # happens to lay refs out.
+          git fetch --no-tags origin +refs/heads/main:refs/remotes/origin/main
           version="0.0.$(git rev-list --count HEAD)"
-          python3 - "$version" <<'PY'
-          import pathlib
-          import re
-          import sys
-
-          version = sys.argv[1]
-          cargo_toml = pathlib.Path("Cargo.toml")
-          text = cargo_toml.read_text()
-          text, count = re.subn(
-              r'(?m)^version = "0\.0\.0"$', f'version = "{version}"', text, count=1
-          )
-          if count != 1:
-              raise SystemExit("workspace placeholder version was not found")
-          cargo_toml.write_text(text)
-
-          lock = pathlib.Path("Cargo.lock")
-          text = lock.read_text()
-          for package in ("mesh", "mesh-core", "mesh-platform"):
-              pattern = rf'(?m)(^name = "{package}"\nversion = ")[^"]+("$)'
-              text, count = re.subn(pattern, rf'\g<1>{version}\2', text, count=1)
-              if count != 1:
-                  raise SystemExit(f"lock entry for {package} was not found")
-          lock.write_text(text)
-          PY
           printf 'version=%s\n' "$version" >> "$GITHUB_ENV"
           printf 'tag=v%s\n' "$version" >> "$GITHUB_ENV"
 
@@ -66,6 +47,20 @@ jobs:
 
       - name: Build
         run: cargo build --release --locked --target "$TARGET" -p mesh
+
+      # The binary derives its own version from the checkout rather than being
+      # told (crates/mesh-core/build.rs), which is what lets a developer's clean
+      # build of a released commit report the released version. That leaves two
+      # derivations of one number, so check them against each other here: a
+      # disagreement fails the release instead of shipping a binary that
+      # misreports which release it is.
+      - name: Check the binary reports the release version
+        run: |
+          reported=$("target/$TARGET/release/mesh" --version)
+          if test "$reported" != "mesh $version"; then
+            echo "mesh --version said '$reported', expected 'mesh $version'" >&2
+            exit 1
+          fi
 
       - name: Package
         run: |
