@@ -372,33 +372,49 @@ to*, which is the shape [`:type`](#modifiers) already has for paths, so they get
 the same spelling:
 
 ```
-$name:kind          # keyword | builtin | func | external | false
-$name:where         # an external's path, or false
+$name:kind          # keyword | builtin | func | external — or it fails
+$name:where         # an external's path — or it fails
 ```
 
 One primitive answers the whole family, which is why it is a modifier rather than
-five predicates: `have_command` is `$x:kind != false`, `is_builtin` is
+five predicates: `have_command` is `if k = $x:kind { … }`, `is_builtin` is
 `$x:kind == builtin`, `is_function` is `$x:kind == func`, `is_command` is
-`$x:kind == external`, and `path` is `$x:where`. Only the first needs the
-comparison spelled out — the others already compare — and it is the one the 41
+`$x:kind == external`, and `path` is `$x:where`. Only the first needs a shape of
+its own — the others already compare — and it is the one the 41
 sites use, so it carries the cost of the rewrite. It maps over a list like any
 value modifier, and reads the way the guards actually appear:
 
 ```
-if shpool:kind != false { … }
-for e in [vi vim editline] { if $e:kind != false { export EDITOR = $e; break } }
+if kind = shpool:kind { … }
+for e in [vi vim editline] { if k = $e:kind { export EDITOR = $e; break } }
 ```
 
-The `!= false` is not decoration. A condition is [a bool or a
-command](#conditionals), and `:kind` yields a *string* when the name resolves, so
-the comparison is what the written contract asks for — and it is now the only form
-that works, since condition truthiness settled as **no truthy values**: a bare
-`if shpool:kind` is a loud "a string is not a condition" rather than a shorter
-spelling. The explicit form is the honest one, and it is the only cost the
-spelling carries.
+**An unresolvable name is an absence, so it fails** rather than answering
+`false` — the [absence rule](#variables-and-assignment), which retired `false`
+from the absent set and left a failing `Status` as the only spelling.
+
+**The guard is a [presence-bind](#tests-and-comparisons), and it has to be** —
+`if $e:kind` is *not* the shorter spelling. Raised in review against a draft here
+that offered it: a resolved `:kind` yields a **string**, condition truthiness is
+settled as *no truthy values*, so a bare condition would error on exactly the
+candidate that resolved — the loop above would report "a string is not a
+condition" for the first installed editor and never export `EDITOR`. The bind is
+what reads both halves, because it asks about *presence* rather than truth: the
+kind word binds and takes the branch, the failure takes `else` and binds nothing.
+It also hands you the word in the same step, which the bare form could not do
+even if it worked.
+
+What the `false` cost, and what its retirement returns, is therefore the *bind*
+rather than the bare test. An earlier draft of this entry wrote
+`if shpool:kind != false` and had to argue that "the `!= false` is not
+decoration" — under the old rule a `false` was absent, so `if k = shpool:kind`
+was ambiguous between the two things `:kind` could answer, and the explicit
+comparison was the only honest form. That apology is gone: the two answers are
+now on different channels, so the bind says what it means. An explicit comparison
+is needed only when you want a *particular* kind.
 
 **A bare subject takes a modifier** *(decided; shipped)*, so the guard is written
-`if shpool:kind != false` and the quoting this entry argued for through its first
+`if kind = shpool:kind` and the quoting this entry argued for through its first
 twenty-two rounds is not needed. An attached `:name` binds as a modifier wherever a
 value is read — expression and argument context alike — for bare and quoted
 subjects equally, and whether or not the modifier takes arguments.
@@ -711,8 +727,8 @@ link     → link: missing operand                         resolution ran — /u
 
 `break`, `continue` and `return` are why the phrasing matters: they parse
 perfectly well and object about *context*, so a "syntax error means keyword" rule
-would file all three under resolution and let `:kind` answer `false` for them —
-the one thing the invariant forbids.
+would file all three under resolution and let `:kind` **fail** for them — the one
+thing the invariant forbids.
 
 Enumerating that here would be a third copy, and copies drift — this entry
 already got the set wrong twice by trying. The set does exist in the codebase,
@@ -766,9 +782,9 @@ the divergence this modifier exists to avoid, which makes fixing it part of the
 work rather than a tidy-up alongside it.
 
 The invariant is what earns the answer, and it has to be stated at exactly this
-width: **`:kind` never says `false` for a word the shell claims in command
+width: **`:kind` never fails for a word the shell claims in command
 position.** Not "a word the shell handles" — `and` is handled, as infix syntax,
-and `and:kind` is quite properly `false` where no such program exists, because
+and `and:kind` quite properly fails where no such program exists, because
 a guard asking about `and` is asking whether it can *run* one. The wider phrasing
 reads better and is wrong, and it would drive an implementation straight back to
 calling mid-form words `keyword`. Command position is the boundary throughout:
@@ -1009,7 +1025,7 @@ would select", not "what will run".
 
 What stays open is one question, not two, and it is the same question in both
 settings: **when nothing runnable is found but a file of that name exists**, does
-`:kind` answer `false` (nothing here can run) or `external` (a file of that name
+`:kind` **fail** (nothing here can run) or answer `external` (a file of that name
 is present)? The rows it covers:
 
 - a file that exists but is not executable, direct (`./notes.txt`) or on `PATH`;
@@ -1026,17 +1042,20 @@ undefined for every receiver containing a slash. And where it *does* search
 `PATH`, "searches `PATH`" is not yet a specification — it has to say "the way
 `execvp` does", or it names the wrong file.
 
-**A name that resolves to nothing is `false`, not an error** *(decided)*. This
-departs from `:type`, which errors on a missing path because a file that is not
-there has no type word — and it is worth stating because the sibling it is
+**A name that resolves to nothing *fails*, and does not error** *(decided)*.
+This departs from `:type`, which errors on a missing path because a file that is
+not there has no type word — and it is worth stating because the sibling it is
 modeled on goes the other way. Here absence is the *question*: "is this
 installed?" is the whole point of a guard, so it follows `:exists`, `:get`'s
 default, and `gets()` at EOF, all of which answer rather than raise. Erroring
-would make all 41 guard sites defensive.
+would make all 41 guard sites defensive. *(It answered `false` until `false`
+[left the absent set](#variables-and-assignment); a failing status is what a
+guard now reads, and the value-versus-answer rule is why this one moved while
+`:exists` did not.)*
 
 ***(Open — is `:where` about resolution, or about `PATH`?)*** I first wrote
-"`:where` on a builtin or a func is `false`: it asks for a path, and there isn't
-one" as though it settled the matter. It does not, and the gap is not confined to
+"`:where` on a builtin or a func has no answer: it asks for a path, and there
+isn't one" as though it settled the matter. It does not, and the gap is not confined to
 keywords — **shadowing is the ordinary case, not the exotic one**:
 
 ```
@@ -1049,7 +1068,7 @@ For every one of those the shell resolves to something with no path, while a rea
 program of that name sits on `PATH`. Two answers, and the choice is the same one
 each time:
 
-- **`:where` follows resolution.** All three are `false`, because that is what
+- **`:where` follows resolution.** All three **fail**, because that is what
   the shell would actually run. The pair never disagrees, and `:where` cannot
   surface a program `:kind` declined to mention. The cost is that it **stops
   being `path`**: the `shrc` function it replaces searches `PATH` and would
@@ -1068,9 +1087,9 @@ exists — leaving `return`, which stays `keyword` by carve-out and so takes
 whichever answer is chosen here.
 
 Worth naming plainly: the wrapper idiom this document recommends elsewhere
-(`func ls() { command ls … }`) is exactly the case that makes `ls:where` return
-`false` under the first option. A vocabulary meant to replace `path` would then
-answer `false` for the most common thing a user wraps.
+(`func ls() { command ls … }`) is exactly the case that makes `ls:where` **fail**
+under the first option. A vocabulary meant to replace `path` would then have no
+answer for the most common thing a user wraps.
 
 *(Open: the session half of the vocabulary — `connected-remotely`,
 `inside-project`, `in-shpool` — needs no new surface. `$sh.interactive`,
@@ -3181,10 +3200,14 @@ $line:match(/\d+\.\d+\.\d+\.\d+/)` pulls an address out of the middle of a line;
   *mixes* named and unnamed groups is a **loud error** for the MVP (list or map is
   ambiguous); a later map-keyed-by-both-name-and-position rule is deferred until the
   need is real.
-- **No match yields `false`**, not an empty collection. Matching is a pass/fail
-  operation, so on a miss `:match` returns the bool **`false`** (status `1`) —
-  keeping the model's rule that failure is signaled by a `false`, never by the
-  *shape* of a value. On a match it returns the capture list (or map).
+- **No match `fail`s**, and does not yield an empty collection. `:match` hands
+  back the *captures*, and a miss has none — so it answers a **failing status**
+  rather than a value, which is the [absence rule](#variables-and-assignment)
+  applied here: absence is never signaled by the *shape* of a value. On a match it
+  returns the capture list (or map). *(It answered the bool `false` until `false`
+  left the absent set; the status carries the same `1`, and what changed is that a
+  miss is now rejectable on its own rather than only by a shape that does not
+  fit.)*
 - **Test with `~`, capture with an `if`-binding.** A match returns a list/map, and
   a bare collection is *not* a condition (the [condition
   contract](#conditionals-if-is-an-expression) is a bool or a command, and a
@@ -3198,16 +3221,16 @@ $line:match(/\d+\.\d+\.\d+\.\d+/)` pulls an address out of the middle of a line;
   if m = $str:match(/(?<user>\w+)@(?<host>\S+)/)  { puts $m.user }
   ```
 
-  **The third line is blocked on an open question, and the second is not.** Since
-  `false` [left the absent set](#variables-and-assignment) a no-match `false`
-  *binds*, so the scalar form enters its true branch on a miss and then reads
-  `$m.user` off a boolean. The list form is unaffected — a `false` is not a list,
-  so the shape miss selects `else` — which is the asymmetry that makes this a
-  question rather than a typo: only the *scalar* capture bind has no shape to
-  reject the miss with. `:match` is unbuilt, so nothing is broken today; what has
-  to be settled before it is built is whether a `:match` miss keeps answering
-  `false` or answers a failing status. Raised in review. See
-  [Open questions](#open-questions).
+  **A miss `fail`s** — it does not answer `false`, and that is what makes the
+  third line work. Since `false`
+  [left the absent set](#variables-and-assignment) a no-match `false` would
+  *bind*, so the scalar form would enter its true branch on a miss and read
+  `$m.user` off a boolean. The list form would have survived — a `false` is not a
+  list, so the shape miss selects `else` — and that asymmetry is what settled it:
+  only the *scalar* capture bind has no shape to reject a miss with, so the miss
+  has to be rejectable on its own. Raised in review; the general rule it produced
+  — **an operation that hands back a value fails when it has none; a predicate
+  answering no keeps `false`** — is in [Open questions](#open-questions).
 
   As a *condition*, `lhs = rhs` is true iff the RHS is **present** — a nonzero
   `Status` is the only absence, and is what
@@ -3225,12 +3248,13 @@ $line:match(/\d+\.\d+\.\d+\.\d+/)` pulls an address out of the middle of a line;
   ```
   match $line:match(/(\w+): (.*)/) {
     [key val] => …       # matched — key/val bound
-    false     => …       # no match
+    _         => …       # no match — the miss is a failing status
   }
   ```
 
 - **A bare, unconditional bind is an assertion.** `[a b] = $str:match(/…/)` with
-  no `if` says "I know this matches" — so a miss (`false`, not a two-element list)
+  no `if` says "I know this matches" — so a miss (a failing status, not a
+  two-element list)
   is a **loud error**, the [no-null](#variables-and-assignment) rule again: an
   unconditional bind that silently yielded `a = ""` would bury the bug. (The same
   mismatch *inside* an `if` condition is the quiet skip above — that contrast is the
@@ -3249,7 +3273,7 @@ under one word.
 
 *(**Decided — keep both, split by job** *(resolving the earlier "consolidate?"
 open, settled alongside the [`match`](#matching-match) `~`-alignment law)*. They
-overlap — `:match` is falsey on a miss, so `if $str:match(/re/)` covers `~`'s yes/no
+overlap — `:match` fails on a miss, so `if $str:match(/re/)` covers `~`'s yes/no
 — but the division is deliberate and worth two spellings: **`~` (and a bare `/re/`
 `match` arm) answer *whether*; `:match` extracts *what*.** `~` reads as a bare
 predicate and binds nothing; `:match` is the single capture path. Defining `~` as
@@ -4130,9 +4154,9 @@ whole category of `x = $(if … )` scaffolding.
 
 ```
 # statement position — run a branch for effect
-if fzf:kind != false {
+if kind = fzf:kind {
   bind-key ctrl-r fzf-history
-} else if atuin:kind != false {
+} else if kind = atuin:kind {
   atuin init mesh | source
 }
 
@@ -4155,7 +4179,9 @@ Decisions:
   both: the session predicates (`connected-remotely`, `inside-project`, …) are
   ordinary functions that slot straight into `if` with no `[ … ]` / `test`, while
   name resolution is the [`:kind` modifier](#modifiers) and so yields a value,
-  compared explicitly (`if fzf:kind != false`).
+  reached by a presence-bind (`if kind = fzf:kind`) since a resolved `:kind` is a
+  string and a bare condition would error on it — or compared explicitly when a
+  *particular* kind is wanted.
 
   **Truthiness is settled, and the answer is that there isn't any.** Which world
   a condition branches on is decided by **where the subject is written** — command
@@ -7514,32 +7540,47 @@ to avoid" rather than promising the latter as done.
   **And its scope note below is now the whole story rather than a carve-out.**
   The rule this entry landed on — *`false` where the operation asks, a `Status`
   where it reads* — no longer holds: `false` does not spell absence anywhere, so
-  an asking operation that means "no answer" says `fail` too. `:match` and
-  `:kind` keep answering `false`, but as the *answer* to a pass/fail question,
-  not as an absence a presence-bind will reject.
+  an operation that means "nothing to give you" says `fail` too, whether it asks
+  or reads. `:match` and `:kind` were listed here as keeping their `false`; they
+  do not — see the rule below, which replaces the ask/read line with a
+  value-versus-answer one and moves both of them onto the status.
 
-  **And that reopens one idiom, which has to be settled before `:match` is
-  built** — raised in review, and the entry did not see it coming. The
+  **That reopened one idiom, and settling it produced the general rule below.**
+  Raised in review; the entry did not see it coming. The
   [scalar named-capture bind](#destructuring),
   `if m = $str:match(/(?<user>\w+)@…/) { puts $m.user }`, relied on the
-  no-match `false` failing the presence-bind. Now it binds, so the block runs on
-  a miss and reads `$m.user` off a boolean. **The list form is unaffected** —
+  no-match `false` failing the presence-bind. Once `false` bound, the block ran
+  on a miss and read `$m.user` off a boolean. **The list form was unaffected** —
   `if [one two] = $str:match(…)` still skips, because a `false` is not a list and
-  the shape miss rejects it — so this is not "the presence-bind lost `:match`",
-  it is specifically the scalar bind having no shape to reject a miss with. Two
-  ways out, undecided:
+  the shape miss rejects it — so it was never "the presence-bind lost `:match`",
+  it was specifically the scalar bind having no shape to reject a miss with.
 
-  1. **A `:match` miss answers a failing status.** The idiom works unchanged and
-     both forms agree. It costs the reading just argued for — matching stops
-     being a pass/fail question answered by a boolean — and it reaches `~`,
-     `:kind` and every other predicate by the same logic, or else splits them.
-  2. **`:match` keeps `false` and the idiom is respelled**, e.g. the list form,
-     or a narrowing that skips a non-map. That keeps the answer-not-absence
-     reading intact and costs the one-evaluation scalar capture, which is what
-     the shape existed for.
+  **The rule, decided by the repo owner: an operation that hands back a *value*
+  fails when it has none; a *predicate* answering no keeps `false`.** That is
+  where the retired ask/read rule was reaching and drew the line in the wrong
+  place — the question is not whether the operation asks or reads, it is whether
+  its result is a **value** or an **answer**. So:
 
-  Nothing is broken today — `:match` arguments are unimplemented, so no script
-  can hit it — which is exactly why it is cheap to settle now rather than after.
+  | | on a miss | why |
+  |---|---|---|
+  | `:match` | **fails** | its result is the captures, and a miss has none |
+  | `:where` | **fails** | its result is a path |
+  | `:kind` | **fails** | its result is a kind word |
+  | `:exists`, `:has`, `~` | `false` | the `false` **is** the result — the question was yes/no and the answer is no |
+
+  Nothing built moves: `gets()` was the only shipped `false`-as-absence and it is
+  already a status; the three that fail are all unimplemented, which is why this
+  was cheap to settle before building rather than after. What it buys beyond the
+  `:match` idiom is [`:kind`'s guard](#modifiers) — `if shpool:kind` now reads,
+  where the `false` forced `if shpool:kind != false` and a paragraph apologizing
+  for it.
+
+  **What the failure is ultimately *called* is still open**, and deliberately
+  separate: it is a failing `Status` today, and whether absence eventually gets a
+  `none`, a reserved status code, or stays exactly this is the question the
+  [mark-versus-value entry](#open-questions) below is deciding. Nothing here
+  presumes that answer — these operations fail, and whatever spelling absence
+  settles on is what they will be failing *with*.
 
   **The scope is narrow, and that is the first thing to say.** The
   [strict/soft pairs](#error-handling) mean absence is normally not *returned* at
@@ -7548,17 +7589,19 @@ to avoid" rather than promising the latter as done.
   another line?" is answerable only by reading it. [`gets()`](#built-ins) is that
   case.
 
-  **It is not the only `T | false` producer, and the line between them is worth
-  stating.** [`:match`](#modifiers) answers `false` on a miss, and a caller who
+  **It was not the only `T | false` producer, and the line between them was
+  redrawn.** [`:match`](#modifiers) answered `false` on a miss, and a caller who
   wants the captures cannot ask ahead either — `:has`-style pre-checking would mean
-  matching twice. What separates them is not "can you ask ahead" but **what the
-  operation is**: a match is a *question*, and `false` is its answer, which is why
-  that section calls matching "a pass/fail operation". A read is not a question —
-  "give me the next line" has no false. The rule this decision followed was
-  **`false` where the operation asks, a `Status` where it reads**; `false` has
-  since left the absent set entirely, so the surviving reading is that `:match`
-  and `:kind` answer `false` as an *answer*, not as an absence. This decision
-  reaches stream reads and nothing else.
+  matching twice. This entry ruled that what separates them is not "can you ask
+  ahead" but whether the operation *asks*: a match is a question, and `false` is
+  its answer, which is why that section calls matching "a pass/fail operation";
+  a read is not a question, and "give me the next line" has no false. **That
+  rule — `false` where the operation asks, a `Status` where it reads — is
+  retired**, along with the `false` it was sorting. The line that replaced it is
+  above: `:match` hands back *captures*, so a miss has nothing to hand back and it
+  fails, and only a genuine yes/no predicate keeps its `false`. So this decision
+  no longer reaches stream reads and nothing else — it was the first case of a
+  rule that now covers `:match`, `:where` and `:kind` too.
 
   **Why.** It takes the double meaning off `false`, which is the whole point:
   after this, a `false` in hand is a boolean answer, full stop, and the
