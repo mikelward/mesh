@@ -973,7 +973,8 @@ enum LineRead {
     /// A line, with any trailing newline already stripped. An empty line is this
     /// case, not [`LineRead::End`].
     Line(String),
-    /// End of input: status `1` for `gets line`, `false` for `gets()`.
+    /// End of input: status `1` either way — reported for `gets line`, yielded as
+    /// a `Status(1)` value for `gets()`.
     End,
     /// Ctrl-C arrived during the read, which consumed nothing.
     Interrupted,
@@ -985,12 +986,13 @@ enum LineRead {
 /// (`DESIGN.md` §"Builtins"), so a read composes: `line = gets()`,
 /// `[k v] = gets():split("=")`, `while line = gets() { … }`.
 ///
-/// **At end of input it yields `false`**, not `""`. That is the whole reason the
-/// condition forms terminate: `DESIGN.md` §"Tests and comparisons" makes
-/// `lhs = rhs` true iff the right-hand side is truthy, and an empty line is a
-/// truthy `""`, so only the `false` ends a loop. It is the same distinction the
-/// command form draws with statuses `0` and `1`, said in the vocabulary a value
-/// has.
+/// **At end of input it yields `status(1)`**, not `""` and not `false`. That is
+/// the whole reason the condition forms terminate: `DESIGN.md` §"Tests and
+/// comparisons" makes `lhs = rhs` a *presence* test, an empty line is a present
+/// `""`, and a failing status is the only absence — so only the status ends a
+/// loop, and it binds nothing, leaving the name holding the last line read. It is
+/// the same distinction the command form draws with statuses `0` and `1`, said in
+/// the vocabulary a value has.
 ///
 /// It takes **no arguments**: the value form binds through the assignment it sits
 /// in, where the command form takes the name as an operand. Both spellings stay —
@@ -1027,7 +1029,12 @@ fn eval_gets(
     }
     match read_gets_item(shell, delimiter) {
         LineRead::Line(text) => Ok(Value::String(text)),
-        LineRead::End => Ok(Value::Boolean(false)),
+        // **`status(1)`, not `false`** — with `false` retired from the absent set,
+        // a boolean binds and takes the true branch, so a `false` here would make
+        // `while line = gets() { … }` spin forever on a bound `false`. A failing
+        // status is what absence is now, and it binds nothing, so the loop ends
+        // and `$line` keeps the last line read.
+        LineRead::End => Ok(Value::Status(1)),
         LineRead::Interrupted => {
             // Not a runtime error: nothing was read and nothing went wrong. The
             // statement abandons the way an interrupted command does, carrying the
@@ -1431,10 +1438,18 @@ impl Step {
 ///
 /// A `Status` reports its own code — that is what the type is *for*, and it is
 /// what lets `func w() { some-cmd; return $sh.status }` forward a failure instead
-/// of returning the number successfully. Otherwise only `false` fails: `false` is
-/// mesh's "no result" — what `gets()` yields at EOF and what a failing predicate
-/// returns — so it is the one other value whose absence of a result is worth
-/// reporting as a nonzero status. Every remaining value is a result, and producing
+/// of returning the number successfully. Otherwise only `false` fails: it is what
+/// a failing predicate returns, so it is the one other value whose answer is worth
+/// reporting as a nonzero status — `if connected-remotely { … }` reads it through
+/// the channel.
+///
+/// **`false` is not an absence**, and this projection is the one place it still
+/// looks like one. A failing status is the only absence: a `false` binds and takes
+/// the branch in `if x = f()`, and `gets()` yields `status(1)` at EOF rather than
+/// a `false`. So this function and `condition_status` disagree about `false` on
+/// purpose — *did this succeed?* against *is there a value?* — and only the second
+/// is about absence. Do not "fix" the disagreement by dropping this arm; it is
+/// what keeps `pred && …` working. Every remaining value is a result, and producing
 /// a result is success, so `return 5` carries the integer five with status `0`
 /// rather than claiming exit code 5. There is deliberately **no `Integer` arm**:
 /// with one, `func g(_n) { $_n + 1 }` run bare would fail whenever its arithmetic
@@ -2809,11 +2824,10 @@ fn condition_status(
     // then tripped over it.
     //
     // `DESIGN.md` §"Empty `\"\"` / `[]` truthiness" settles what is asked: it
-    // "tests *presence* rather than truth — and there the answer follows from
-    // `false` being mesh's 'no result': only `false` is absent, so `\"\"`, `[]`
-    // and `0` all bind and take the branch." That is what lets a function answer
-    // `false` for "found nothing" and be tested for it. A nonzero `Status` has
-    // since joined `false` on the absent side — see the arm below for why.
+    // "tests *presence* rather than truth". A **failing status is the only
+    // absence** — every other value binds and takes the branch, `false`, `""`,
+    // `[]` and `0` alike — so a function with nothing to answer says so with
+    // `fail`, and one that answers `false` has answered.
     //
     // Absent binds nothing, the rule the two neighbors already state: a
     // list-pattern mismatch "selects `else` without changing any bindings"
@@ -2849,56 +2863,43 @@ fn condition_status(
         // **Publishes before any of the answers below**, because every one of them
         // is a question about the *value* — absent, failing, or bindable — and
         // none of them is a question about what the call exited with. Placing it
-        // after the absent check left `if x = f()` on a `false`-returning `f`
-        // showing unrelated history where `x = f()` reported `0`. Raised in
-        // review, and the same slip in the shape arm above.
+        // after the absent check left `if x = f()` on a failing `f` showing
+        // unrelated history where `x = f()` reported `0`. Raised in review, and
+        // the same slip in the shape arm above.
         let reported = assignment_status_of(value, &bound, false, shell);
         publish_condition_status(reported, records, shell);
-        if bound == Value::Boolean(false) {
-            return Ok(Some(1));
-        }
-        // A **status** is the other value-level failure (`DESIGN.md` §"Error
-        // handling"), so a failing one takes `else` here exactly as it does when
-        // it is the condition itself — otherwise `if s = sh("-c", "exit 5")`
-        // succeeds while `if sh("-c", "exit 5")` fails, on the same value.
+        // A **failing status is the absence**, and the only one. It takes `else`
+        // here exactly as it does when it is the condition itself — otherwise
+        // `if s = sh("-c", "exit 5")` succeeds while `if sh("-c", "exit 5")`
+        // fails, on the same value. `false` is not this case and used to be:
+        // it is a boolean *answer*, and a presence-bind asks whether there is a
+        // value, not whether the value is true. A **successful** status is not
+        // this case either — it is a value, so it binds through the arm below.
         //
-        // And it **binds nothing**, like `false`. It used to bind, on the grounds
-        // that a status is a result rather than an absence and the `else` branch
-        // might want the code. That lost more than it bought: under the
-        // `T | Status(n≠0)` widening a declared type admits a failing status, so
-        // binding one puts a `Status` into a `str`-typed name and the annotation
-        // stops meaning anything on the failure path.
+        // It **binds nothing**. It used to bind, on the grounds that a status is
+        // a result rather than an absence and the `else` branch might want the
+        // code. That lost more than it bought: under the `T | Status(n≠0)`
+        // widening a declared type admits a failing status, so binding one puts a
+        // `Status` into a `str`-typed name and the annotation stops meaning
+        // anything on the failure path.
         //
         // The *binding* is what is withheld; the code is not lost with it. The
         // status channel is a separate one and the right-hand side ran, so it
-        // publishes above, before any of these answers, and the `else` branch
-        // reads the rejected code in
-        // `$sh.status`. That reading used to track whatever ran before the `if`
-        // instead — unreliable rather than unavailable, which is worse — and is
-        // pinned now by
+        // publishes above — before any of these answers, since none of them is a
+        // question about what the call exited with — and the `else` branch reads
+        // the rejected code in `$sh.status`. That reading used to track whatever
+        // ran before the `if` instead: `0` in a fresh shell, `3` after an earlier
+        // `exit 3` — unreliable rather than unavailable, which is worse, and in
+        // the one place the program knows the call failed. Pinned by
         // `a_rejected_status_publishes_its_code_to_the_branch_it_picks`. A caller
         // who needs the code to outlive the branch assigns first — a statement
-        // binds unconditionally — and then
-        // asks presence again: `t = f()` then `if kept = $t { … } else { $t:code }`.
-        // The inner bind matters: a bare `if $t` serves a bool or a status and
-        // errors on a string, which is the case this rule exists for.
-        //
-        // A **successful** status is not this case: it is a value, so it binds and
-        // takes the true branch through the arm below.
+        // binds unconditionally — and asks presence again: `t = f()` then
+        // `if kept = $t { … } else { $t:code }`. The inner bind matters: a bare
+        // `if $t` serves a bool or a status and errors on a string.
         //
         // The capture-tailed sibling is untouched, and is not an exception: `if
         // out = $(diff a b)` binds the *output*, a string, and branches on the
         // diff's status — the bound value was never a `Status` there.
-        // **The right-hand side ran, so it publishes**, on the same terms the
-        // assignment *statement* does — `assignment_status_of`, one line up the
-        // page. Without this the two positions disagreed about identical text:
-        // `x = f()` where `f` ends in `fail 5` reported `5`, while
-        // `if x = f() { … } else { … }` left whatever ran before the `if`
-        // standing, so the `else` showed `0` in a fresh shell, `3` after an
-        // earlier `exit 3`, `9` after an `exit 9` — tracking unrelated history
-        // rather than the call it just made. That is the worst place for it: the
-        // `else` branch is where the program knows `f` failed, and was the one
-        // place its code could not be read.
         if let Value::Status(code) = bound
             && code != 0
         {

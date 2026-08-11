@@ -2012,22 +2012,23 @@ hyphen between — the third payoff of that one spacing rule.
   back for, e.g., "key present but unset"? Current answer: no; `:has` +
   `:get(key, default)` cover it.)*
 
-  **Three values look null-shaped, and only one of them encodes absence.** They get
+  **Four values look null-shaped, and only one of them encodes absence.** They get
   mistaken for each other because each turns up where a value was wanted and none
   arrived, so the sort is by *what question each one answers*:
 
-  - **`false` is what *encodes* absence** — mesh's ["no result"](#functions), and
-    what an `if x = f()` presence-bind treats as nothing-there, along with a
-    nonzero `Status`.
-    (**Stream reads are the exception, decided separately**: `gets()` at EOF
-    answers [`status(1)`](#open-questions), not `false`, so the one place the
-    encoding was load-bearing no longer uses it.) `""`, `[]` and `0` all bind and take the branch; a
-    nonzero `Status` takes `else` and, like `false`,
-    [binds nothing](#tests-and-comparisons). The encoding is **contextual, not a property of the value**: a
-    `bool func` answers `false` as a complete result, and `:filter` reads it as
-    "does not match" rather than "no answer". That it reuses the boolean instead
-    of adding a value of its own is what the `false | T` duality pays to avoid a
-    null, and the reason nothing can tell the two uses apart.
+  - **A nonzero `Status` is what *encodes* absence**, and the only thing that
+    does — mesh's ["no result"](#functions), what an `if x = f()` presence-bind
+    treats as nothing-there, and what `gets()` answers at end of input. It takes
+    `else` and [binds nothing](#tests-and-comparisons), so the name keeps what it
+    held. A function with nothing to answer says so with `fail`.
+  - **`false` is an answer, not an absence.** It used to be the absence too — the
+    `false | T` duality, a boolean doing double duty so the language needed no
+    null — and that reading is *retired*. It cost more than it saved: the encoding
+    was contextual rather than a property of the value, so a `bool func` answering
+    `false` as a complete result and a lookup answering `false` for "found
+    nothing" were the same bytes and nothing could tell them apart. Now `false`
+    binds and takes the branch, along with `""`, `[]` and `0`, and the absence has
+    a spelling of its own.
   - **`status(0)` is an outcome, not an absence.** `puts(1 + 2)` binding
     `Status(0)` does not say "nothing came back"; it says the command ran and
     went fine — the [status decision](#open-questions)'s own grounds, that a
@@ -2049,12 +2050,11 @@ hyphen between — the third payoff of that one spacing rule.
     not. That one is left open where it is analyzed
     ([Open questions](#open-questions)), not decided here.
 
-  Stated once, the rule those three obey: **absence is spelled `false` where the
-  operation *asks* and a nonzero `Status` where it *reads*; everything else is a
-  value.** `status(0)` is on the "everything else" side of that — it is success,
-  never absence — which is why the live question is the empty string and not the
-  status. See [Open questions](#open-questions) for both halves: the `""` question,
-  and the stream-absence decision that put the second clause there.
+  Stated once, the rule those four obey: **absence is spelled by a failing
+  `Status`; everything else is a value.** `status(0)` is on the "everything else"
+  side of that — it is success, never absence — and so is `false`, which is why
+  the live question is the empty string and not either of them. See
+  [Open questions](#open-questions) for the `""` question.
 
   The residual cost on the status side is a lost *diagnostic*, not a null: with
   every call yielding a value, `:map(&puts)` produces a list of `Status(0)` where
@@ -3198,10 +3198,21 @@ $line:match(/\d+\.\d+\.\d+\.\d+/)` pulls an address out of the middle of a line;
   if m = $str:match(/(?<user>\w+)@(?<host>\S+)/)  { puts $m.user }
   ```
 
-  As a *condition*, `lhs = rhs` is true iff the RHS is **truthy** (a `false` — the
-  no-match — fails it, as does a nonzero `Status`, which is what
-  [`gets()` answers at EOF](#open-questions)) **and** its shape fits `lhs`; on true the
-  names bind for the block. On a `false`, a shape miss, **or a nonzero `Status`**
+  **The third line is blocked on an open question, and the second is not.** Since
+  `false` [left the absent set](#variables-and-assignment) a no-match `false`
+  *binds*, so the scalar form enters its true branch on a miss and then reads
+  `$m.user` off a boolean. The list form is unaffected — a `false` is not a list,
+  so the shape miss selects `else` — which is the asymmetry that makes this a
+  question rather than a typo: only the *scalar* capture bind has no shape to
+  reject the miss with. `:match` is unbuilt, so nothing is broken today; what has
+  to be settled before it is built is whether a `:match` miss keeps answering
+  `false` or answers a failing status. Raised in review. See
+  [Open questions](#open-questions).
+
+  As a *condition*, `lhs = rhs` is true iff the RHS is **present** — a nonzero
+  `Status` is the only absence, and is what
+  [`gets()` answers at EOF](#open-questions) — **and** its shape fits `lhs`; on
+  true the names bind for the block. On a nonzero `Status` or a shape miss
   it skips and binds nothing ([Tests and comparisons](#tests-and-comparisons)) —
   so at EOF `while line = gets() { … }` leaves `line` holding the last line read,
   not the status that ended it. A shape mismatch in
@@ -3502,11 +3513,16 @@ Rules:
   `Status(n)` — which projects to its own `n`, so `fail 123` and
   `return status 123` both leave 123. The invariant below is otherwise unchanged:
   what that decision adds is a second value that can carry a failure, not a
-  reason for any other value to.)* `false` is mesh's "no result" — what a failing
-  predicate returns, what `if x = f() { … }` tests for — so it
-  is the one value whose status is worth reporting as nonzero. *(A **stream** read
-  with nothing left answers [`status(1)`](#open-questions) rather than `false`,
-  decided separately; the status is the same `1` either way.)* Every other value
+  reason for any other value to.)* `false` is what a failing predicate returns,
+  so it is the one non-status value whose status is worth reporting as nonzero:
+  `if connected-remotely { … }` reads the answer through the channel. *(It is
+  **not** mesh's "no result" — the
+  [absence rule](#variables-and-assignment) retired that reading, so a `false`
+  binds and takes the branch in `if x = f() { … }`, and a stream read with
+  nothing left answers `status(1)`. The projection and the presence-bind
+  therefore disagree about `false`, on purpose: they answer different questions —
+  *did this succeed?* and *is there a value?* — and only the second one is about
+  absence.)* Every other value
   *is* a result, and producing a result is success, which is why `return 5` carries
   the integer five with status `0` rather than claiming exit code 5. A returned
   string, list, map or zero is likewise a success.
@@ -4170,13 +4186,15 @@ Decisions:
   `and`, `or` and `not` ask the same question and refuse the same values, since
   they are boolean operators rather than a second truthiness system.
 - **An assignment may *be* the condition** — `if lhs = rhs { … }`, the `if let`
-  shape. The condition is true iff the RHS is **truthy** (a `false` / failed
-  command / nonzero `Status` fails it — *a nonzero **int** does not, under the
-  [status decision](#open-questions), since `return 5` is data with status `0`*)
-  **and** its shape **fits** `lhs`; on true the
-  names bind for the block. On a `false`, a shape miss, **or a nonzero `Status`**
+  shape. The condition is true iff the RHS is **present** — a failed command or a
+  nonzero `Status` is the only absence, and *a nonzero **int** is not one, under
+  the [status decision](#open-questions), since `return 5` is data with status
+  `0`* — **and** its shape **fits** `lhs`; on true the
+  names bind for the block. On a nonzero `Status` or a shape miss
   it skips and binds nothing, so at EOF `if line = gets() { … }` skips and leaves
-  `line` exactly as it was. `lhs` may be a
+  `line` exactly as it was. **A `false` is present**, so `if x = false { … }`
+  takes the branch with `$x` bound: this asks whether there *is* a value, not
+  whether the value is true ([the absence rule](#variables-and-assignment)). `lhs` may be a
   name (always fits) or a `[…]` [destructuring](#destructuring) pattern, so
   `if [one two] = $s:match(/…/) { … }` and `if line = gets() { … }` both test-and-bind
   in one step, RHS written once. Crucially, **pattern-fit is part of the test**: a
@@ -4562,14 +4580,15 @@ canonical homes:
   values*: a bare `if $xs` is an error whether the list is empty or not, so there
   is no emptiness rule left to decide. The question survives only for the
   **assignment-condition RHS** (`if xs = f() { … }`), which tests *presence* rather
-  than truth — and there the answer follows from `false` being mesh's "no result":
-  `false` is absent — and so is a nonzero `Status`, per the addition below — so
-  `""`, `[]` and `0` all bind and take the branch. That
+  than truth — and there the answer follows from a failing `Status` being mesh's
+  "no result": a nonzero status is absent, and nothing else is, so `false`, `""`,
+  `[]` and `0` all bind and take the branch. That
   also keeps `gets()`'s pinned contract, where a blank line must not end a read
-  loop. A **`Status`** is the one addition the [status
-  decision](#open-questions) makes here, and it is not an exception to the
-  presence reading: a nonzero status is a *value-level failure* like `false`, so
-  it takes `else` — **and binds nothing, like `false`.** It used to bind, on the
+  loop — and `gets()` at end of input answers `status(1)`, which is what *does*
+  end it. `false` was on the absent side until the
+  [absence rule](#variables-and-assignment) retired it: it is a boolean answer,
+  and a presence-bind asks whether there is a value rather than whether the value
+  is true. A nonzero status takes `else` — **and binds nothing.** It used to bind, on the
   grounds that a status is a result rather than an absence and the `else` branch
   might want the code. The [`T | Status(n≠0)` widening](#open-questions) retired
   that: a declared type now admits a failing status, so binding one would put a
@@ -5514,14 +5533,13 @@ programs or user functions:
   - **`gets [--nulls] [var]`** — read one line from stdin into `var` (trailing newline
     stripped) and return that line as its value. **At EOF it returns
     [`status(1)`](#open-questions)** and leaves `var` unchanged, so
-    `while gets line { … }` terminates. An empty line still reads as a truthy
+    `while gets line { … }` terminates. An empty line still reads as a present
     `""` — only EOF ends the loop — so blank lines don't end it. With no `var`
-    it just yields the line (or that `status(1)`). *(Decided, not yet built: the
-    code returns `false` at EOF today. The status carries the same `1`, so the
-    loop terminates identically, and it binds nothing either way — a failing
-    status is [absent for a presence-bind](#tests-and-comparisons) exactly as a
-    `false` is, so `while line = gets() { … }` leaves `line` holding the last line
-    read. What changes is only that `false` stops meaning "no result".)* **`--nulls` reads a NUL-terminated item
+    it just yields the line (or that `status(1)`). *(Built. It returned `false`
+    at EOF until `false` left the absent set, which forced the change rather than
+    merely allowing it: a bound `false` takes the true branch, so
+    `while line = gets() { … }` would never end. The failing status binds nothing,
+    so the loop leaves `line` holding the last line read.)* **`--nulls` reads a NUL-terminated item
     instead** — the read a `find -print0` stream needs, where a newline inside a name
     is data and a line read would tear the name in half. The separator is *named*
     rather than passed as a character because `\0` is deliberately not one of the
@@ -7239,15 +7257,18 @@ to avoid" rather than promising the latter as done.
     fail that way, or a fallback that *completes* is itself an error. That choice
     is part of the proposal, not an implementation detail under it.
   - **It catches exactly what the `if`-bind catches, and no more.** That test is
-    *truthy* **and** *shape fits*
+    *present* **and** *shape fits*
     ([Conditionals](#conditionals-if-is-an-expression)), so the fallback fires on
-    either half: a **value-level failure** — a `false`, a failed command, a
-    nonzero `Status` — or a **shape miss**, including a non-list right-hand side,
+    either half: a **value-level failure** — a failed command or a nonzero
+    `Status`, which is the whole of [absence](#variables-and-assignment) — or a
+    **shape miss**, including a non-list right-hand side,
     which `pattern_bindings` already treats as a plain no-match rather than an
-    error, and a missed [`:match`](#destructuring).
+    error, and a missed [`:match`](#destructuring). A `false` is **not** one of
+    these: it binds and the fallback does not fire, the same as `""`, `[]` and
+    `0`. (An earlier draft listed it, from when `false` was absent.)
 
     It inherits the binding rule with it, and there is no asymmetry left to
-    inherit: a `false` binds nothing and so does a nonzero `Status`
+    inherit: a nonzero `Status` binds nothing
     ([Tests and comparisons](#tests-and-comparisons)). So
     `s = build() otherwise { … }` cannot read `$s` in the fallback, exactly as the
     `else` of `if s = build() { … }` cannot — the fallback is for *what to do
@@ -7367,7 +7388,7 @@ to avoid" rather than promising the latter as done.
   | **Leave it lenient** (today) | The terse one-liner survives; nothing to migrate | Keeps both manufactured silent empties — the no-`else` `if` and the unmatched `match` — in the language whose pitch is that absence is loud |
   | **Require `else` wherever the value is used** | Closes the `if` half of it — the `match` half needs the totality question answered the same way | "Wherever the value is used" includes func tails, `match` arms and `for` bodies, so it fires far beyond the case it was aimed at, and breaks the documented prompt-segment idiom |
   | **Require `else` in binding position only** | Narrow, syntactic, and checkable at parse time | Already weighed and declined once under [Error handling](#error-handling); and it misses the func-tail case, so it buys explicitness without closing the hole |
-  | **Yield `false` instead of `""`** | The only option that changes the *value*, so the only one that closes the hole the *what it buys* paragraph below concedes the others leave open: `""` stops standing for both "empty" and "absent", `if tag = if $root { "[root]" } { … }` becomes a real presence test (today it always takes the branch), and the gap gets the spelling the [ask/read rule](#open-questions) gives it — no new type, no null. That rule is what carries this row now: a failed condition is an **ask** answered no, and `false` is what an ask spells absence with. *(An earlier draft argued instead that the gap would "join `gets()`" on a single absent value. The [stream-absence decision](#open-questions) retired that: `gets()` at EOF answers `status(1)`, so `false` in the gap agrees with the rule rather than with `gets()`, and two spellings coexist by design instead of one being unified.)* | `false` renders as the text `false`, so `"$tag"` reads `false` rather than nothing — the terse tag idiom breaks loudly instead of quietly. The [prompt-segment idiom](INTRO.md) needs its "empties dropped" rule to become "absent dropped". And it does not stop a value being manufactured on an unwritten path, it changes which one: an author who wanted `""` now writes `else { "" }`. **Nor is it value-only** — `false` is the [one value that fails](#functions), so wherever the gap's value projects to a status the omitted branch starts reporting failure: a typed `func` tailing in one answers nonzero, and a `… \|\| fallback` chained off that answer runs the fallback where `""` left it alone. Either that is accepted as correct — an unwritten branch *did* produce no result — or the gap's `false` is exempted from the projection, which splits `false` into two kinds and hands back the single absent value the option exists to reach |
+  | **Yield `false` instead of `""`** | The only option that changes the *value*, so the only one that closes the hole the *what it buys* paragraph below concedes the others leave open: `""` stops standing for both "empty" and "absent" — no new type, no null. **Read the paragraph below the table before this cell**: it used to claim a real presence test as well, on the strength of the ask/read rule, and both the rule and the claim have since been withdrawn — `false` no longer spells absence anywhere, so a gap yielding it yields a value that binds. | `false` renders as the text `false`, so `"$tag"` reads `false` rather than nothing — the terse tag idiom breaks loudly instead of quietly. The [prompt-segment idiom](INTRO.md) needs its "empties dropped" rule to become "absent dropped". And it does not stop a value being manufactured on an unwritten path, it changes which one: an author who wanted `""` now writes `else { "" }`. **Nor is it value-only** — `false` is the [one value that fails](#functions), so wherever the gap's value projects to a status the omitted branch starts reporting failure: a typed `func` tailing in one answers nonzero, and a `… \|\| fallback` chained off that answer runs the fallback where `""` left it alone. Either that is accepted as correct — an unwritten branch *did* produce no result — or the gap's `false` is exempted from the projection, which splits `false` into two kinds and hands back the single absent value the option exists to reach |
   | **Make `""` false** | Touches no construct at all: the gap goes on yielding `""`, so the terse tag idiom, the [prompt segment](INTRO.md) and every hand-written `else { "" }` survive unchanged. **At the stronger of the two strengths below** it collapses the three to two *for conditions* — ordinary and presence alike — and makes the gap testable in any condition it already reaches; the [status projection](#functions) still tells `""` from `false` unless the third dial is turned too, so what collapses is the condition behavior rather than the values. At the weaker strength `""` is only a newly falsy value that stays *present* in a bind, so the three stay distinct and the payoff is the explicit `if $tag { … }` alone. It is also the shell-native reading — in POSIX, `[ -z "$x" ]` and an unset name are near-interchangeable — and Python, JavaScript and Perl all take it | Reopens [truthiness](#conditionals-if-is-an-expression), settled and shipped as *no truthy values* — `if "" { … }` is an error today naming the comparison to write, and a falsy `""` makes `if $x` legal for a string, putting `"0"` and `"false"` back on the table with the three disagreeing rules that section retired. And it negates the principle the two-arg `$xs:get(i, default)` was reasoned from — *don't let one value stand in for both "empty" and "absent"* — so where the row above gives that distinction up **in the gap**, this gives it up **language-wide**. (`:get` itself survives, its bounds check being internal; what goes is every test written *on* the value it hands back.) **What it costs past that depends on how far it reaches**, and only the stronger of its two strengths touches `gets()` — below the table |
 
   **What it buys is smaller than it first looks.**
@@ -7386,13 +7407,22 @@ to avoid" rather than promising the latter as done.
   last cost, what status it leaves. So it is not a rival
   to the three above it so much as the question they never ask, and both axes can
   be taken at once — require `else` in binding position *and* yield `false`
-  elsewhere. What recommends it is the [absence rule](#variables-and-assignment):
-  `false` is how the language spells absence **for an operation that asks**, and a
-  failed condition is exactly that, so a gap yielding it agrees with the rule and
-  with presence-binding instead of minting a third answer. It does *not* agree
-  with `gets()` any more — that reads, so it answers `status(1)` under the
-  [stream-absence decision](#open-questions) — and this row no longer claims it
-  does. It
+  elsewhere.
+
+  **The argument that recommended it has been withdrawn.** It used to be the
+  [absence rule](#variables-and-assignment): `false` was how the language spelled
+  absence for an operation that *asks*, and a failed condition is exactly that,
+  so a gap yielding it agreed with the rule instead of minting a third answer.
+  That rule is gone — a nonzero `Status` is now the only absence, and `false` is
+  an ordinary value that binds. So a gap yielding `false` is a gap yielding a
+  *present* value: `if tag = if $root { "[root]" } { … }` takes the branch either
+  way and the row's headline payoff, a real presence test, is not delivered. What
+  survives is the narrower claim that `false` is a less mistakable placeholder
+  than `""` and that it fails a status projection. Whether the gap should instead
+  yield a failing status — which *would* deliver the presence test — is a new
+  question this row does not answer.
+
+  It
   carries the same coupling as everything else here — whatever `if` does, an
   unmatched `match` does. The valueless `func` body is not dragged along: that
   producer is already the *asking* half of the
@@ -7417,8 +7447,8 @@ to avoid" rather than promising the latter as done.
   **The fifth row has two strengths, and they cost differently.** *Truthiness
   only* — `""` is false in an ordinary condition — leaves `if x = f()` alone: an
   [assignment condition](#matching-match) tests **presence**, not truth, and keys
-  on `false` itself, so a blank line still binds and `gets()`'s contract is
-  untouched. But then the gap is not testable by a presence-bind either —
+  on a failing status rather than on falsity, so a blank line still binds and
+  `gets()`'s contract is untouched. But then the gap is not testable by a presence-bind either —
   `if tag = if $root { "[root]" } { … }` still always takes the branch — and what
   the option buys is the explicit `if $tag { … }` and nothing more. *Truthiness
   plus absence* — `""` counts as absent in the presence-bind too — is the strength
@@ -7453,12 +7483,13 @@ to avoid" rather than promising the latter as done.
   falsy `""` is the **blank line**, not the EOF, so the
   casualty is untouched. The version that *would* work moves the presence-bind off
   value-falsity altogether, failing only on a nonzero `Status`; that costs the
-  `false | T` encoding everywhere else, since `if m = lookup(k) { … }` would then
-  take the branch with `m` bound to `false`. (Whether `gets()` should answer EOF
-  with a `Status` on its own merits was a separate question, and is now
-  [decided that way](#open-questions) — which does not change this analysis: a
-  read at EOF fails the presence-bind either way, so it is still the *blank line*
-  that a falsy `""` would stop the loop on.)
+  `false | T` encoding everywhere else, since `if m = lookup(k) { … }` then
+  takes the branch with `m` bound to `false`. (**That version has since shipped**
+  — see the [absence rule](#variables-and-assignment) — along with `gets()`
+  answering EOF with a `Status`, so the escape is no longer hypothetical and the
+  encoding cost has been paid. It does not change this analysis: a read at EOF
+  fails the presence-bind either way, so it is still the *blank line* that a
+  falsy `""` would stop the loop on.)
 
   **Independent of the flat soft bind above.** That construct is unambiguous with
   a distinct fallback word whether or not this changes, so the two should not be
@@ -7467,12 +7498,48 @@ to avoid" rather than promising the latter as done.
   *would* also disambiguate a fallback spelled `else` — that is why it appears in
   the other entry's list of ways out — but it should stand or fall on the `""`
   question alone.
-- **Stream absence is a `Status` — decided, not yet built.** A stream read that
+- **Stream absence is a `Status` — decided and built.** A stream read that
   has nothing left answers **`status(1)`**, not `false`. `gets()` at EOF is the
   case. [The absence rule](#variables-and-assignment) narrowed `false` to what
   *encodes* absence rather than what absence is, because the same value is also a
   predicate's complete answer and nothing can tell the two apart; this takes the
   encoding off `false` where the encoding was actually load-bearing.
+
+  **It shipped as a consequence rather than on its own.** Retiring `false` from
+  the absent set made this change *forced*: with a bound `false` taking the true
+  branch, a `gets()` that answered `false` would leave `while line = gets() { … }`
+  spinning forever. The entry below on the mark and the value is where that
+  decision is recorded; this one is what it obliged.
+
+  **And its scope note below is now the whole story rather than a carve-out.**
+  The rule this entry landed on — *`false` where the operation asks, a `Status`
+  where it reads* — no longer holds: `false` does not spell absence anywhere, so
+  an asking operation that means "no answer" says `fail` too. `:match` and
+  `:kind` keep answering `false`, but as the *answer* to a pass/fail question,
+  not as an absence a presence-bind will reject.
+
+  **And that reopens one idiom, which has to be settled before `:match` is
+  built** — raised in review, and the entry did not see it coming. The
+  [scalar named-capture bind](#destructuring),
+  `if m = $str:match(/(?<user>\w+)@…/) { puts $m.user }`, relied on the
+  no-match `false` failing the presence-bind. Now it binds, so the block runs on
+  a miss and reads `$m.user` off a boolean. **The list form is unaffected** —
+  `if [one two] = $str:match(…)` still skips, because a `false` is not a list and
+  the shape miss rejects it — so this is not "the presence-bind lost `:match`",
+  it is specifically the scalar bind having no shape to reject a miss with. Two
+  ways out, undecided:
+
+  1. **A `:match` miss answers a failing status.** The idiom works unchanged and
+     both forms agree. It costs the reading just argued for — matching stops
+     being a pass/fail question answered by a boolean — and it reaches `~`,
+     `:kind` and every other predicate by the same logic, or else splits them.
+  2. **`:match` keeps `false` and the idiom is respelled**, e.g. the list form,
+     or a narrowing that skips a non-map. That keeps the answer-not-absence
+     reading intact and costs the one-evaluation scalar capture, which is what
+     the shape existed for.
+
+  Nothing is broken today — `:match` arguments are unimplemented, so no script
+  can hit it — which is exactly why it is cheap to settle now rather than after.
 
   **The scope is narrow, and that is the first thing to say.** The
   [strict/soft pairs](#error-handling) mean absence is normally not *returned* at
@@ -7487,10 +7554,11 @@ to avoid" rather than promising the latter as done.
   matching twice. What separates them is not "can you ask ahead" but **what the
   operation is**: a match is a *question*, and `false` is its answer, which is why
   that section calls matching "a pass/fail operation". A read is not a question —
-  "give me the next line" has no false. So the rule this decision follows is
-  **`false` where the operation asks, a `Status` where it reads**, and `:match`
-  keeps its `false` under it. So does [`:kind`](#modifiers), and so does any
-  predicate. This decision reaches stream reads and nothing else.
+  "give me the next line" has no false. The rule this decision followed was
+  **`false` where the operation asks, a `Status` where it reads**; `false` has
+  since left the absent set entirely, so the surviving reading is that `:match`
+  and `:kind` answer `false` as an *answer*, not as an absence. This decision
+  reaches stream reads and nothing else.
 
   **Why.** It takes the double meaning off `false`, which is the whole point:
   after this, a `false` in hand is a boolean answer, full stop, and the
@@ -7612,12 +7680,13 @@ to avoid" rather than promising the latter as done.
   value is unrepresentable without a null. Absence is a value here; it is just no
   longer `false`.
 
-  **Not urgent.** The surface is one builtin plus the widening, and nothing is
-  built yet — `gets()` returns `false` in the code today.
+  **Not urgent.** The surface is one builtin plus the widening.
 - **Should stream absence be `none`, declared `str?`, rather than `status(1)`? —
-  open, written up, not decided.** The entry above chose a nonzero `Status` and is
-  **unbuilt**, so the spelling is still cheap to change: `gets()` would be written
-  once rather than written and rewritten. What follows is the case for `none`,
+  open, written up, not decided.** The entry above chose a nonzero `Status`, and
+  that has since **shipped** — `gets()` yields `status(1)` at EOF — so switching
+  to `none` would now be a rewrite rather than a first write. That is a cost this
+  entry did not carry when it was drafted, and a small one: the change is one
+  match arm and the tests pinning it. What follows is the case for `none`,
   with the alternatives kept beside it because none of them is ruled out.
 
   **The shape.** `none` is a value with its own literal, and the one-word return
@@ -7686,10 +7755,11 @@ to avoid" rather than promising the latter as done.
   restated rather than broken: **no *implicit* null.** An `Option` written in the
   type is what the languages usually credited with fixing null actually shipped;
   what they removed was the universal implicit kind. Also: a **third** member of
-  the absent set — the presence-bind already refuses `false` *and* every nonzero
+  the absent set — the presence-bind refuses every nonzero
   `Status`, and this proposal keeps the status refusal, so `none` joins rather
-  than replaces, and "what fails a presence-bind" grows to three answers unless
-  [`false` leaves](#modifiers); a migration for `:match` and `:kind` if absence
+  than replaces and "what fails a presence-bind" grows to two answers. (It would
+  have been three: `false` was refused there too, until it
+  [left the absent set](#variables-and-assignment).) A migration for `:match` and `:kind` if absence
   generalizes; and `?` is a glob metacharacter, though it sits in a fixed slot
   before `func`, so the lexer's job is bounded.
 
@@ -7933,7 +8003,8 @@ to avoid" rather than promising the latter as done.
   - **`bool`, because of the interim.** The interim exempts it so a fallible
     boolean function stays writable, and settling `false` removes the exemption
     — a `false` that no longer fails a presence-bind makes `bool?` workable and
-    the exemption unnecessary.
+    the exemption unnecessary. **Closed**: `false` has left the absent set, so
+    the interim is never needed and `bool` needs no exception.
   - **`any`, independently of all of it.** `declared_matches` accepts every
     value for `ReturnType::Value`, so `any func f() { fail 5 }` conforms no
     matter what `false` means. Settling `false` does nothing here; only
@@ -7944,6 +8015,8 @@ to avoid" rather than promising the latter as done.
   `any`, then ship the mark** — two prerequisites, not one, and the reverse of
   the ordering this entry proposes. Worth weighing against it: "ship the mark
   now" buys a rule with two holes in it, and only one of them closes on its own.
+  **The first prerequisite is done** — `false` is out of the absent set — so what
+  stands between here and the mark is `any` alone.
 
   ```mesh
   str? func find(k)      # may come up empty; `fail` is how it says so
@@ -7956,13 +8029,15 @@ to avoid" rather than promising the latter as done.
   doing an exception's or an `err`'s job; the question mark is doing an option's**
   — because the mark is about the *slot* and the status is about the *outcome*.
 
-  **`false` is a third spelling, and the mark has to say something about it.**
-  [The ask/read rule](#modifiers) leaves `false` as what an *asking* operation
-  answers, and the [presence-bind](#tests-and-comparisons) refuses it alongside a
-  failing status — so a marked func that forwards one,
-  `str? func first(s) { $s:match(/…/) }`, answers an absence the stated
-  `T | Status(n≠0)` does not admit. Raised in review. Three ways out, none picked
-  here:
+  **`false` was a third spelling, and the mark had to say something about it.**
+  The ask/read rule left `false` as what an *asking* operation answers, and the
+  [presence-bind](#tests-and-comparisons) refused it alongside a
+  failing status — so a marked func that forwarded one,
+  `str? func first(s) { $s:match(/…/) }`, answered an absence the stated
+  `T | Status(n≠0)` does not admit. Raised in review. Three ways out were listed;
+  **the repo owner took the third**, so `false` binds and takes the branch and the
+  presence-bind refuses a failing status and nothing else. The three, for the
+  record:
 
   1. **Admit it** — `T?` means `T | none | Status(n≠0) | false`, which is four
      arms and gives up on the mark naming one thing.
@@ -7971,9 +8046,14 @@ to avoid" rather than promising the latter as done.
      with the absent arm spelling whatever this entry settles on. That keeps
      `false` a *boolean answer*, which is what
      [the absence decision](#open-questions) narrowed it to.
-  3. **Retire `false` from the absent set entirely**, which the entry above
-     already lists as open — then the presence-bind refuses a `none` and a
-     failing status and nothing else.
+  3. **Retire `false` from the absent set entirely** — then the presence-bind
+     refuses a failing status and nothing else, plus a `none` if one is ever
+     minted. **Taken, and built**, and since there is no `none` today the
+     shipped rule is the failing status alone. The cost is an idiom change: `any func find-up(_n) { … else
+     { false } }` and `while n = nxt($n)` no longer signal absence with `false`
+     and must `fail` instead, and `gets()` at EOF was obliged to move with them.
+     The status **projection** is untouched — `false` still projects to `1`, so
+     `if pred { … }` and `pred && …` read the same as before.
 
   **Two and three are not the same work**, and an earlier draft here said they
   were. Raised in review. *Refuse it* is a rule about what a **declaration may
@@ -8036,15 +8116,17 @@ to avoid" rather than promising the latter as done.
   | exhaustive matching | one arm, exact | two arms, the second inexact | one arm, inexact — unsound as soon as `T` is `int` |
 
   **These are end states, and every one of them assumes `false` has been
-  *retired* from the absent set** — option 3 above, and only that one. Raised in
-  review twice: first against reading the columns beside the interim, where
+  *retired* from the absent set** — option 3 above, and only that one. **That
+  precondition is now met**, so the columns can be read as written rather than
+  beside an interim. It was raised in review twice: first against reading the
+  columns beside the interim, where
   `str? func f() { false }` is valid and the absence is `T | none | false`, so
-  no column's matching claim holds; then against offering *refuse it* as
-  sufficient. It is not. Refusing a `false` from a non-`bool` value func leaves
-  asking operations producing one, the presence-bind refusing one, and `bool`
-  containing one — so the exact-single-pattern claims still fail for `bool` and
-  for anything forwarding an ask. The interim is a way station, not a fourth
-  candidate; the comparison is between destinations, and it has a precondition.
+  no column's matching claim held; then against offering *refuse it* as
+  sufficient. It is not. Refusing a `false` from a non-`bool` value func would
+  leave asking operations producing one, the presence-bind refusing one, and
+  `bool` containing one — so the exact-single-pattern claims would still fail for
+  `bool` and for anything forwarding an ask. The interim was a way station, not a
+  fourth candidate; the comparison is between destinations.
 
   **A class pattern for "any failing status" already exists**, and earlier
   drafts of this entry said twice that it did not. `match_bindings` treats a
@@ -8123,6 +8205,13 @@ to avoid" rather than promising the latter as done.
   warn-and-hand-back, since a warning that hands the value over leaves the
   declaration meaning nothing. That refusal is a real behavior change with its own
   blast radius, and it is the prerequisite for the mark being worth writing.
+
+  **The interim branch below is spent — `false` has been settled.** It was the
+  answer to "what if the mark ships first", and the ordering above won instead:
+  `false` left the absent set before any of the mark was written, so the mark
+  will not ship with these exceptions in it. What follows is kept as the record
+  of why the ordering mattered, not as a live plan. Its conclusions still read
+  as conditionals: had the mark gone first, this is what it would have owed.
 
   **If the mark ships *before* `false` is settled, it needs an interim answer —
   and the rest of this bullet is that branch only.** Raised in review against

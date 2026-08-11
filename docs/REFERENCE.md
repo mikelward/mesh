@@ -1037,7 +1037,7 @@ argument by hand, and repeating it walks back through earlier commands.
 | `puts [arg …]` | Render each argument and print them separated by single spaces, then a newline. No arguments prints a blank line. Rendering is per value: a scalar as itself, a **list** as its elements joined by newlines, a **map** as `key: value` lines. A **nested** collection moves down a level — indented two spaces under its map key, or prefixed with a `- ` bullet as a list element, which is what keeps `[[1 2] [3 4]]` from printing exactly as the flat `[1 2 3 4]`. Depth is not capped. A value with no byte form — a job or stream handle, a function, a pattern — is a loud error rather than a guess, wherever it is nested. Unlike argv, `puts` sees the real value, so `puts $xs` needs no `...`; a *written* argument keeps its own text, so `puts 007` prints `007`. It takes no flags — so a [flag](#flags-and---) handed to it is an option it cannot match and is **reported**, exactly as a `func` with no such parameter reports one. `puts -- --force`, `puts "$x"` and `puts $x:repr` are the three ways to print one; a flag *inside* a collection is data being displayed and needs none of them. |
 | `print [arg …]` | The same as `puts` with **no trailing newline**, for partial lines. No arguments prints nothing. |
 | `gets [--nulls] [var]` | Read one line from stdin, strip its trailing newline, and bind it to `var`. **`--nulls` reads a NUL-terminated item instead** — what a `find -print0` stream needs, since a newline inside a name is data there and a line read tears the name in half. The separator is *named* rather than passed as a character because `\0` is not a string escape (a NUL crosses neither `execve` nor the environment), and `--nulls` is what the [`:nulls`](#modifiers) family already calls it. The delimiter is a terminator either way, so a final item without one is still an item. **At end of input the status is `1` and `var` is left unchanged**, which is what terminates `while gets line { … }`. An empty line is a successful read of `""` — a blank line mid-file must not end a loop — so only a zero-byte read ends it, and a final line with no trailing newline is still a line. A line that is not valid UTF-8 is **refused** rather than repaired — status `2`, and `var` is left alone — following the capture rather than `$env`'s lossy read; status `2` is also what an I/O error reports, so `1` means end of input and nothing else. Interactively, **Ctrl-C cancels a read** — status `130`, and `var` keeps whatever it held, since a cancelled read has read nothing. It reads a byte at a time, so the bytes after the line reach whatever runs next rather than being swallowed by a buffer. With no `var` it consumes the line and reports only whether there was one. |
-| `gets()` | The **value** form of the same read — parens attached, so it yields the line into an expression rather than reporting a status: `line = gets()`, `[k v] = gets():split("=")`, `while line = gets() { … }`. `gets(--nulls)` takes the one flag the command form does, so the composable spelling is not the one that cannot read a `-print0` stream. **At end of input it yields `false`**, which is what stops those loops: an [assignment as a condition](#conditionals) is true iff its right-hand side is truthy, and an empty line is a truthy `""`. It takes **no arguments** — the binding is the assignment it sits in, where the command form takes the name as an operand. Both spellings read through one reader, so everything above holds here: the byte-at-a-time read, the refusal of a non-UTF-8 line, and Ctrl-C cancelling. A failure **raises** rather than yielding, since `false` already means end of input. As the **last stage of a foreground pipeline** the read happens in the shell itself, so `cmd \| gets line` leaves `line` set — see [the last stage](#redirection). In an *earlier* stage, or a backgrounded one, it happens in a forked process and the binding dies with the stage, the same as any builtin. `cmd \| while line = gets() { … }` works for the same reason — a [compound statement is a stage](#redirection), so the loop runs in the shell and keeps what it counts. |
+| `gets()` | The **value** form of the same read — parens attached, so it yields the line into an expression rather than reporting a status: `line = gets()`, `[k v] = gets():split("=")`, `while line = gets() { … }`. `gets(--nulls)` takes the one flag the command form does, so the composable spelling is not the one that cannot read a `-print0` stream. **At end of input it yields `status(1)`**, which is what stops those loops: an [assignment as a condition](#conditionals) tests *presence*, and a nonzero status is the only absence — an empty line is a present `""`, and a `false` would bind and never end the loop. It takes **no arguments** — the binding is the assignment it sits in, where the command form takes the name as an operand. Both spellings read through one reader, so everything above holds here: the byte-at-a-time read, the refusal of a non-UTF-8 line, and Ctrl-C cancelling. A failure **raises** rather than yielding, since a failing status already means end of input. As the **last stage of a foreground pipeline** the read happens in the shell itself, so `cmd \| gets line` leaves `line` set — see [the last stage](#redirection). In an *earlier* stage, or a backgrounded one, it happens in a forked process and the binding dies with the stage, the same as any builtin. `cmd \| while line = gets() { … }` works for the same reason — a [compound statement is a stage](#redirection), so the loop runs in the shell and keeps what it counts. |
 | `style(text, fg: …, bg: …, bold: …)` | A [styled value](#styled-values) — text plus display attributes. A **value call**, parens attached, because a command position yields a status. Colors are the sixteen ANSI names: `black`, `red`, `green`, `yellow`, `blue`, `magenta`, `cyan`, `white`, `grey` (or `gray`, or `bright-black`), and `bright-` forms of the rest. |
 | `link(text, url)` | A [styled value](#styled-values) carrying an `OSC 8` hyperlink, so `text` is clickable. The url needs a **scheme** (`https://…`, `file://host/path`) and anything RFC 3986 forbids raw is percent-encoded, a space included; over 2083 encoded bytes is refused, since past a terminal's own limit the whole sequence — link text included — is dropped. |
 | `glob(pattern)` · `files(dir = ".")` · `dirs(dir = ".")` | The paths a pattern matches, and a directory's immediate files or subdirectories — a **list**, since these are [value calls](#the-glob-family) rather than commands. |
@@ -3430,25 +3430,29 @@ if [head ...tail] = $items { puts $head ...$tail }
 ```
 
 An **assignment condition over a value** asks whether there *is* one, not
-whether it is true: `false` is absent, and so is a nonzero status (below), so
-`""`, `[]` and `0` all bind and take the branch. That is what lets a function answer `false` for "found
-nothing" and be tested for it where bash would test a status — and what ends a
-`while` that binds its sentinel:
+whether it is true: a **nonzero status is the only absence**, so `false`, `""`,
+`[]` and `0` all bind and take the branch. That is what lets a function `fail`
+for "found nothing" and be tested for it where bash would test a status — and
+what ends a `while` that binds its sentinel:
 
 ```mesh
-any func find-up(_name) { … }          # a path, or `false` on a miss
+any func find-up(_name) { … }          # a path, or `fail` on a miss
 if path = find-up(Makefile) {
   puts "found $path"
 } else {
   puts "none above here"
 }
 
-while line = next-line() { puts $line }   # ends when `next-line` answers false
+while line = next-line() { puts $line }   # ends when `next-line` fails
 ```
 
-A **status** is the other value-level failure, so a failing one takes `else`
+`false` is **not** absent — it is a boolean answer, and this condition asks
+whether there is a value rather than whether the value is true — so
+`if x = false { … }` takes the *then* branch with `$x` bound to `false`.
+
+A failing status takes `else`
 here exactly as it does when it is the condition itself — otherwise `if s =
-f()` would succeed where `if f()` fails, on the same value. Like `false`, it
+f()` would succeed where `if f()` fails, on the same value. It
 **binds nothing**, so a name never comes back holding a failure:
 
 ```mesh

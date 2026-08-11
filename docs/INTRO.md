@@ -257,8 +257,8 @@ isn't there. Asking for a missing element is a bug and says so; when absence is
 An unset variable is the same: `$nope` is an error naming the name, never an
 empty word that quietly changes what a command sees.
 
-Reading input is the same story. `gets line` binds one whole line and reports
-**false** at end-of-input rather than `""`, so `while gets line { … }` ends
+Reading input is the same story. `gets line` binds one whole line and **fails**
+at end-of-input rather than handing back `""`, so `while gets line { … }` ends
 cleanly and a blank line is still a real `""` you can act on.
 
 ## Jobs and the prompt are first-class

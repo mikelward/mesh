@@ -16017,9 +16017,9 @@ fn a_later_sibling_stands_on_what_an_earlier_one_left() {
 
 #[test]
 fn an_assignment_condition_branches_on_a_status_without_binding_a_failing_one() {
-    // A status is the other value-level failure, so it answers here as it does
-    // when it *is* the condition — a nonzero one takes `else` — while `""`, `[]`
-    // and `0` are still present-and-bound, since only `false` is absent.
+    // A failing status is the absence, so it answers here as it does when it *is*
+    // the condition — a nonzero one takes `else` — while `false`, `""`, `[]` and
+    // `0` are all present-and-bound.
     //
     // A **failing** status binds nothing, so the name keeps what it held: the
     // `T | Status(n≠0)` widening lets a declared type answer one, and binding it
@@ -16032,12 +16032,12 @@ fn an_assignment_condition_branches_on_a_status_without_binding_a_failing_one() 
          if c = sh(\"-c\", \"exit 5\") { puts success } else { puts \"command keeps $c\" }\n\
          if e = \"\" { puts bound-empty }\n\
          if n = 0 { puts bound-zero }\n\
-         if b = false { puts bad } else { puts absent }\n",
+         if b = false { puts \"bound-false=$b\" } else { puts bad }\n",
     );
     assert_eq!(
         String::from_utf8_lossy(&out.stdout),
         "failure keeps before\nsuccess with status(0)\ncommand keeps before\n\
-         bound-empty\nbound-zero\nabsent\n",
+         bound-empty\nbound-zero\nbound-false=false\n",
         "{}",
         String::from_utf8_lossy(&out.stderr)
     );
@@ -16111,16 +16111,18 @@ fn a_rejected_status_publishes_its_code_to_the_branch_it_picks() {
     );
 
     // **Every** binding-condition path publishes, not just the failing-status
-    // one. A `false`-returning call and a list-pattern condition each returned
-    // from `condition_status` before the recording step, so they still showed
+    // one. The plain bind and the two list-pattern answers each returned from
+    // `condition_status` before the recording step, so they still showed
     // unrelated history while their statement forms reported `0`. Raised in
-    // review — the first fix closed one early return of three.
+    // review — the first fix closed one early return of three. `f` answers
+    // `false`, which binds and takes the true branch, so the reading is taken
+    // there.
     let paths = run_with_input(
         "any func f() { false }\n\
          any func g() { [1] }\n\
          any func h() { [1 2] }\n\
          sh -c \"exit 7\"\n\
-         if x = f() { puts t } else { puts \"false-cond $sh.status\" }\n\
+         if x = f() { puts \"bound-cond $sh.status\" } else { puts bad }\n\
          sh -c \"exit 7\"\n\
          if [y] = g() { puts \"list-match $sh.status\" } else { puts e }\n\
          sh -c \"exit 7\"\n\
@@ -16128,7 +16130,7 @@ fn a_rejected_status_publishes_its_code_to_the_branch_it_picks() {
     );
     assert_eq!(
         String::from_utf8_lossy(&paths.stdout),
-        "false-cond 0\nlist-match 0\nlist-miss 0\n",
+        "bound-cond 0\nlist-match 0\nlist-miss 0\n",
         "{}",
         String::from_utf8_lossy(&paths.stderr)
     );
@@ -18123,8 +18125,10 @@ fn a_bare_return_carries_the_result_so_far() {
 #[test]
 fn a_result_reports_the_status_view_of_its_value() {
     // An expression statement's status is the view of its value (`DESIGN.md`):
-    // only `false` fails, because `false` is mesh's "no result". Every other value
-    // is a result, and producing one is success. That holds for a value call, for a
+    // only `false` fails, because it is what a failing predicate answers. Every
+    // other value is a result, and producing one is success. (`false` is *not* an
+    // absence — that is a failing status, and only that — so this projection and
+    // the presence-bind disagree about it on purpose.) That holds for a value call, for a
     // command-mode call whose body ends in an implicit value, and for a bare
     // expression — and `fail` is the separate spelling for naming a status.
     let out = run_with_input(
@@ -23044,11 +23048,14 @@ fn if_binding_a_capture_branches_on_the_status_with_the_output_bound() {
 #[test]
 fn an_assignment_condition_over_a_value_tests_presence_not_truth() {
     // `DESIGN.md` §"Empty `\"\"` / `[]` truthiness": the assignment-condition RHS
-    // "tests *presence* rather than truth … only `false` is absent, so `\"\"`,
-    // `[]` and `0` all bind and take the branch." Every row is the same `if`, so
-    // the table is the rule: one absent value, and everything else a result.
+    // "tests *presence* rather than truth". A failing status is the only absence,
+    // so `false`, `\"\"`, `[]` and `0` all bind and take the branch. Every row is
+    // the same `if`, so the table is the rule: one absent value, and everything
+    // else a result — `false` included, since it is an answer and not the lack of
+    // one.
     for (rhs, expected) in [
-        ("false", "absent"),
+        ("status(1)", "absent"),
+        ("false", "present"),
         ("true", "present"),
         ("\"\"", "present"),
         ("0", "present"),
@@ -23074,19 +23081,21 @@ fn an_absent_assignment_condition_leaves_the_name_as_it_was() {
     // `else` without changing any bindings", and `gets` at end of input leaves
     // `var` unchanged. So the `else` reads what the name held, never the
     // sentinel that ended the test.
-    let out = run_with_input("x = kept\nif x = false { puts then } else { puts \"else=[$x]\" }\n");
+    let out =
+        run_with_input("x = kept\nif x = status(1) { puts then } else { puts \"else=[$x]\" }\n");
     assert_eq!(String::from_utf8_lossy(&out.stdout), "else=[kept]\n");
     assert!(out.stderr.is_empty(), "{:?}", out.stderr);
 }
 
 #[test]
-fn a_function_answering_false_ends_a_while_that_binds_it() {
+fn a_function_that_fails_ends_a_while_that_binds_it() {
     // The shape `DESIGN.md` pins the contract on. Reporting the *assignment's*
     // status made every such condition true, so the loop ran one pass past the
-    // end, bound the sentinel, and then tripped over it comparing `false` to an
-    // integer.
+    // end, bound the sentinel, and then tripped over it comparing the sentinel to
+    // an integer. A generator says "no more" with `fail`: `false` is an answer
+    // that binds, so ending on one would spin here forever.
     let out = run_with_input(
-        "any func nxt(_n) { if $_n < 3 { $_n + 1 } else { false } }\n\
+        "any func nxt(_n) { if $_n < 3 { $_n + 1 } else { fail } }\n\
          n = 0\n\
          while n = nxt($n) { puts \"n=$n\" }\n\
          puts \"done n=$n\"\n",
@@ -23099,10 +23108,10 @@ fn a_function_answering_false_ends_a_while_that_binds_it() {
 }
 
 #[test]
-fn a_value_function_answering_false_is_testable_where_bash_tests_a_status() {
+fn a_value_function_that_fails_is_testable_where_bash_tests_a_status() {
     // Rough edge 25's motivating idiom, `find_up x && …`. Both spellings reach
-    // the same answer: the binding condition, and the status `false` carries.
-    let script = "any func find-up(_n) { if $_n == \"yes\" { \"/found\" } else { false } }\n";
+    // the same answer: the binding condition, and the status the `fail` carries.
+    let script = "any func find-up(_n) { if $_n == \"yes\" { \"/found\" } else { fail } }\n";
 
     let bound = run_with_input(&format!(
         "{script}\
@@ -23117,6 +23126,29 @@ fn a_value_function_answering_false_is_testable_where_bash_tests_a_status() {
          find-up(no) && puts no-branch\n"
     ));
     assert_eq!(String::from_utf8_lossy(&chained.stdout), "yes-branch\n");
+}
+
+#[test]
+fn a_predicate_answering_false_still_fails_a_condition_but_binds_a_presence_test() {
+    // The two relations disagree about `false` on purpose, which is the whole of
+    // what retiring it from the absent set changed. The **projection** is
+    // untouched: a `bool func` tailing in `false` still reports a nonzero status,
+    // so `if pred { … }` and `pred && …` read as they always did. The
+    // **presence-bind** is what moved: `false` is an answer, so it binds and takes
+    // the true branch, where it used to select `else` and leave the name alone.
+    let out = run_with_input(
+        "bool func pred(_p) { $_p }\n\
+         if pred(false) { puts cond-true } else { puts cond-false }\n\
+         pred(false) && puts chained\n\
+         if answer = pred(false) { puts \"bound=$answer\" } else { puts absent }\n",
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "cond-false\nbound=false\n",
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(out.stderr.is_empty(), "{:?}", out.stderr);
 }
 
 #[test]
@@ -23155,7 +23187,7 @@ fn not_negates_a_presence_test_inside_a_while() {
     // otherwise — a presence test always runs. Raised in review.
     let enters = run_with_input(
         "i = 0\n\
-         while not x = false { i = $i + 1 ; if $i > 2 { break } ; puts \"pass $i\" }\n\
+         while not x = status(1) { i = $i + 1 ; if $i > 2 { break } ; puts \"pass $i\" }\n\
          puts \"done i=$i\"\n",
     );
     assert_eq!(
@@ -23174,7 +23206,7 @@ fn not_negates_a_presence_test_inside_a_while() {
 
     // The same test outside a loop, where `produced` happened to be set, worked
     // before the fix and must keep working.
-    let absent = run_with_input("if not x = false { puts then } else { puts else }\n");
+    let absent = run_with_input("if not x = status(1) { puts then } else { puts else }\n");
     assert_eq!(String::from_utf8_lossy(&absent.stdout), "then\n");
     let present = run_with_input("if not x = true { puts then } else { puts else }\n");
     assert_eq!(String::from_utf8_lossy(&present.stdout), "else\n");
@@ -32919,10 +32951,11 @@ fn run_source_with_stdin(source: &str, bytes: &[u8]) -> Output {
 /// The **value** form: `gets()` yields the line into an expression, which is what
 /// makes a read compose (`DESIGN.md` §"Builtins").
 ///
-/// The loop terminates on the `false` that end of input yields, *not* on an empty
-/// string: `lhs = rhs` is true iff the right-hand side is truthy, and a blank line
-/// is a truthy `""`. That is the same line the command form draws between statuses
-/// `0` and `1`, so the two spellings agree about where the input ends.
+/// The loop terminates on the failing status that end of input yields, *not* on an
+/// empty string: a binding condition tests presence, and a blank line is a present
+/// `""`. That is the same line the command form draws between statuses `0` and `1`,
+/// so the two spellings agree about where the input ends. The status is what makes
+/// the end an *absence* — a `false` would bind and the loop would never stop.
 #[test]
 fn the_gets_value_form_yields_the_line() {
     let out = run_source_with_stdin(
@@ -32931,7 +32964,7 @@ fn the_gets_value_form_yields_the_line() {
     );
     assert_eq!(
         String::from_utf8_lossy(&out.stdout),
-        "[a]\n[]\n[b]\nfalse\n",
+        "[a]\n[]\n[b]\nstatus(1)\n",
         "{}",
         String::from_utf8_lossy(&out.stderr)
     );
@@ -33114,8 +33147,9 @@ fn the_gets_value_form_captures_as_a_call() {
 }
 
 /// A line that is not UTF-8 is refused in the value form too, and **raises**
-/// rather than yielding: `false` means end of input here, and a failure that
-/// yielded it would end a `while line = gets()` as though the input had run out.
+/// rather than yielding: a failing status means end of input here, and a failure
+/// that yielded one would end a `while line = gets()` as though the input had run
+/// out.
 #[test]
 fn the_gets_value_form_refuses_a_non_utf8_line() {
     let out = run_source_with_stdin("x = kept\nx = gets()\nputs \"x=$x\"\n", b"a\xffb\n");
@@ -35679,7 +35713,7 @@ fn the_branch_check_stays_out_of_everything_it_cannot_see() {
         // answering `false` to end a `while` is an idiom `DESIGN.md` pins a
         // contract on. Whether that idiom should be exempt is a language
         // question, not one to settle by widening a lint.
-        "any func nx(_n) { if $_n < 3 { $_n + 1 } else { false } }\nn = 0\nwhile n = nx($n) { }\n",
+        "any func nx(_n) { if $_n < 3 { $_n + 1 } else { fail } }\nn = 0\nwhile n = nx($n) { }\n",
         // **A key is a string, and a collection or a function is not one.**
         "p = false\nx = if $p { [[]: 1] } else { \"s\" }\n",
         "p = false\nx = if $p { [[a: 1]: 1] } else { \"s\" }\n",
