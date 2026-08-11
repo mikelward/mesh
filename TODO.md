@@ -133,7 +133,7 @@ Delete an entry once you have agreed with it or reversed it.
       `Value` equality.** Codex found that making the underlying equality raise
       breaks three things that reuse it — `:dedup` is a `HashSet<Value>` whose
       `Eq` can only answer a bool, list `-` is defined as the same equality
-      (`DESIGN.md`:1270), and `match` literal arms are `==` under first-match
+      (`DESIGN.md`:1612), and `match` literal arms are `==` under first-match
       traversal, so a `match` with both a `"--help"` arm and a `--help` arm
       would raise on whichever came first and make the correct one unreachable.
       *(The first two are about **today's code**, not the language — see
@@ -4454,14 +4454,14 @@ thing a reader takes on trust.*
           and never a stringified `a b`. This is #361's rule relocated: an
           option's value must be one scalar, so `f(--tag=*.txt)` reports
           rather than binding a match or dropping the option
-          (`DESIGN.md`:2957, `REFERENCE.md`:3084). Typed flags move where
+          (`DESIGN.md`:3021, `REFERENCE.md`:3084). Typed flags move where
           that check runs — call site to construction site — and moving a
           validation must not weaken it. Construction is the better place:
           the diagnostic points at the line that made the mistake, which is
           the whole reason the value is captured at assignment.
         - *A payload, when there is one, stays a typed scalar rather than a
           string.* It types the way the written word already types, because
-          dashed and named options are the same option (`DESIGN.md`:3274), so
+          dashed and named options are the same option (`DESIGN.md`:3354), so
           `--n=2` holds the **integer** `2` — pinned today by
           `an_attached_flag_value_is_a_typed_scalar`. Storing `"2"` would
           break `x = --n=2; add $x` arithmetic, or force every consumer to
@@ -4470,10 +4470,10 @@ thing a reader takes on trust.*
         - *A bare flag has **no** payload — not a boolean one.* This is the
           "two states" of the decision above, and it must survive into the
           value: `--force` and `--force=true` are different flags and have to
-          render as themselves. `--force` ≡ `force: true` (`DESIGN.md`:2956)
+          render as themselves. `--force` ≡ `force: true` (`DESIGN.md`:3482)
           is what the flag means **once it binds to a switch**, not what it
           stores; a switch is bare-only and a valued flag is attached-only
-          (`DESIGN.md`:2950), so collapsing the bare state to a boolean
+          (`DESIGN.md`:3014), so collapsing the bare state to a boolean
           payload would both lose that distinction and make the text form
           print `--force=true` for a flag nobody wrote that way. Produce
           `true` at the binding, not at construction.
@@ -4520,7 +4520,7 @@ thing a reader takes on trust.*
 
         **`:repr` is not the text form**, and a flag is the value that makes
         the difference visible. `:repr`'s contract is round-trip *and of the
-        same type* (`DESIGN.md`:196), which is what forces `42` and `'42'`
+        same type* (`DESIGN.md`:193), which is what forces `42` and `'42'`
         apart. A flag's payload keeps the written word's type, and an
         interpolated one stays a string — pinned by
         `an_interpolated_flag_value_keeps_its_string_type` — so
@@ -4536,7 +4536,7 @@ thing a reader takes on trust.*
 
         The **spelling** of the value-type question is not decided, only its
         answer. `:type` is taken: it is the `find -type` word on a path
-        (`$p:type == dir`, `DESIGN.md`:3736, `REFERENCE.md`:2194). One
+        (`$p:type == dir`, `DESIGN.md`:5284, `REFERENCE.md`:2194). One
         spelling answering "what kind of value is this" on a flag and "what
         kind of file is this" on a string is itself the ambiguity this entry
         keeps refusing elsewhere, so it wants either a separate name for the
@@ -4545,18 +4545,30 @@ thing a reader takes on trust.*
         that is settled.
 
         `$x == "--tag=v2"` is an **error** rather than a silent `false`, and
-        this **revises the settled equality rule** rather than following from
-        it. `DESIGN.md`:1349 decides equality across mismatched nonnumeric
-        types as *false* — `1 == "1"` is false, deliberately — with
-        `1 == 1.0` the only proposed widening, which is itself **open, not
-        decided** (see the marker in `DESIGN.md` §Arithmetic, under the float entry); nothing in this
-        entry depends on how it lands. A flag would be the first
-        type for which `==` can *raise*, which is a real cost and the reason
-        to name it: every comparison site becomes fallible, where today only
-        arithmetic is.
+        this **follows from the settled equality rule** rather than revising
+        it. Three claims here said the opposite and are withdrawn (Codex,
+        #472): `DESIGN.md`:5356 has `==` **refuse** across types, showing
+        `1 == "1"` as *cannot compare an int with a string* — not the
+        deliberate `false` this paragraph asserted. So a flag is **not** the
+        first type whose `==` can raise, every comparison site is fallible
+        already, and the cost named here was the cost of a change that has
+        already happened. (The prose predates this branch; `main` changed the
+        rule under it, and this branch's re-anchoring pass pointed the citation
+        at the section without re-reading what the section now says — a content
+        check that matched the *heading* and not the assertion.) `1 == 1.0`
+        remains **open, not decided** (see the marker in `DESIGN.md`
+        §Arithmetic, under the float entry); nothing here depends on how it
+        lands.
 
-        The argument for paying it: `1 == "1"` is two pieces of ordinary data
-        and "no, different things" is a useful answer. A flag against its own
+        **What is actually at stake, restated.** Refusal is the default, so the
+        live question is the opposite of the one this entry used to ask: not
+        whether to *add* a refusal, but whether the flag-against-its-own-text
+        pair should be **declared an exception** to it, the way status/int is
+        the one declared cross-type pair. The rejected alternatives below are
+        exactly proposals for that carve-out.
+
+        The argument against carving it out: for two pieces of ordinary data,
+        an answer of some kind is at least conceivable. A flag against its own
         text form is not that. The string was written *because* someone
         believed it was the flag — the two render identically by construction
         (see the text-form decision above), so a `false` here reads as "not
@@ -4571,11 +4583,11 @@ thing a reader takes on trust.*
         that asks.
 
         **The refusal is on the `==` operator, not on `Value` equality.** This
-        is forced: `DESIGN.md`:1270 says list `-` compares elements by "the
+        is forced: `DESIGN.md`:1612 says list `-` compares elements by "the
         same equality `:dedup` and `==` use," `:dedup` is a `HashSet<Value>`
-        (`DESIGN.md`:1357) whose `Eq` can only answer a bool, and `match`
-        literal arms are defined in terms of `==` (`DESIGN.md`:3602) under
-        first-match traversal (:3566). Make the *underlying* equality raise
+        (`DESIGN.md`:1758) whose `Eq` can only answer a bool, and `match`
+        literal arms are defined in terms of `==` (`DESIGN.md`:4414) under
+        first-match traversal (:4329). Make the *underlying* equality raise
         and three things break at once: `[--help "--help"]:dedup` and
         `[--help] - ["--help"]` have nowhere to put the error and would
         silently answer "unequal" anyway, and a `match` with both a
@@ -4762,7 +4774,7 @@ thing a reader takes on trust.*
         call.** Raised by the repo owner against the reserved-name cost above,
         and it removes that cost outright — modifiers are a **closed, built-in
         namespace** (user-defined modifiers are their own open question,
-        `DESIGN.md`:3609), so `:flag` takes nothing out of the function namespace
+        `DESIGN.md`:3694), so `:flag` takes nothing out of the function namespace
         and `func flag(…)` keeps working.
 
         - **`:int` and `:bool` are the closer precedent.** `re()` exists because
@@ -4899,7 +4911,7 @@ thing a reader takes on trust.*
           (`call_func(name, args, !wrapper, shell)`, `repl.rs`:7313), so the
           guard is skipped entirely and `--` lands in positionals.
 
-        So `DESIGN.md`:4577's "who has options to end" describes the two
+        So `DESIGN.md`:6505's "who has options to end" describes the two
         *builtin* sites and does not extend to functions; the earlier claim
         here that this was `reads_options` reaching one more case was simply
         wrong. "Only the first `--` goes" does still cover repeats.
@@ -4930,13 +4942,13 @@ thing a reader takes on trust.*
           every match on a flag's name a nameless case to forget.
         - **Named `Value::FlagTerminator`**, with the value-type question
           answering `flag-terminator`. The short name is what mesh's prose
-          uses for `--` (`DESIGN.md`:2999, :4578) but is already overloaded
-          in this repo — **statement** terminator at :3516, :3681 and :5282,
-          and the split sense at :251 ("the delimiter is a terminator, not a
+          uses for `--` (`DESIGN.md`:3063, :5218) but is already overloaded
+          in this repo — **statement** terminator at :4350, :5205 and :7257,
+          and the split sense at :266 ("the delimiter is a terminator, not a
           separator") — so it needs the qualifier. Prior art does not supply
           a better one: POSIX gives `--` no single-word name, describing it
           as a *delimiter* marking the *end of options*, and `delimiter` is
-          exactly the word :251 has already spent. `EndOfOptions` was
+          exactly the word :266 has already spent. `EndOfOptions` was
           rejected for saying *options* where mesh predominantly says
           *flags*, and `FlagSentinel` for being implementation jargon rather
           than a name for the thing someone typed. *Low conviction on the
@@ -5077,14 +5089,14 @@ thing a reader takes on trust.*
       It is already the answer mesh keeps reaching independently, and the repo
       owner named it as a trend worth keeping. Genuine instances to cite:
       `if $xs` on a list is an error rather than a length test
-      (`DESIGN.md`:3415, alongside `if 0` and `if ""`); an option value that
+      (`DESIGN.md`:4239, alongside `if 0` and `if ""`); an option value that
       evaluates to something other than one string is reported rather than
       joined or dropped (#361); and now a flag compared against a string.
 
       Two things that look like instances and are **not**, worth naming in the
       write-up so the rule is not overclaimed. `007` is not one: mesh *picks*
       there — it is the string `007`, it binds, travels and runs as a command
-      (`DESIGN.md`:1427), and the only error is `007 + 1`, which is the
+      (`DESIGN.md`:1832), and the only error is `007 + 1`, which is the
       ordinary "a string is not a number" rule every string already follows.
       A glob that matches nothing is not one either: it is an empty list, a
       chosen answer rather than a refusal.
@@ -7235,7 +7247,7 @@ two other shells' answers turned out to be strictly better than ours.
       That sample excludes the shape the rule hits hardest — a **one-arm
       `match` whose arm is not an unguarded catch-all**, which is most of them
       in practice, since a one-arm form is the normal way this file and `docs/`
-      illustrate a rule (`DESIGN.md`:5016 is `match "x" { 0 => … }`, written to
+      illustrate a rule (`DESIGN.md`:5407 is `match "x" { 0 => … }`, written to
       show a miss). Not *every* one-arm site: `match 1 { _ => … }` is one arm
       and already exhaustive, as is a lone `"a" | _ => …` under the alternation
       rule above, and both need no edit — an earlier draft said one arm implied
@@ -8569,7 +8581,7 @@ the same web, and each correction after that has more sites to miss.
 
       **A range arm counts too, and an earlier inventory missed it** (Codex,
       #472): `match_bindings` evaluates a range to its integer values and does
-      `values.contains(subject)` (`repl.rs`:7725), so it rides the same equality
+      `values.contains(subject)` (`repl.rs`:7916), so it rides the same equality
       as everything else and `match $sh.status { 0..=255 => … }` — a spelling
       `DESIGN.md` §Matching confirms works today — becomes a miss. It is listed
       because a reader auditing for affected *spellings* would not think to look
@@ -8594,8 +8606,8 @@ the same web, and each correction after that has more sites to miss.
       **every one of them**, with no exception (Codex, #472; "all but one" here
       was itself a leftover from the draft where `:dedup` was the exception).
       `match_bindings` returns `Result<Option<…>,
-      Step>` (`repl.rs`:7698), `eval_binary` returns `Result<Value, String>`
-      (:8112), and `expand::has_value` and `apply_modifier` return `Result<_,
+      Step>` (`repl.rs`:7888), `eval_binary` returns `Result<Value, String>`
+      (:8317), and `expand::has_value` and `apply_modifier` return `Result<_,
       ExpandError>` (`expand.rs`:2512, :1747) — so an arm, `in`, `:has` and
       nested `==` all *could* report, and making them do so is precisely what
       option C is. **`:dedup` is not an exception either**, though two drafts of
@@ -10139,6 +10151,34 @@ a one-line edit. Every claim below was checked against the built shell.
 
 ## Decisions needed
 
+- [ ] **Six `DESIGN.md` citations in this file point at unrelated text, and
+      predate any branch that moved them.** Found by Codex on #472 while
+      checking that PR's re-anchoring pass, and confirmed against `origin/main`
+      rather than the branch: on `main`, `TODO.md`'s citation for *"list `-` is
+      defined as the same equality"* reads `DESIGN.md`:1270, which is the
+      function-declaration-order example. It is rot in this file, not damage
+      from a rebase.
+
+      Eight were re-derived from target *content* on #472 — list `-` (twice),
+      `:dedup`'s `HashSet`, `--force` ≡ `force: true`, the literal-arm rule,
+      `if $xs`, `007`, "who has options to end" — plus the cross-type equality
+      section. **These six could not be**, because the sentence each one cites
+      no longer appears in `DESIGN.md` in a form that can be matched:
+
+      - `:3021` — *"rather than binding a match or dropping the option"*
+      - `:3354` — *"dashed and named options are the same option"*
+      - `:3014` — *"a switch is bare-only and a valued flag is attached-only"*
+      - `:3063` and `:5218` — the short name mesh's prose uses for `--`
+      - `:3694` — *"user-defined modifiers are their own open question"*, where
+        the **claim** is stale rather than the number: declaring a modifier is
+        recorded as *decided* at `DESIGN.md`:1226.
+
+      They need someone who knows what each sentence was pointing at, which is
+      why they are filed rather than guessed. The general lesson is in #472's
+      citation commit: verifying that a citation still points at *the same text
+      as before* preserves a wrong citation perfectly, so the check has to be
+      against the claim, not against the previous target.
+
 - [ ] **What is the absence ultimately called?** Filed by mikelward when the
       value-versus-answer rule landed: everywhere an operation used to answer
       `false` for "nothing to give you" it now `fail`s, and that is a decision
@@ -10362,7 +10402,7 @@ a one-line edit. Every claim below was checked against the built shell.
       **Whether there is a *seventh* answer is open, and it blocks calling
       these six exhaustive.** `main` adopted, in `3d033ff`, *an operation that
       hands back a value fails when it has none; a predicate answering no keeps
-      `false`* (`DESIGN.md`:8169). An expression-position `match` that hits no
+      `false`* (`DESIGN.md`:8211). An expression-position `match` that hits no
       arm hands back a value and has none, so by the letter of that rule it
       should **fail** — and that is not among A–F, since A, C and F all preserve
       the `""`. Either the rule reaches `match`, in which case failure-on-miss
@@ -10408,7 +10448,7 @@ a one-line edit. Every claim below was checked against the built shell.
         match aborts the whole construct rather than being skipped. **Guards do
         not rescue it**, which an earlier draft implied (Codex, #472):
         `eval_match_expr` runs `match_bindings` *before* evaluating an arm's
-        guard (`repl.rs`:7663 and :7672), so an incompatible literal arm aborts
+        guard (`repl.rs`:7847 and :7856), so an incompatible literal arm aborts
         before its guard is reached.
 
         **What C forecloses is narrower than that sentence, though — a
@@ -10464,7 +10504,7 @@ a one-line edit. Every claim below was checked against the built shell.
 
         **And the total arm has to be *unguarded*** (Codex, #472). A failed
         guard is not a taken arm: `eval_match_expr` restores the bindings and
-        `continue`s to the next arm (`repl.rs`:7870-7873), so `status(n) if
+        `continue`s to the next arm (`repl.rs`:7871-7873), so `status(n) if
         false` leaves the subject to meet the incompatible literal below it and
         abort under C, exactly as if the total arm were not there. Verified with
         a pattern that exists today — `match f() { status(1) if false => … ;
@@ -10500,7 +10540,7 @@ a one-line edit. Every claim below was checked against the built shell.
         - an arm, `in`, and `:has`, the last being `in`'s modifier spelling
           over the same `values.contains`;
         - **nested `==`**, since `eval_binary` returns a `Result`
-          (`repl.rs`:8112), so its `Equal` / `NotEqual` paths can run a
+          (`repl.rs`:8317), so its `Equal` / `NotEqual` paths can run a
           recursive fallible comparator while `Value::eq` stays total — but
           **that comparator short-circuits, and C's promise has to be written
           around it** (Codex, #472). `[0 "x"] == [1 2]` answers `false` at the
