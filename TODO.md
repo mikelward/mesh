@@ -720,8 +720,10 @@ Delete an entry once you have agreed with it or reversed it.
         *question* in a form the guards cannot use. Three differences, each
         checkable:
 
-        - **Vocabulary.** `:kind` is `keyword | builtin | func | external |
-          false` (`DESIGN.md` §"Predicate vocabulary"); `-t` is bash's
+        - **Vocabulary.** `:kind` is `keyword | builtin | func | external`, and
+          it **fails** on a name that resolves to none of them
+          (`DESIGN.md` §"Predicate vocabulary" — it answered `false` there until
+          `false` left the absent set); `-t` is bash's
           `keyword | builtin | function | file | variable`. `func`/`function`
           and `external`/`file` are **spelling** — a slashed receiver is
           "external-or-nothing" for `:kind`, so an executable path operand and a
@@ -731,7 +733,9 @@ Delete an entry once you have agreed with it or reversed it.
           written against one still does not port, but because the tokens
           differ, not because the categories do.
         - **Position.** `:kind` yields a value in expression position —
-          `if $e:kind != false` — and **maps over a list**, which is the shape
+          `if k = $e:kind`, a presence-bind, since a resolved `:kind` is a
+          *string* and a bare condition would error on exactly the candidate
+          that resolved — and **maps over a list**, which is the shape
           the config sites take (`for e in [vi vim editline] { … }`). `-t` takes
           `NAME …` and answers per name, so `$(type -t ...$xs):lines` is one
           capture rather than one each — but it **loses alignment**: a name that
@@ -2273,26 +2277,23 @@ designed, and the cross-references say where the fuller note lives.
       than a boolean. Decide what a non-match yields and whether group 0 leads
       the list.
 
-      **What a non-match yields is no longer a free choice, and this is now a
-      blocker rather than a detail.** Raised in review on the PR that retired
-      `false` from the absent set. The old answer was `false`, on the grounds
-      that `if [k v] = $line:match(/…/)` is then the soft form — and it still is,
-      because a `false` is not a list, so the shape miss selects `else`. But the
-      **scalar named-capture bind** has no shape to reject a miss with:
+      **What a non-match yields is decided: it `fail`s.** Raised in review on the
+      PR that retired `false` from the absent set. The old answer was `false`, on
+      the grounds that `if [k v] = $line:match(/…/)` is then the soft form — and
+      that much still worked, because a `false` is not a list, so the shape miss
+      selects `else`. But the **scalar named-capture bind** has no shape to
+      reject a miss with:
 
       ```mesh
       if m = $str:match(/(?<user>\w+)@(?<host>\S+)/) { puts $m.user }
       ```
 
-      With `false` binding, that enters the block on a miss and reads `$m.user`
-      off a boolean. So either a `:match` miss answers a **failing status** — the
-      idiom works unchanged, both forms agree, and the cost is that matching
-      stops being a pass/fail question answered by a boolean, which reaches `~`
-      and `:kind` by the same logic — or `:match` keeps `false` and the scalar
-      idiom is respelled, which costs the one-evaluation capture the shape exists
-      for. `docs/DESIGN.md` §"Open questions" writes both out. Nothing is broken
-      today because the modifier is unimplemented, which is why it is cheap to
-      settle before building rather than after.
+      With `false` binding, that entered the block on a miss and read `$m.user`
+      off a boolean. The repo owner's rule: **an operation that hands back a
+      value fails when it has none; a predicate answering no keeps `false`.** So
+      a `:match` miss fails, and both forms agree again. `~`, `:has` and
+      `:exists` are unaffected — their `false` *is* the result. See
+      `docs/DESIGN.md` §"Open questions" for the rule and the table.
 - [x] **The spread of an argument-taking modifier at a command boundary.**
       *(Built.)* `puts ...$x:split(":")` was a syntax error. `CommandItem::Value` had
       no spread variant — `UnaryOp::Spread` is produced by the parser and
@@ -2828,9 +2829,11 @@ designed, and the cross-references say where the fuller note lives.
 
 - [ ] **`:kind` and `:where`** — the name-resolution half of the predicate
       vocabulary, spelled out in `DESIGN.md` §"Name resolution". `$name:kind`
-      gives `keyword` / `builtin` / `func` / `external` / `false` and
+      gives `keyword` / `builtin` / `func` / `external` — and **fails** on a name
+      that resolves to none of them, since `false`
+      [left the absent set](../docs/DESIGN.md) — and
       `$name:where` gives an
-      external's path, which between them are `have_command` (`$x:kind != false`),
+      external's path, which between them are `have_command` (`if k = $x:kind`),
       `is_builtin`, `is_function`, `is_command` and `path` — 41 guard sites in the
       `shrc` this is for, nearly all `if have_command X`.
 
@@ -2844,7 +2847,7 @@ designed, and the cross-references say where the fuller note lives.
 
         ```
         if type --quiet fzf { … }          # against  if have_command fzf
-        if shpool:kind != false { … }      # what this item proposes
+        if kind = shpool:kind { … }        # what this item proposes
         ```
 
         It also settles, by reporting **both** rather than choosing, the two
@@ -2970,12 +2973,12 @@ designed, and the cross-references say where the fuller note lives.
         entry got it wrong twice, missing `not` on one pass and
         `in` / `and` / `or` / `re` / the value names on the next. Ask the owning
         predicate. The invariant to test is narrow, and the exact width matters:
-        **`:kind` never answers `false` for a word the shell claims in command
+        **`:kind` never fails for a word the shell claims in command
         position** — *not* "a word the shell handles", which is wider and false.
-        `and` is handled as infix syntax, and `and:kind` is correctly `false`
+        `and` is handled as infix syntax, and `and:kind` correctly fails
         where no such program exists. Writing the invariant the wide way drives
         the implementation back to calling mid-form words `keyword`, so assert
-        the narrow one: `if:kind` is never `false`, `and:kind` may be.
+        the narrow one: `if:kind` never fails, `and:kind` may.
   - [ ] **Do not "fix" the expanded path to match.** Quoted into command
         position, every keyword but `return` falls through to external lookup on
         `main` today:
@@ -3029,7 +3032,7 @@ designed, and the cross-references say where the fuller note lives.
         `command not found` (or the name's own program running) means it did.
         `break`, `continue` and `return` parse fine and object about *context*
         (`break: not inside a loop`), so a syntax-error test would file them
-        under resolution and let `:kind` answer `false` — the one thing the
+        under resolution and let `:kind` fail — the one thing the
         invariant forbids.
         Build the `:kind` view from command-position claims — not from
         `RESERVED_FUNCTION_NAMES` (wider by the value names) nor from the
@@ -3349,7 +3352,7 @@ designed, and the cross-references say where the fuller note lives.
         `x = not:upper` evaluates to `false` — so a guard over it reads as "no
         such name" forever. With an unknown name it errors, so the two halves of
         `not` misbehave differently and both need pinning. Note this also breaks the entry's own
-        recommended guard — `if if:kind != false { … }` is currently
+        recommended guard — `if kind = if:kind { … }` is currently
         `unexpected end of input`. Every other reserved word (`while`, `loop`,
         `return`, `break`, `continue`, `global`, `unset`, `export`, `func`, `and`,
         `fork`) already takes the ordinary path, so this is a four-name carve-out,
@@ -9722,6 +9725,31 @@ a one-line edit. Every claim below was checked against the built shell.
   pass-through as a footgun.
 
 ## Decisions needed
+
+- [ ] **What is the absence ultimately called?** Filed by mikelward when the
+      value-versus-answer rule landed: everywhere an operation used to answer
+      `false` for "nothing to give you" it now `fail`s, and that is a decision
+      about *which channel* absence lives on, deliberately taken without
+      deciding **what the thing on that channel is named**. Today it is a
+      failing `Status` and nothing else — but the candidates are a `none` value,
+      a reserved status code that means absence rather than failure, or exactly
+      what is there now.
+
+      The work is already written up and does not need repeating here:
+      `docs/DESIGN.md`'s mark-versus-value entry compares the three end states
+      (`T | none`, `T | none | Status(n≠0)`, `T | Status(n≠0)`) on precision
+      against information — a `none` matches exactly and is told apart from a
+      real failure but says nothing about why; a status says why and is
+      matchable only by `1..=255`, which cannot tell it from an `int`. What this
+      entry adds is the **new evidence**: the rule now routes `:match`, `:where`
+      and `:kind` misses onto that channel too, so "EOF versus a failed command"
+      becomes "a miss versus a failure" at four call sites rather than one, which
+      is the column the `none` case was always strongest in.
+
+      Deciding it does not block anything — the three modifiers can be built
+      failing, and whatever absence settles on is what they will be failing
+      *with*. Deciding it late is what costs: each of them then has a pinned
+      contract to migrate.
 
 - [ ] **Should `status` be renamed `error`?** Raised by mikelward alongside the
       absence-spelling decision, and deferred there rather than answered: *a
