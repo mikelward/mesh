@@ -2270,8 +2270,29 @@ designed, and the cross-references say where the fuller note lives.
       strict/soft destructuring pair is built for. The `~` operator already tests
       a regex and the replace family already takes a `/…/` **match slot**, so the
       regex plumbing is in place; what is missing is returning the groups rather
-      than a boolean. Decide what a non-match yields (`false`, so `if [k v] =` is
-      the soft form) and whether group 0 leads the list.
+      than a boolean. Decide what a non-match yields and whether group 0 leads
+      the list.
+
+      **What a non-match yields is no longer a free choice, and this is now a
+      blocker rather than a detail.** Raised in review on the PR that retired
+      `false` from the absent set. The old answer was `false`, on the grounds
+      that `if [k v] = $line:match(/…/)` is then the soft form — and it still is,
+      because a `false` is not a list, so the shape miss selects `else`. But the
+      **scalar named-capture bind** has no shape to reject a miss with:
+
+      ```mesh
+      if m = $str:match(/(?<user>\w+)@(?<host>\S+)/) { puts $m.user }
+      ```
+
+      With `false` binding, that enters the block on a miss and reads `$m.user`
+      off a boolean. So either a `:match` miss answers a **failing status** — the
+      idiom works unchanged, both forms agree, and the cost is that matching
+      stops being a pass/fail question answered by a boolean, which reaches `~`
+      and `:kind` by the same logic — or `:match` keeps `false` and the scalar
+      idiom is respelled, which costs the one-evaluation capture the shape exists
+      for. `docs/DESIGN.md` §"Open questions" writes both out. Nothing is broken
+      today because the modifier is unimplemented, which is why it is cheap to
+      settle before building rather than after.
 - [x] **The spread of an argument-taking modifier at a command boundary.**
       *(Built.)* `puts ...$x:split(":")` was a syntax error. `CommandItem::Value` had
       no spread variant — `UnaryOp::Spread` is produced by the parser and
@@ -2305,10 +2326,13 @@ designed, and the cross-references say where the fuller note lives.
       and each form says that in its own vocabulary — a status and a binding, or
       a value. So the byte-at-a-time read, the non-UTF-8 refusal, the stdin line
       counting and Ctrl-C cancelling are inherited rather than restated, and the
-      two cannot drift about where the input ends. **EOF yields `false`**, not
-      `""`, which is what stops the loops: the assignment-as-condition rule is
-      true iff the RHS is truthy and a blank line is a truthy `""`. A read
-      *failure* raises instead of yielding, since `false` is already spoken for.
+      two cannot drift about where the input ends. **EOF yields `status(1)`**,
+      not `""` and not `false`, which is what stops the loops: the
+      assignment-as-condition rule tests presence, a blank line is a present
+      `""`, and a failing status is the only absence. (It yielded `false` until
+      `false` left the absent set, which forced the move — a bound `false` takes
+      the true branch, so the loop would never end.) A read *failure* raises
+      instead of yielding, since the failing status is already spoken for.
 
       `gets` is the first builtin with **both** spellings, which needed one new
       idea rather than a `Claim::ValueCall` — those names are *only* calls
@@ -3196,7 +3220,7 @@ designed, and the cross-references say where the fuller note lives.
         Bears on the `:where` question above in two directions: a direct path has
         no `PATH` answer at all, and where it does search `PATH`, "searches
         `PATH`" is not a specification until it says "the way `execvp` does".
-  - [ ] Absent is **`false`**, not an error, unlike `:type`. Worth a test that
+  - [ ] A miss answers **`false`**, not an error, unlike `:type`. Worth a test that
         pins it beside `:type`'s error, since the two siblings deliberately
         differ.
 
@@ -5393,10 +5417,13 @@ thing a reader takes on trust.*
       mismatch "selects `else` without changing any bindings", and `gets` at end
       of input leaves `var` unchanged.
 
-      **Since amended:** a nonzero `Status` joins `false` on the absent side —
-      it takes `else` and binds nothing — so that a declared type widened to
-      `T | Status(n≠0)` cannot leave a `Status` in, say, a `str`-typed name.
-      A **successful** status is still an ordinary value and binds.
+      **Since amended twice.** First, a nonzero `Status` joined `false` on the
+      absent side — it takes `else` and binds nothing — so that a declared type
+      widened to `T | Status(n≠0)` cannot leave a `Status` in, say, a `str`-typed
+      name. A **successful** status is still an ordinary value and binds. Then
+      `false` **left** the absent side, so a failing status is the only absence:
+      the arm described above no longer answers `1` for a `false`, and the
+      generator in the reproduction ends with `fail` rather than `false`.
 
       - [ ] **Reading a rejected code back costs something whichever way you
             reach for it**, and what the complete routes cost is either
@@ -5409,6 +5436,18 @@ thing a reader takes on trust.*
             missing; what is missing keeps turning out smaller, and the
             honest version of the complaint is now about **ergonomics**
             rather than capability.
+
+            **Amended, and it narrows again: there is only one absence
+            spelling now.** `false` has left the absent set, so every
+            "code from a `false`" column below is asking about a value the
+            presence-bind no longer rejects — a `false` binds and takes the
+            *true* branch, and there is no rejected code to read. What
+            survives of the entry is the `Status` half, where all five routes
+            still work and the knowledge cost the two `match` routes carried
+            is gone with the arm that had to name `false`. Hole 1, below, is
+            closed by the same change rather than by anything done to it. The
+            `false` columns are left in place as the record of what the entry
+            was about.
 
             | | code from a `Status` | value on success | code from a `false` | costs |
             |---|---|---|---|---|
@@ -6420,24 +6459,24 @@ entry records what each costs.
             The cost of leaving it: `if $p { $n + 1 } else { "s" }` is silent,
             which is a real disagreement the check would otherwise catch.
 
-            **Since written, the sentinel has a second spelling — decided, and
-            for reads still unbuilt.** `DESIGN.md`'s stream-absence decision
-            makes a read with nothing left answer a nonzero `Status` rather than
-            `false`, and the presence-bind refuses a failing status exactly as it
-            refuses a `false` — *that* half shipped. The read half has **not**:
-            `eval_gets` still maps `LineRead::End` to `Value::Boolean(false)`,
-            pinned by its own test, and the entry is marked "not yet built" on
-            purpose. So option 2's precondition is **decided rather than met**,
-            and the `gets()` work is outstanding rather than done — do not read
-            this note as closing it.
+            **Since written, the sentinel has only one spelling.**
+            `DESIGN.md`'s stream-absence decision makes a read with nothing left
+            answer a nonzero `Status` rather than `false`, and `false` has since
+            left the absent set entirely — so the presence-bind refuses a failing
+            status and nothing else, and `eval_gets` maps `LineRead::End` to
+            `Value::Status(1)`. Both halves are built, so option 2's precondition
+            is **met**.
 
-            What a user can write today is the sentinel by hand, which is all
-            the examples below show. Both end the loop and leave `n=3`:
+            That narrows this entry rather than closing it: a hand-written
+            sentinel is now a status, and only the second line here ends the
+            loop and leaves `n=3` —
 
             ```
             any func nxt(_n) { if $_n < 3 { $_n + 1 } else { false } }
-            any func nxt(_n) { if $_n < 3 { $_n + 1 } else { status(1) } }
+            any func nxt(_n) { if $_n < 3 { $_n + 1 } else { fail } }
             ```
+
+            — because the first binds `false` and spins forever.
 
             Neither warns today, so nothing is newly broken — but **not for the
             same reason, and the difference is the whole of what this adds.**
@@ -6462,10 +6501,11 @@ entry records what each costs.
             So the two spellings do diverge, and **all three options have to
             cover both**: option 1's exemption is worded "a `false` sentinel
             beside any other kind" and would exempt `false` while still warning
-            on `return status N`. Option 2 gets easier to argue and narrower in
-            scope — the channel it wanted is decided, but only where the
-            operation *reads*, so it is no answer for a predicate, and it is not
-            built yet either. Option 3 is unaffected.
+            on `return status N` — an exemption now aimed at nothing, since a
+            `false` is no longer a sentinel. Option 2 gets easier to argue and
+            broader than the note above allowed: the channel it wanted is not
+            only decided but built, and it is the *only* absence, so it answers
+            for a predicate too. Option 3 is unaffected.
 
             **And a caution for whoever picks option 1**, since the obvious
             tidy statement of it is unsound: "a branch yielding an absent value
@@ -8276,7 +8316,7 @@ of each PR had landed by another route, but these pieces had not.
 
 - [ ] **`docs/INTRO.md` writes `gets()` in the value-call form, which is not
       built.** Also from the same sweep. The prose has been narrowed to the
-      command form (`gets line`, which is what exists and does report false at
+      command form (`gets line`, which is what exists and does fail at
       end-of-input), so nothing in the docs is wrong today. It stays here as the
       reason the sentence is phrased the way it is: `while line = gets() { … }`
       is the shape that composes, and it waits on the value-call route in

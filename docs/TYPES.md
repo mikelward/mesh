@@ -96,13 +96,13 @@ each of which every type must answer separately.
 | 1 | **operator equality** | `==` / `!=` | refuses across types; one declared cross-type pair (status/int); scoped to the top-level operand pair only |
 | 2 | **total equality** | `Value::eq` | never refuses — backs `in`, `:has`, `:dedup`, list `-`, hashing, and `match` literal arms |
 | 3 | **condition** | `if` / `while` / `and` / `or` / `not` | a bool, a status, or a command's exit status; everything else is an error |
-| 4 | **presence** | the `if lhs = rhs` RHS | everything binds and passes except `false` and a nonzero status, which take `else` and bind nothing |
+| 4 | **presence** | the `if lhs = rhs` RHS | everything binds and passes except a nonzero status, which takes `else` and binds nothing |
 | 5 | **status projection** | `return v`, command position | `false`→1, status→its code, **everything else**→0 |
 | 6 | **order** | `<` `<=` `>` `>=` | int/int numeric, string/string lexical, otherwise a fall-through to text |
 
 Relations 1 and 2 are the same question with two answers, and `DESIGN.md`
 spends roughly 200 lines explaining why they must differ. Relations 3 and 4 are
-the same question with two answers, and disagree on `""`, `[]` and `0`.
+the same question with two answers, and disagree on `false`, `""`, `[]` and `0`.
 Relation 5 gives a status meaning to types that have none, and gives them the
 affirmative one. Relation 6 silently answers `10.0 < 2.0` with `true`.
 
@@ -400,19 +400,23 @@ one table row.
 **A nonzero `Status` is the only value-level failure. `false` is a bool and
 nothing else.**
 
-Today `false` does two jobs: the boolean, and "no result" — what `gets()`
-answers at EOF, what a no-`else` `if` is reaching for, what makes the presence
+`false` used to do two jobs: the boolean, and "no result" — what `gets()`
+answered at EOF, what a no-`else` `if` is reaching for, what made the presence
 relation a separate relation from the condition one. Overloading it is what
-forces `gets()`'s pinned contract to be argued rather than derived (a blank
+forced `gets()`'s pinned contract to be argued rather than derived (a blank
 line must bind, EOF must not, and both are `""`-adjacent).
 
 Under one failure:
 
 - `gets()` at EOF returns a **failing status**. A blank line returns `""`,
   which binds. The pinned contract becomes a consequence instead of a rule.
+  **Shipped**: `gets()` answers `status(1)` at end of input.
 - `if x = f()` is one sentence: **run it; if its status succeeded, bind its
   value and take the branch; otherwise bind nothing and take `else`.** Relation
-  4 disappears into relation 3.
+  4 disappears into relation 3. **The absent set has shipped ahead of the rest
+  of B3**: a nonzero status is the only absence, and `false` binds like any
+  other value. What is left of relation 4 is relation 5 disagreeing with it —
+  see the projection note below, where `false`→`1` is still live.
 
   The "bind nothing" half is load-bearing, and it has since **shipped ahead of
   the rest of B3**: a failing status now takes `else` and binds nothing. It used
@@ -442,7 +446,9 @@ Under one failure:
   the status. Either way B3 is what makes the failing half work, which is the
   part this bullet needs.
 - `false` as *data* keeps working everywhere, including as a bound value, which
-  it cannot cleanly do today.
+  it could not cleanly do before. **Shipped**, for the presence relation: `if x
+  = false { … }` binds `false` and takes the branch. Relation 5 still projects
+  it to `1`, so a `bool func` tailing in `false` still reports failure.
 
 This also settles the `TODO.md` question about **what status a `return` of a
 non-bool leaves**, which was revised upward on five consecutive reviews and
@@ -670,9 +676,9 @@ is the same move C1 makes everywhere, and `if $f:exists { … }` is unchanged
 source. The **stored settings** do not — nothing is being asked there, a
 recorded flag is being read back, which is where C1's polarity lands rather
 than where it is neutral. One producer that looks like it belongs here is
-already gone before C1 applies: `gets()` answers `false` at EOF today
-(`repl.rs`), and **B3 has replaced that with a failing status** — C1 inherits
-no work from it.
+already gone before C1 applies: `gets()` used to answer `false` at EOF, and
+**B3's failing status has since shipped in its place** (`repl.rs`) — C1
+inherits no work from it.
 
 **`:bool` is the sharp one**, and not because of the tree cost. Its parser
 reads `"1"` as true and `"0"` as false, so under C1 `"1":bool` is `status(0)`
@@ -1051,7 +1057,8 @@ Five consequences worth stating rather than discovering:
   `str`"** — and `if p = find-up("x") { … }` still binds only on success, so
   no caller ever sees a `Status` in a `str`-typed name. That holds because the
   presence-bind refuses a failing status outright: it takes `else` and binds
-  nothing, exactly as a `false` does. It used to bind, which would have made this
+  nothing, and it is the *only* value that does — a `false` binds like any other
+  answer. It used to bind, which would have made this
   sentence false the moment `DESIGN.md`'s `T | Status(n≠0)` widening let a declared
   type answer one — the binding contract was changed rather than this guarantee
   given up. The price is that the `else` branch cannot read the failing code; a
@@ -1528,7 +1535,7 @@ the bare-word-in-a-pattern row both turn on whether list-shape arms survive.
 | Flag | its own type, typed payloads | **a marked string** — distinction kept, payload becomes text and is converted in the body | same as B |
 | Styled | its own type | **folded into text** | same as B |
 | Glob / regex | two types | **one `pattern`**, dialect kept in its identity | same as B |
-| Failure | `false`, nonzero status, absence-as-`false` | **nonzero status only** | status only (C1) / bool only (C2) |
+| Failure | nonzero status; `false` still projects to `1` | **nonzero status only** | status only (C1) / bool only (C2) |
 | Condition | bool, status, command | **bool or status** | one type |
 | Order | numeric / lexical / text fall-through | **text, number, instant, duration only; error elsewhere** | same as B |
 | `~` | strict subset of arm grammar | **defined as a one-arm `match`**, over the non-binding arm forms if list arms stay | same shape; the arms answer statuses under C1 |
