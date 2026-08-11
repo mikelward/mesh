@@ -9113,6 +9113,82 @@ a one-line edit. Every claim below was checked against the built shell.
 
 ## Decisions needed
 
+- [ ] **Should `status` be renamed `error`?** Raised by mikelward alongside the
+      absence-spelling decision, and deferred there rather than answered: *a
+      status is kinda like an exception or an `err`; the question mark is like
+      an option*. That sentence is the whole argument — the two channels are
+      doing the two jobs those words name, and only one of them is named after
+      what it does. `status` names the *mechanism* (a process's 8-bit exit
+      code), `error` would name the **role** (why a thing did not work), which
+      is what a reader of `str? func f()` beside a failing `f` is actually
+      distinguishing.
+
+      **The success case is the objection to answer first**, and it is not a
+      detail: `status(0)` is legal and `$sh.status` records a *successful*
+      expression as readily as a failing one, so a wholesale rename produces
+      `error(0)` for a command that worked and an `$sh.error` that is `0` when
+      nothing went wrong. Raised in review. Either the word is wrong for the
+      value as it stands, or the rename presupposes a **split** — an error
+      channel carrying only failures, beside something else reporting how the
+      last thing went — which is a much larger change than a rename and would
+      want its own entry. Naming that here so the framing is not adopted with
+      the objection unexamined: *a status is an exception, `?` is an option*
+      reads well precisely because it thinks about the failing case, and the
+      value spends most of its life being `0`.
+
+      **What makes it more than cosmetic:** the rename would be the point at
+      which the value stops being the OS's byte and starts being mesh's error
+      channel, so it invites the questions that follow from that — whether it
+      carries a message as well as a code, whether `error(5)` is still capped
+      at 255, and whether an out-of-band code becomes available — the sentinel
+      option the absence-spelling entry in `DESIGN.md` weighed and set aside,
+      on the grounds that it makes `Value::Status` a `u8` that is not one.
+      Renaming without answering those leaves a word promising more than the
+      value delivers.
+
+      **What it costs**, so the size is on the record before anyone starts:
+      the `status(N)` constructor, `status func`, the `status N` statement
+      spelling, **the channel word in `return status N` and `exit status N`** —
+      a separate spelling from all three of those, `channel-word` in
+      `GRAMMAR.md` and `Channel::Status` in the parser, so `return error N` is
+      its own decision — `$sh.status`, **`$sh.pipestatus`** — a list of the same values,
+      built beside `$sh.status`, so it needs a decision of its own and
+      `$sh.pipeerrors` is not obviously an improvement — `:code`'s
+      diagnostics, `$j.status`, **the `.status` field on a `:capture`
+      record** — `channel_record` builds it as a `Value::Status` and
+      `REFERENCE.md` documents it on every capture, so leaving it alone
+      strands the most prominent status-valued API on the old
+      word — **`:repr`**, which `REFERENCE.md` fixes as `status(5)` under a
+      round-trip contract, so it is not free to disagree with the constructor:
+      rename one without the other and a representation either stops parsing or
+      keeps the retired word, which makes this the one item on the list with a
+      **test** attached rather than a judgment call — the
+      `ReturnType::Status` arm and every message that says "a
+      status", plus `REFERENCE.md`, `DESIGN.md` and `GRAMMAR.md`. Nothing is
+      owed backward compatibility — mesh is 0.0.0 — so the cost is the edit
+      and the docs, not a migration.
+
+      **One item on that list is not built yet and still counts**: the
+      **history store's `status` column**, decided in `DESIGN.md` as part of
+      the SQLite schema and unwritten so far, along with whatever `$sh.history`
+      eventually exposes. Raised in review. It has the same successful-`0`
+      problem as everything else here, and being unbuilt makes it *cheaper* to
+      settle rather than exempt — the word gets chosen once, before any rows
+      exist, instead of being migrated afterwards. Decide it with the rename or
+      say deliberately that the column keeps `status` because it records how a
+      command went rather than whether something failed.
+
+      The capture field is the one place the rename would read *worst*, which
+      is why it belongs in the list rather than in a footnote: `r.error` on a
+      call that succeeded holds `0`, and a record whose whole job is to report
+      how the invocation went would be naming three of its four fields after
+      the channels and one after failure. Raised in review.
+
+      **Deferred deliberately**, and this entry exists so the deferral is not
+      a silence: it should be answered with, or after, the absence spelling,
+      since the two together decide what mesh's vocabulary calls "no answer"
+      and "it went wrong".
+
 - [ ] **The type system as a whole — see [`docs/TYPES.md`](docs/TYPES.md).**
       Raised by mikelward: `match`, `==` and the value types have taken a
       disproportionate share of the design effort, and each entry settling one
