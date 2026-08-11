@@ -230,6 +230,16 @@ host in the prompt is there to distinguish. When the name cannot be read at all
 both are the empty string, the same honest sentinel `$sh.width` uses for "there
 is no terminal".
 
+`$sh.version` is what `mesh --version` prints, derived from the checkout the
+binary was built from rather than written down in a manifest. A clean build of a
+released commit reports that release's own number — `0.0.888`, the build the
+`v0.0.888` release ships — and any other build appends the branch and commit it
+came from and whether the sources carried changes: `0.0.888+quoting.g1a2b3c4.dirty`
+(the branch's last segment, so `claude/quoting` shows as `quoting`). Everything
+after the `+` is semver build metadata, which comparisons ignore, so a shell
+built from a working copy still sorts as the release it followed while never
+being mistaken for it.
+
 `$sh.width` is read from the terminal at each access rather than cached, so it
 cannot go stale: `TIOCGWINSZ` is what the kernel answers from and it is current
 the instant the window changes, `SIGWINCH` being only the notification that it

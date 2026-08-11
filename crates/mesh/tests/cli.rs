@@ -25053,6 +25053,83 @@ fn help_and_version_print_and_exit_successfully() {
     assert!(String::from_utf8_lossy(&out.stderr).contains("unknown option `--nope`"));
 }
 
+/// The version mesh prints, and where the parts of it come from.
+///
+/// `crates/mesh-core/build.rs` derives it from the checkout: a clean commit on
+/// `main` reports the plain `0.0.N` that the release workflow tags that commit
+/// with, and every other build carries its branch, commit and dirty state after
+/// a `+` (`0.0.888+quoting.g1a2b3c4.dirty`), so a working copy is never mistaken for the
+/// release it sits on. Which of those a test run gets depends on the checkout
+/// it is running in, so this checks the shape rather than a fixed string, plus
+/// the two places the same string has to show up.
+#[test]
+fn version_describes_the_checkout_it_was_built_from() {
+    let out = run_with_args(&["--version"]);
+    let printed = String::from_utf8_lossy(&out.stdout).into_owned();
+    let version = printed
+        .strip_prefix("mesh ")
+        .and_then(|rest| rest.strip_suffix('\n'))
+        .unwrap_or_else(|| panic!("--version printed {printed:?}"));
+
+    // Semver, in the order the grammar builds it: `MAJOR.MINOR.PATCH`, then an
+    // optional `-prerelease`, then an optional `+build`. Build metadata is split
+    // off first because it may itself contain the `-` that opens a prerelease.
+    // Both tails are dot-separated identifiers of alphanumerics and hyphens.
+    //
+    // The whole grammar rather than just the derived shapes: `MESH_BUILD_VERSION`
+    // hands the stamp through verbatim, so a source archive built as
+    // `9.9.9-rc1` is a supported version this suite has to run against.
+    let (version_core, metadata) = match version.split_once('+') {
+        Some((core, metadata)) => (core, Some(metadata)),
+        None => (version, None),
+    };
+    let (release, prerelease) = match version_core.split_once('-') {
+        Some((release, prerelease)) => (release, Some(prerelease)),
+        None => (version_core, None),
+    };
+    let numbers: Vec<&str> = release.split('.').collect();
+    assert!(
+        numbers.len() == 3
+            && numbers.iter().all(|part| {
+                // Semver's numeric identifiers are canonical decimal: `0`, or a
+                // digit string that does not open with one. mesh's own counts
+                // never pad, so this is here to fail an override that does.
+                !part.is_empty()
+                    && part.bytes().all(|byte| byte.is_ascii_digit())
+                    && (*part == "0" || !part.starts_with('0'))
+            }),
+        "{version:?} does not open with MAJOR.MINOR.PATCH"
+    );
+    // A prerelease identifier that is all digits is a number, and carries the
+    // same no-padding rule as the core; one with a letter or hyphen in it is a
+    // name and does not. Build metadata identifiers are never numbers, so
+    // `+g0123` is fine there and only the character set applies.
+    for (tail, numeric_rule, what) in [
+        (prerelease, true, "prerelease"),
+        (metadata, false, "build metadata"),
+    ] {
+        let Some(tail) = tail else { continue };
+        assert!(
+            tail.split('.').all(|identifier| {
+                let digits = identifier.bytes().all(|byte| byte.is_ascii_digit());
+                !identifier.is_empty()
+                    && identifier
+                        .bytes()
+                        .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+                    && !(numeric_rule && digits && identifier != "0" && identifier.starts_with('0'))
+            }),
+            "the {what} of {version:?} is not dot-separated semver identifiers"
+        );
+    }
+
+    // `-V` is the same flag. `$sh.version` is the same string too, which
+    // `sh_version_is_the_shells_own_version` checks from the `$sh` side.
+    assert_eq!(
+        String::from_utf8_lossy(&run_with_args(&["-V"]).stdout),
+        printed
+    );
+}
+
 #[test]
 fn sh_is_a_reserved_namespace_that_cannot_be_bound() {
     let out = run_with_input("sh = 1\nputs after\n");
@@ -30111,11 +30188,16 @@ fn sh_host_ignores_a_stale_exported_hostname() {
 
 #[test]
 fn sh_version_is_the_shells_own_version() {
+    // The one `--version` prints, not the `0.0.0` placeholder the workspace
+    // manifest carries — see `version_describes_the_checkout_it_was_built_from`
+    // for what the string is made of.
+    let printed = String::from_utf8_lossy(&run_with_args(&["--version"]).stdout).into_owned();
+    let version = printed
+        .strip_prefix("mesh ")
+        .unwrap_or_else(|| panic!("--version printed {printed:?}"));
+
     let out = run_with_input("puts $sh.version\n");
-    assert_eq!(
-        String::from_utf8_lossy(&out.stdout).trim(),
-        env!("CARGO_PKG_VERSION")
-    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), version);
 }
 
 #[test]

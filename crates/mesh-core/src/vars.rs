@@ -1376,7 +1376,7 @@ impl Vars {
             ),
             (
                 "version".to_owned(),
-                Value::String(env!("CARGO_PKG_VERSION").to_owned()),
+                Value::String(env!("MESH_VERSION").to_owned()),
             ),
             // The shipped defaults, as their own source. Readable is the point:
             // they are ordinary functions a user replaces, so `puts $sh.prelude`

@@ -216,6 +216,17 @@ never executes a test there.
 publishes the Linux x86-64 binary for every push to `main`, versioned by commit
 count (see the README's *Releases*).
 
+The binary is not told that version — it derives its own, in
+[`crates/mesh-core/build.rs`](crates/mesh-core/build.rs), from the checkout it is
+built from, which is what lets your own clean build of a released commit report
+the released number rather than the `0.0.0` placeholder in `Cargo.toml`. The
+release job checks the two derivations against each other before publishing, so
+a disagreement fails the release instead of shipping a binary that misreports
+which release it is. Setting `MESH_BUILD_VERSION` overrides the derivation
+outright, for building from a source archive that knows its version but has no
+history to read; it has to be a semver version, and a value that is not one is
+reported as a build warning and the derivation runs instead.
+
 ## Supported systems
 
 mesh is **Unix-only**. Real POSIX job control (`Ctrl-Z`/`fg`/`bg`, handing the

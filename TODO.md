@@ -641,7 +641,14 @@ Delete an entry once you have agreed with it or reversed it.
       script's own flags reach it; `--` ends it explicitly. A script is parsed as
       one unit, so a syntax error rejects the whole file; a missing script exits
       `127` and an unreadable one `126`. Shebangs work by way of `#` comments.
-- [x] `--help` and `--version`.
+- [x] `--help` and `--version`. The version is derived from the checkout at
+      build time (`crates/mesh-core/build.rs`) rather than read from the `0.0.0`
+      placeholder in `Cargo.toml`: a clean build of a commit on `main` reports
+      the `0.0.COMMITS` number the release workflow tags that commit with, and
+      any other build appends its branch, commit and dirty state
+      (`0.0.888+quoting.g1a2b3c4.dirty`). The release job cross-checks the binary's
+      answer against the tag it is about to publish, so the two derivations
+      cannot drift apart silently.
 - [x] A `help` builtin, bash's `help` in mesh's shape. Bare `help` prints mesh in
       one screen: every builtin with its usage, then every keyword and operator
       with the shape it is written in, each with a one-line summary. `help NAME …`

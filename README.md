@@ -56,15 +56,23 @@ installable binary, so Cargo selects it automatically.
 
 Every push to `main` publishes a Linux x86-64 binary. The version is
 `0.0.COMMITS`, where `COMMITS` is the number of commits reachable from that
-revision, and the release is tagged `v0.0.COMMITS`. The workflow calculates the
-version and updates the Cargo metadata used for the build; no manual version
-edit or tag is needed.
+revision, and the release is tagged `v0.0.COMMITS`; no manual version edit or
+tag is needed.
+
+`mesh --version` and `$sh.version` work that number out from the checkout they
+were built from, so a clean build of a released commit reports exactly what the
+release of that commit reports — `0.0.888`. Any other build says which branch
+and commit it came from and whether the sources carried changes,
+`0.0.888+quoting.g1a2b3c4.dirty`, so a working copy is never mistaken for the
+release it sits on. Everything after the `+` is semver build metadata, which
+comparisons ignore.
 
 Release assets contain the binary, README, and license files in
 `mesh-VERSION-x86_64-unknown-linux-gnu.tar.gz`, together with a SHA-256
-checksum. The `0.0.0` workspace version is a source-tree placeholder. Commit
-counts are calculated from a full clone, and rewriting `main` history is avoided
-so release versions remain unique and increasing.
+checksum. The `0.0.0` workspace version in `Cargo.toml` is a source-tree
+placeholder that nothing reports. Commit counts are calculated from a full
+clone, and rewriting `main` history is avoided so release versions remain unique
+and increasing.
 
 The shell launches external commands and includes prompt configuration alongside
 builtins for the shell's own state — `cd`, `pwd`, `puts`, `exit`, job control,
