@@ -4534,9 +4534,9 @@ Rules:
   reporting `` `:value` is a built-in modifier and cannot be redeclared `` the day
   this lands. That is the general cost of adding to the modifier vocabulary, not
   something specific to these two — recorded so the choice is made knowing it.
-- **A constructor pattern that binds — `status(n)`** *(the shape is settled;
-  what remains open is how many constructors it covers)*. Raised by mikelward,
-  asking whether this runs today:
+- **A constructor pattern that binds — `status(n)`** *(**built** for `status`;
+  what remains open is how many constructors it covers, and the two payload
+  restrictions below)*. Raised by mikelward, asking whether this runs today:
 
   ```mesh
   func f() { return status 1 }
@@ -4561,12 +4561,22 @@ Rules:
   subject whose code equals an arm's is swallowed by that arm. All verified; an
   earlier draft summarized the fallthrough as if the displayed match had it, and
   the draft correcting that one wrote the int case for every integer rather than
-  for `0` alone (Codex, #472). What does not exist is the **binder**. An arm pattern is parsed as an
-  ordinary expression (`match_pattern`, `parser.rs`:4899), so `status(n)` calls the
-  constructor with the *string* `"n"` and reports `` the code must be an integer,
-  not a string `` — and it reports it whether or not `n` is bound, since the
-  pattern never expands the word at all. `status($n)` does run, but that is a
-  literal comparison against `$n`'s value, not a capture.
+  for `0` alone (Codex, #472). **The binder is what was missing, and it is now
+  built.** An arm pattern was parsed as an ordinary expression, so `status(n)`
+  called the constructor with the *string* `"n"` and reported `` the code must
+  be an integer, not a string `` — whether or not `n` was bound, since the
+  pattern never expanded the word at all. A `status(…)` arm is now recognized
+  syntactically and given the pattern semantics this entry specifies, while
+  every other arm stays an evaluated expression. `status($n)` still compares
+  against `$n`'s value rather than capturing, which is the escape the rule
+  below keeps.
+
+  **What landed is `status` alone**, the narrower of the two coverage rows. It
+  forecloses nothing: adding the styled family is additive, and its three open
+  questions are untouched. Neither payload restriction was taken either, so the
+  slot is a plain pattern — the default the rule describes. The behavior changes
+  the rest of this entry records all arrived with it, and the tests for them sit
+  beside `match_bindings`.
 
   **This is not a new rule; it is the rule above applied to a third slot.** The
   flag-pattern entry already settles that *a bare word is a literal in a
