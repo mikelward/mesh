@@ -1981,6 +1981,206 @@ fn a_builtin_and_a_function_read_flags_the_same_way() {
 }
 
 #[test]
+fn both_call_spellings_reach_the_generated_help() {
+    // One call, two spellings: `f --help` went through `dispatch_function_call`,
+    // which answers `--help` before binding, while `f(--help)` bound directly and
+    // came back ``unknown flag `--help` ``. A forwarded one is the same call again
+    // — `f(...$args)` is how a caller passes on a `--help` it was handed — so the
+    // value path now asks the question where command position asks it: after every
+    // argument is evaluated, before the first one binds.
+    for line in [
+        "greet --help",
+        "greet(--help)",
+        "args = [--help]\ngreet(...$args)",
+    ] {
+        let out = run_with_input(&format!(
+            "func greet(name) {{ puts \"hi $name\" }}\n{line}\n"
+        ));
+        assert!(
+            String::from_utf8_lossy(&out.stdout).contains("Usage: greet <NAME>"),
+            "{line:?}: {:?} {:?}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(out.stderr.is_empty(), "{line:?}: {:?}", out.stderr);
+    }
+
+    // The two conditions the command path applies hold in the value path too: a
+    // signature that declares its own `--help` observes the switch, and a
+    // `wrapper` forwards the word rather than answering it.
+    let own = run_with_input("func greet(name, --help) { puts \"own=$help\" }\ngreet(x, --help)\n");
+    assert_eq!(String::from_utf8_lossy(&own.stdout), "own=true\n");
+    let forwarded = run_with_input("wrapper func g(...args) { puts ...$args }\ng(--)\ng(--help)\n");
+    assert!(
+        String::from_utf8_lossy(&forwarded.stdout).contains("Usage: puts"),
+        "{:?}",
+        String::from_utf8_lossy(&forwarded.stdout)
+    );
+
+    // And the escapes still escape: `--` before it makes the word data, in the
+    // spread as well as written out.
+    let data = run_with_input(
+        "func greet(...xs) { puts $xs:repr }\n\
+         greet(--, --help)\n\
+         args = [--, --help]\n\
+         greet(...$args)\n",
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&data.stdout),
+        "[--help]\n[--help]\n"
+    );
+}
+
+#[test]
+fn a_value_call_evaluates_every_argument_before_answering_help() {
+    // Command position expands all of its words, *then* asks about `--help`, then
+    // binds. Answering the word the moment the scan reached it made the value
+    // spelling skip the rest of the call: `f(--help, side())` never ran `side()`,
+    // and `f(--help, $missing)` reported nothing and succeeded.
+    let side = run_with_input(
+        "func greet(name) { puts \"hi\" }\n\
+         func side() { puts \"side ran\"; return \"x\" }\n\
+         greet(--help, side())\n",
+    );
+    let printed = String::from_utf8_lossy(&side.stdout);
+    assert!(printed.starts_with("side ran\n"), "{printed:?}");
+    assert!(printed.contains("Usage: greet <NAME>"), "{printed:?}");
+
+    let missing = run_with_input("func greet(name) { puts \"hi\" }\ngreet(--help, $missing)\n");
+    assert!(
+        String::from_utf8_lossy(&missing.stderr).contains("missing: unbound variable"),
+        "{:?}",
+        String::from_utf8_lossy(&missing.stderr)
+    );
+
+    // The same order decides which complaint a wrong call gets. Nothing binds
+    // until the help question is answered, so a mistake written *before* the word
+    // loses to it — in both spellings, and in a spread.
+    for line in [
+        "greet --bogus --help",
+        "greet(--bogus, --help)",
+        "args = [--bogus, --help]\ngreet(...$args)",
+    ] {
+        let out = run_with_input(&format!("func greet(name) {{ puts \"hi\" }}\n{line}\n"));
+        assert!(
+            String::from_utf8_lossy(&out.stdout).contains("Usage: greet <NAME>"),
+            "{line:?}: {:?}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(out.stderr.is_empty(), "{line:?}: {:?}", out.stderr);
+    }
+
+    // A `--` after the word still ends the scan, even inside the one spread that
+    // carried the word. Stopping the scan at `--help` left the terminator unseen,
+    // so a later argument's expansion failure was described as a flag mistake
+    // (`unknown flag --bogus`, status 2) rather than the bad payload it is —
+    // where the command spelling, whose terminator was seen, says the latter.
+    let prelude = "func f(...rest) { puts $rest:repr }\nxs = [p, q]\n";
+    for line in [
+        "f --help -- --bogus=$xs",
+        "args = [--help, --]\nf(...$args, --bogus=$xs)",
+    ] {
+        let out = run_with_input(&format!("{prelude}{line}\n"));
+        assert!(
+            String::from_utf8_lossy(&out.stderr)
+                .contains("an option's value must be one string, not a list"),
+            "{line:?}: {:?}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+}
+
+#[test]
+fn a_value_call_answered_by_help_still_yields_a_status() {
+    // `DESIGN.md` §"Calling for a value": every call yields a value, and a
+    // command-shaped one yields a `Status`. Answering `--help` with a control step
+    // unwound the enclosing expression instead — `x = f(--help)` left `x` unbound
+    // and `puts before f(--help) after` skipped the outer call — where the same two
+    // spellings of a value-called *builtin's* help already produce `status(0)`.
+    // A function and a builtin are not two kinds of command.
+    let greet = "func greet(name) { puts \"hi\" }\n";
+    for (script, expected) in [
+        (
+            format!("{greet}x = greet(--help)\nputs $x:repr\n"),
+            "status(0)",
+        ),
+        (
+            format!("{greet}args = [--help]\nx = greet(...$args)\nputs $x:repr\n"),
+            "status(0)",
+        ),
+        (
+            format!("{greet}puts before greet(--help) after\n"),
+            "before 0 after",
+        ),
+    ] {
+        let out = run_with_input(&script);
+        let printed = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            printed.lines().last() == Some(expected),
+            "{script:?}: {printed:?}"
+        );
+        assert!(out.stderr.is_empty(), "{script:?}: {:?}", out.stderr);
+    }
+
+    // The builtin spelling those two are measured against, so the test fails if
+    // *it* is what moves rather than the function.
+    let builtin = run_with_input("x = puts(--help)\nputs $x:repr\n");
+    assert_eq!(
+        String::from_utf8_lossy(&builtin.stdout).lines().last(),
+        Some("status(0)")
+    );
+}
+
+#[test]
+fn generated_help_describes_the_definition_the_call_snapshotted() {
+    // A value call clones the signature before evaluating its arguments, and one of
+    // those arguments may redefine the callee. Rendering the help from the function
+    // store when the `--help` word was reached described the *replacement* while
+    // every other answer about the same call — the arity error below — came from
+    // the snapshot the call is actually using.
+    let script = "func greet(name) { puts \"original\" }\n\
+                  func change() { func greet(other, --loud) { puts \"replacement\" }; return \"x\" }\n";
+    let helped = run_with_input(&format!("{script}greet(change(), --help)\n"));
+    let printed = String::from_utf8_lossy(&helped.stdout);
+    assert!(printed.contains("Usage: greet <NAME>"), "{printed:?}");
+    assert!(!printed.contains("OTHER"), "{printed:?}");
+    assert!(!printed.contains("--loud"), "{printed:?}");
+
+    // The same call without the help word binds against that same snapshot, which
+    // is what makes the two answers agree: one parameter, not two.
+    let bound = run_with_input(&format!("{script}greet(change(), 1)\n"));
+    assert!(
+        String::from_utf8_lossy(&bound.stderr).contains("expected 1 argument(s), got 2"),
+        "{:?}",
+        String::from_utf8_lossy(&bound.stderr)
+    );
+}
+
+#[test]
+fn a_lambda_does_not_borrow_a_functions_generated_help() {
+    // A lambda has no generated help, and the name a value call carries for one is
+    // the *variable* it was read through. Answering `--help` from `shell.funcs`
+    // without that distinction printed the help of an unrelated function that
+    // happened to share the name — so `$f(--help)` here would have described
+    // `func f`, which is not what is being called.
+    let out = run_with_input(
+        "func f(name) { puts \"the func\" }\n\
+         f = func(a) { puts \"the lambda got $a\" }\n\
+         $f(--help)\n",
+    );
+    assert!(
+        !String::from_utf8_lossy(&out.stdout).contains("Usage:"),
+        "{:?}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("unknown flag `--help`"),
+        "{:?}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
 fn cd_updates_pwd_and_oldpwd_for_children() {
     let out = run_with_input("cd /\nprintenv PWD\ncd /usr\nprintenv OLDPWD\n");
     assert_eq!(String::from_utf8_lossy(&out.stdout), "/\n/\n");

@@ -4407,15 +4407,36 @@ thing a reader takes on trust.*
       threading call-site information down the argv path. Worth keeping as its own
       entry because the principle is broader than flags.
 
-- [ ] **A value call cannot ask for the generated `--help`.** `f(--help)` reports
-      ``unknown flag `--help` `` and `f(...$x)` with a `--help` element does the
-      same, while both command spellings print the usage. Not a flag-handling gap —
+- [x] **A value call cannot ask for the generated `--help`.** `f(--help)` reported
+      ``unknown flag `--help` `` and `f(...$x)` with a `--help` element did the
+      same, while both command spellings printed the usage. Not a flag-handling gap —
       every *declared* flag works identically in both spellings, and a function
       that declares its own `--help` observes it in a value call — but an
       **interception** gap: `dispatch_function_call` answers `--help` before
-      binding, and the value path does not go through it, so the word reaches the
-      ordinary binder and finds no such parameter. The fix is to share that
+      binding, and the value path does not go through it, so the word reached the
+      ordinary binder and found no such parameter. The fix is to share that
       interception rather than duplicate it.
+
+      **Built.** Sharing it meant matching command position's *order*, not just its
+      answer: `evaluate_value_arguments` now evaluates every argument, asks the
+      help question, and only then binds — which is what `expand_stage` →
+      `dispatch_function_call` → `call_func` does. Both spellings therefore run the
+      same side effects before answering, report the same expansion errors, and let
+      `--help` outrank a mistake written before it.
+
+      Whether the callee *has* a generated help is decided where the callee is
+      known and passed down as an `AutoHelp` **snapshot** of the signature: `None`
+      for a `wrapper`, for a signature declaring its own `--help`, for a declared
+      modifier, and for a lambda — whose name at the call is the variable it was
+      read through, so looking that up in the function store would have printed the
+      help of an unrelated function of the same name. The snapshot is what keeps
+      `f(change(), --help)` describing the definition the call is binding into,
+      rather than a replacement one of its own arguments installed.
+
+      The answer is an outcome (`ScannedCall::Helped`), not a control step, so the
+      call still **produces a value**: `x = f(--help)` binds `status(0)` and
+      `puts before f(--help) after` prints it, which is what a value-called
+      builtin's help already did and what "every call yields a value" requires.
 
 - [ ] **A `Flag` value type, so a word that is an option carries that rather than
       being sniffed for it.** The answer to the whole "what is an option" family,
