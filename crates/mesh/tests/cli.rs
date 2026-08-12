@@ -10535,6 +10535,36 @@ fn a_stopped_job_is_still_watched() {
         "sh -c 'kill -STOP $$; sleep 5' &\nsleep 0.3\nwait 1\nputs waited=$sh.status\n",
     );
     assert_eq!(String::from_utf8_lossy(&stopped.stdout), "waited=147\n");
+
+    // Killed from **outside** this table — the case the builtin's own "clear
+    // the mark before waiting" cannot cover. A `kill` in a pipeline stage
+    // signals the job from a copy of the table that dies with the stage, and
+    // `command kill` by pid never touches the table at all, so neither leaves a
+    // cleared mark behind for `wait` to find. What answers instead is that the
+    // stop is re-checked against the kernel before it is trusted.
+    //
+    // Waited for the kill to be **observed** before asking, unlike the cases
+    // above. Those clear the mark synchronously, so there is nothing to wait
+    // for; here the kill is asynchronous, and a `wait` that beats the kernel's
+    // termination finds the job genuinely still stopped and says so — which is
+    // correct rather than stale, and is the window `TODO.md` keeps. Asserting
+    // 137 without the wait-for-observed loop is asserting a race: it comes out
+    // 147 a couple of times in a hundred.
+    for script in [
+        "sh -c 'kill -STOP $$; sleep 5' &\nsleep 0.3\nkill -KILL %1 | cat\n",
+        "sh -c 'kill -STOP $$; sleep 5' &\nsleep 0.3\nj = $sh.jobs[1]\ncommand kill -9 $j.pid\n",
+    ] {
+        let killed = run_with_input(&format!(
+            "{script}n = 0\n\
+             while $sh.jobs[1].state == stopped and $n < 500 {{ sleep 0.02; n = $n + 1 }}\n\
+             wait 1\nputs waited=$sh.status\n"
+        ));
+        assert_eq!(
+            String::from_utf8_lossy(&killed.stdout),
+            "waited=137\n",
+            "{script:?}"
+        );
+    }
 }
 
 #[test]
