@@ -1190,6 +1190,17 @@ pub enum MatchPattern {
     Wildcard,
     Value(Expr),
     Alternation(Vec<MatchPattern>),
+    /// A constructor pattern — `status(0)`, `status(n)`, `status(_)`.
+    ///
+    /// A **variant test** that then constrains the payload, not a comparison
+    /// (`DESIGN.md` §Matching). The variant is checked first, so a subject of
+    /// the wrong variant skips the arm without the payload being looked at —
+    /// which is what lets `status(_)` ask "is this a status" of a value that
+    /// otherwise equals its own code.
+    Constructor {
+        name: String,
+        payload: Box<MatchPattern>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -4899,6 +4910,21 @@ impl Parser<'_> {
     fn match_pattern(&mut self) -> Result<MatchPattern, ParseError> {
         if self.same(&TokenKind::LBracket) {
             Ok(MatchPattern::Binding(self.binding_pattern()?))
+        } else if let Some(name) = self.constructor_pattern() {
+            self.position += 2;
+            // Newlines inside a `(…)` are layout (`GRAMMAR.md`), and this
+            // spelling reached the ordinary call path before the pattern
+            // existed — so a payload written across lines has to keep parsing.
+            self.newlines();
+            let payload = self.payload_pattern()?;
+            self.newlines();
+            if self.eat(&TokenKind::RParen).is_none() {
+                return Err(self.error(ParseErrorKind::Unterminated('(')));
+            }
+            Ok(MatchPattern::Constructor {
+                name,
+                payload: Box::new(payload),
+            })
         } else if self.word("_") {
             self.position += 1;
             Ok(MatchPattern::Wildcard)
@@ -4911,6 +4937,105 @@ impl Parser<'_> {
             self.regex_slot = false;
             Ok(MatchPattern::Value(match_pattern_operand(pattern?)))
         }
+    }
+
+    /// Is a **constructor pattern** starting here — a constructor name with an
+    /// *attached* `(`?
+    ///
+    /// Attachment is the same one-token lookahead `f arg` vs `f(arg)` already
+    /// draws, so `status (0)` is not one. The set is named rather than inferred:
+    /// `Flag` is built by the `:flag` modifier and has no call form to put in a
+    /// pattern, so "every value constructor" would not name itself
+    /// (`DESIGN.md` §Matching). It is one member today; adding the styled family
+    /// is the open coverage question, not a change to this test.
+    ///
+    /// **The call has to be the *whole* operand**, so the closing `)` is checked
+    /// to be followed by something that ends a pattern — `=>`, a `|`
+    /// alternative, or an `if` guard. Committing on the opener alone broke arms
+    /// that merely *start* with one: `status(1):code` and `status(0) == 0` are
+    /// ordinary evaluated expressions and parsed before this pattern existed.
+    /// Raised in review.
+    fn constructor_pattern(&self) -> Option<String> {
+        const CONSTRUCTORS: [&str; 1] = ["status"];
+        let name = CONSTRUCTORS.iter().find(|name| self.word(name))?;
+        let head = self.tokens.get(self.position)?;
+        let paren = self.tokens.get(self.position + 1)?;
+        if !matches!(paren.value, TokenKind::LParen) || head.span.end != paren.span.start {
+            return None;
+        }
+        let mut depth = 0usize;
+        let mut index = self.position + 1;
+        let closer = loop {
+            match self.tokens.get(index)?.value {
+                TokenKind::LParen => depth += 1,
+                TokenKind::RParen => {
+                    depth -= 1;
+                    if depth == 0 {
+                        break index;
+                    }
+                }
+                _ => {}
+            }
+            index += 1;
+        };
+        let follower = self
+            .tokens
+            .iter()
+            .skip(closer + 1)
+            .find(|token| !matches!(token.value, TokenKind::Newline))?;
+        let ends_a_pattern = match &follower.value {
+            TokenKind::FatArrow | TokenKind::Pipe => true,
+            TokenKind::Word(word) => word.is_bare_text("if"),
+            _ => false,
+        };
+        ends_a_pattern.then(|| (*name).to_string())
+    }
+
+    /// A constructor's payload slot, which is a **sub-pattern position**.
+    ///
+    /// So a bare word binds rather than comparing, exactly as `[start arg]`
+    /// binds both elements while a top-level `main` arm stays a string. The
+    /// binder takes only the slot's *string* case — a bare run of digits is
+    /// still the integer literal it is today, which is what keeps `status(0)` a
+    /// code test rather than a binder — and `$n` or a quoted word is an escape
+    /// back to comparison.
+    ///
+    /// **What counts as a name is [`valid_name`], not a character test of its
+    /// own.** A second vocabulary disagrees with the first in both directions:
+    /// it let `status(true)` bind — matching every status where the boolean
+    /// should have been compared — and refused `error-code`, which mesh spells
+    /// as one name. Raised in review.
+    fn payload_pattern(&mut self) -> Result<MatchPattern, ParseError> {
+        if self.take_word("_") {
+            return Ok(MatchPattern::Wildcard);
+        }
+        if let Some(TokenKind::Word(word)) = self.peek().map(|token| &token.value)
+            && let Some((text, QuoteMode::Bare)) = single_text(word)
+            && valid_name(text)
+            && boolean_literal(text).is_none()
+            && self
+                .tokens
+                .iter()
+                .skip(self.position + 1)
+                .find(|token| !matches!(token.value, TokenKind::Newline))
+                .is_some_and(|token| matches!(token.value, TokenKind::RParen))
+        {
+            let name = text.to_string();
+            self.position += 1;
+            return Ok(MatchPattern::Binding(BindingPattern::Name(name)));
+        }
+        // **A nested constructor is a value here, not a pattern.** The slot holds
+        // the code — an integer by construction — so a variant test inside it
+        // could never pass, and reading `status(status(1))` recursively would
+        // turn a spelling that works today into a dead one. It is compared
+        // instead, with the status unwrapped to its code (`DESIGN.md` §Matching).
+        if self.same(&TokenKind::LBracket) {
+            return Ok(MatchPattern::Binding(self.binding_pattern()?));
+        }
+        self.regex_slot = true;
+        let pattern = self.expression();
+        self.regex_slot = false;
+        Ok(MatchPattern::Value(match_pattern_operand(pattern?)))
     }
 
     fn for_bindings(&mut self) -> Result<Vec<BindingPattern>, ParseError> {

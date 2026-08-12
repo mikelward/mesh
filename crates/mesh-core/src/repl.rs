@@ -7930,6 +7930,41 @@ fn match_bindings(
             }
             matched
         }
+        parser::MatchPattern::Constructor { name, payload } => {
+            // The variant test runs **first**, so a wrong-variant subject skips
+            // the arm without the payload being evaluated at all — which is what
+            // makes `status(_)` cost nothing beyond the test, and what stops an
+            // int subject taking a `status(…)` arm even though a status equals
+            // its own code (`DESIGN.md` §Matching).
+            match (name.as_str(), subject) {
+                ("status", Value::Status(code)) => {
+                    let code = Value::Integer(i64::from(*code));
+                    // **A status-valued payload is unwrapped to its code**,
+                    // whatever produced it — `status($n)` with a status in `$n`,
+                    // and `status(status(1))`. `status_value` carries the same
+                    // identity arm for the constructor, and doing it here rather
+                    // than leaning on the status/int equality keeps this rule
+                    // independent of whether that equality survives.
+                    if let parser::MatchPattern::Value(expr) = payload.as_ref() {
+                        let value = eval_expr(expr, last, in_function, shell)?;
+                        let value = match value {
+                            Value::Status(payload) => Value::Integer(i64::from(payload)),
+                            value => value,
+                        };
+                        let matched = match value {
+                            Value::List(values) if matches!(expr, parser::Expr::Range { .. }) => {
+                                values.contains(&code)
+                            }
+                            value => value == code,
+                        };
+                        matched.then(Vec::new)
+                    } else {
+                        match_bindings(payload, &code, last, in_function, shell)?
+                    }
+                }
+                _ => None,
+            }
+        }
     };
     if let Some(bindings) = &bindings {
         validate_bindings(bindings).map_err(runtime_message)?;
@@ -12541,6 +12576,11 @@ fn arm_may_leave(arm: &parser::MatchArm, unwinds: bool) -> bool {
             parser::MatchPattern::Alternation(alternatives) => alternatives
                 .iter()
                 .any(|alternative| pattern_may_leave(alternative, unwinds)),
+            // The payload is a pattern too, so `status((if true { return 1 }))`
+            // can leave exactly as a bare arm of the same shape can.
+            parser::MatchPattern::Constructor { payload, .. } => {
+                pattern_may_leave(payload, unwinds)
+            }
             parser::MatchPattern::Binding(_) | parser::MatchPattern::Wildcard => false,
         }
     }
@@ -12599,6 +12639,10 @@ fn always_matches(pattern: &parser::MatchPattern) -> bool {
         // earlier alternative that can only *error* is a different question, and
         // [`first_pattern`] is the one that asks it. Raised in review.
         parser::MatchPattern::Alternation(alternatives) => alternatives.iter().any(always_matches),
+        // A constructor pattern is a *variant test*, so it never matches
+        // everything however total its payload is — `status(_)` still rejects a
+        // string, which is the whole point of having it.
+        parser::MatchPattern::Constructor { .. } => false,
         parser::MatchPattern::Binding(_) | parser::MatchPattern::Value(_) => false,
     }
 }
@@ -12628,6 +12672,22 @@ fn evaluated_patterns<'a>(
         parser::MatchPattern::Alternation(alternatives) => alternatives
             .iter()
             .any(|alternative| evaluated_patterns(alternative, subject, unwinds, into)),
+        // **The payload is evaluated only when the variant test passes**, so a
+        // subject whose kind is known to be something else never reaches it and
+        // it does not belong in the definitely-evaluated set — collecting it
+        // there let a payload that can only error stand for a `match` that
+        // cannot. An *unknown* subject stays conservative, since only the run
+        // can say. Either way the arm never promises to match, which keeps later
+        // arms counted: a wrong-variant subject really does reach them. Raised
+        // in review.
+        parser::MatchPattern::Constructor { payload, .. } => {
+            let wrong_variant =
+                matches!(subject, Yields::Known(kind) if kind != ReturnType::Status);
+            if !wrong_variant {
+                evaluated_patterns(payload, subject, unwinds, into);
+            }
+            false
+        }
         parser::MatchPattern::Binding(_) | parser::MatchPattern::Wildcard => true,
     }
 }
@@ -21531,5 +21591,189 @@ mod tests {
         // reports the trailing-text error rather than swallowing later commands.
         assert!(!func_definition_is_open("func f() {} {\n"));
         assert!(!func_definition_is_open("func f() { puts hi } extra {\n"));
+    }
+
+    /// Bind a constructor pattern's payload and read back what `x` became.
+    fn match_result(arms: &str, subject: &str) -> String {
+        let mut shell = Shell::new();
+        let line = format!("x = match {subject} {{ {arms} }}\n");
+        assert_eq!(run_line(&line, 0, false, &mut shell), Step::Continue(0));
+        match shell.vars.get("x") {
+            Some(Value::String(text)) => text.clone(),
+            other => panic!("x is {other:?}"),
+        }
+    }
+
+    /// **The binder is the whole feature.** `status(n)` used to call the
+    /// constructor with the string `"n"` and report *the code must be an
+    /// integer, not a string*; under the variant reading it captures the code.
+    #[test]
+    fn a_constructor_pattern_binds_the_code() {
+        let arms = r#"status(0) => "ok" ; status(n) => "error $n" ; _ => "other""#;
+        assert_eq!(match_result(arms, "status(1)"), "error 1");
+        // `status(0)` stays the code test it is today rather than becoming a
+        // binder — only a bare *non-numeric* word takes the slot's string case.
+        assert_eq!(match_result(arms, "status(0)"), "ok");
+    }
+
+    /// **A name is what [`valid_name`] says it is**, not what a character test
+    /// invented here says. The first draft had its own rule and disagreed with
+    /// mesh in both directions: `true` bound — so the arm matched *every*
+    /// status, where the boolean should be compared and match none — and
+    /// `error-code` could not bind at all, though mesh spells it as one name.
+    #[test]
+    fn a_payload_binder_uses_the_language_s_own_name_rule() {
+        let bound = r#"status(error-code) => "bound $error-code" ; _ => "other""#;
+        assert_eq!(match_result(bound, "status(1)"), "bound 1");
+
+        // A boolean stays a comparison, and no status equals one.
+        let boolean = r#"status(true) => "bound" ; _ => "other""#;
+        assert_eq!(match_result(boolean, "status(1)"), "other");
+        assert_eq!(match_result(boolean, "status(0)"), "other");
+    }
+
+    /// Newlines inside a `(…)` are layout, and this spelling parsed through the
+    /// ordinary call path before the pattern existed — so splitting a payload
+    /// across lines has to keep working rather than becoming a syntax error.
+    #[test]
+    fn a_payload_may_be_written_across_lines() {
+        let mut shell = Shell::new();
+        let line =
+            "x = match status(1) {\n  status(\n    n\n  ) => \"bound $n\"\n  _ => 'other'\n}\n";
+        assert_eq!(run_line(line, 0, false, &mut shell), Step::Continue(0));
+        assert_eq!(shell.vars.get("x"), Some(&Value::String("bound 1".into())));
+    }
+
+    /// **An arm that merely *starts* with a constructor call is still an
+    /// expression.** `status(1):code` and `status(0) == 0` parsed as ordinary
+    /// evaluated arms before the pattern existed, so committing to the pattern
+    /// on the opener alone regressed them to `expected =>`. The call has to be
+    /// the whole operand. Raised in review.
+    #[test]
+    fn a_constructor_call_that_is_not_the_whole_operand_stays_an_expression() {
+        assert_eq!(
+            match_result(r#"status(1):code => "hit" ; _ => "miss""#, "1"),
+            "hit"
+        );
+        assert_eq!(
+            match_result(r#"status(0) == 0 => "hit" ; _ => "miss""#, "true"),
+            "hit"
+        );
+        // The whole-operand forms still take the pattern, including the two
+        // followers that are not `=>`.
+        assert_eq!(
+            match_result(
+                r#"status(0) | status(1) => "either" ; _ => "other""#,
+                "status(1)"
+            ),
+            "either"
+        );
+        assert_eq!(
+            match_result(
+                r#"status(n) if $n > 0 => "guarded" ; _ => "other""#,
+                "status(1)"
+            ),
+            "guarded"
+        );
+    }
+
+    /// `status(_)` asks the one question a bare `_` arm cannot: *being* a status.
+    #[test]
+    fn a_discard_payload_asks_only_the_variant_question() {
+        let arms = r#"status(_) => "a status" ; _ => "other""#;
+        assert_eq!(match_result(arms, "status(7)"), "a status");
+        assert_eq!(match_result(arms, r#""x""#), "other");
+    }
+
+    /// **The recorded behavior change**: a status equals its own code, so an int
+    /// subject used to be swallowed by a `status(…)` arm and leave the literal
+    /// arm below it dead. The variant test runs first, so both arms now do what
+    /// they say.
+    #[test]
+    fn an_int_subject_no_longer_takes_a_constructor_arm() {
+        let arms = r#"status(1) => "status" ; 1 => "int" ; _ => "other""#;
+        assert_eq!(match_result(arms, "status(1)"), "status");
+        assert_eq!(match_result(arms, "1"), "int");
+    }
+
+    /// A payload that *is* a status compares codes, whatever produced it — the
+    /// substitution and the nested constructor alike. Left to the recursive
+    /// reading the inner `status(1)` would be a variant test against an integer
+    /// and could never match, turning a working spelling into a dead one.
+    #[test]
+    fn a_status_valued_payload_is_unwrapped_to_its_code() {
+        let arms = r#"status(status(1)) => "nested" ; _ => "other""#;
+        assert_eq!(match_result(arms, "status(1)"), "nested");
+        assert_eq!(match_result(arms, "status(2)"), "other");
+
+        let mut shell = Shell::new();
+        let line =
+            "n = status(1)\nx = match status(1) { status($n) => \"unwrapped\" ; _ => \"other\" }\n";
+        assert_eq!(run_line(line, 0, false, &mut shell), Step::Continue(0));
+        assert_eq!(
+            shell.vars.get("x"),
+            Some(&Value::String("unwrapped".into()))
+        );
+    }
+
+    /// The payload is just a pattern, so a range matches inside it. Note this is
+    /// the one row where an error becomes a **taken arm**: `status(1..=2)` reports
+    /// *the code must be an integer, not a list* today, since the arm evaluates
+    /// the range to a list and hands it to the constructor.
+    #[test]
+    fn a_range_payload_matches_inside_the_range() {
+        let arms = r#"status(1..=2) => "in" ; _ => "out""#;
+        assert_eq!(match_result(arms, "status(1)"), "in");
+        assert_eq!(match_result(arms, "status(5)"), "out");
+    }
+
+    /// An out-of-range, mistyped or structural payload stops *raising* and
+    /// starts missing quietly — the compatibility cost of the slot becoming a
+    /// pattern, and unconditional across the loudness options, which govern how
+    /// a comparison fails and never reach a payload that fails to destructure.
+    #[test]
+    fn an_unmatchable_payload_is_a_quiet_miss() {
+        assert_eq!(
+            match_result(r#"status(256) => "hit" ; _ => "miss""#, "status(1)"),
+            "miss"
+        );
+        assert_eq!(
+            match_result(r#"status("x") => "hit" ; _ => "miss""#, "status(1)"),
+            "miss"
+        );
+        assert_eq!(
+            match_result(r#"status([n]) => "hit" ; _ => "miss""#, "status(1)"),
+            "miss"
+        );
+    }
+
+    /// **The payload is compared after the variant test**, so a wrong-variant
+    /// subject skips the arm without running it. The answer does not change for
+    /// the int subject — `other` before and after — but an effect the payload
+    /// carried stops happening, which is a cost in its own right.
+    #[test]
+    fn a_wrong_variant_subject_never_evaluates_the_payload() {
+        // **A payload that raises is the discriminator.** An effect written as an
+        // assignment inside the payload's function is scope-local, so asserting
+        // it did not happen passes whether or not the payload ran — the first
+        // draft of this test did exactly that and proved nothing.
+        let boom = "func boom() { return status nope-not-a-number }\n";
+
+        let mut shell = Shell::new();
+        let skipped = format!("{boom}x = match 7 {{ status(boom()) => 'hit' ; _ => 'other' }}\n");
+        assert_eq!(run_line(&skipped, 0, false, &mut shell), Step::Continue(0));
+        assert_eq!(shell.vars.get("x"), Some(&Value::String("other".into())));
+
+        // The same arm over a same-variant subject *does* reach the payload, so
+        // the pair together shows the variant test is what skipped it rather
+        // than the payload being harmless.
+        let mut shell = Shell::new();
+        let reached =
+            format!("{boom}x = match status(1) {{ status(boom()) => 'hit' ; _ => 'other' }}\n");
+        assert_ne!(
+            run_line(&reached, 0, false, &mut shell),
+            Step::Continue(0),
+            "a same-variant subject should have reached the raising payload"
+        );
     }
 }
