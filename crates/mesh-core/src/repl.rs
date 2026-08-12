@@ -36,7 +36,7 @@ use unicode_width::UnicodeWidthStr;
 use crate::builtins::{self, Builtin, Multiplexer, NOTIFY_LIMIT};
 use crate::completion::{CompletionCache, CompletionSpec, ValueHint, man_pages, rank_candidates};
 use crate::expand::{Piece, VarRef, Word};
-use crate::funcs::{FuncDef, Funcs};
+use crate::funcs::{self, FuncDef, Funcs};
 #[cfg(test)]
 use crate::hooks::Hook;
 use crate::hooks::HookEvent;
@@ -5436,7 +5436,10 @@ fn call_function_value(
     let (params, captured, body) = function
         .as_lambda()
         .expect("a callable is a lambda, a modifier reference, or an `&name`");
-    // A lambda has no `wrapper` marker to carry, so it always parses flags.
+    // A lambda has no `wrapper` marker to carry, so it always parses flags — but it
+    // has no generated help either, and `description` is the variable it was read
+    // through rather than a name in the function store, so `--help` binds (or is
+    // refused) like any other flag.
     call_signature_for_value(
         description,
         params,
@@ -5445,6 +5448,7 @@ fn call_function_value(
         function.return_type(),
         arguments,
         true,
+        None,
         last,
         in_function,
         shell,
@@ -6051,6 +6055,9 @@ fn run_declared_modifier(
         &params,
         arguments.unwrap_or(&[]),
         true,
+        // A declared modifier is stored under its own namespace, not in
+        // `shell.funcs`, and has no generated help of its own.
+        None,
         last,
         in_function,
         shell,
@@ -6065,7 +6072,9 @@ fn run_declared_modifier(
         return Ok(Value::String(String::new()));
     }
     let scanned = match scanned {
-        Ok(scanned) => scanned,
+        // `Helped` needs an `AutoHelp`, and a declared modifier passes none.
+        Ok(ScannedCall::Helped(_)) => unreachable!("a modifier offers no generated help"),
+        Ok(ScannedCall::Arguments(scanned)) => scanned,
         Err(step) => {
             shell.result = caller_result;
             shell.produced = caller_produced;
@@ -10830,18 +10839,17 @@ fn run_cd_hooks(event: HookEvent, path: &Path, shell: &mut Shell) {
 }
 
 fn auto_help_requested(args: &[(Value, bool)]) -> bool {
-    // A written `--help` is a `Flag` now; a computed `"--help"` string still
-    // reaches here through the call-site scan, so both spellings are asked.
-    // Only a written `--help` -- a `Flag` -- asks for the generated help. A
-    // computed `"--help"` is data, as every other computed string now is.
-    let is_help = |arg: &Value| matches!(arg, Value::Flag(flag) if flag.name == "help" && flag.value.is_none());
+    // Only a written `--help` — a `Flag` — asks for the generated help. A computed
+    // `"--help"` is data, as every other computed string now is. The value
+    // spelling asks `is_written_help` of its own arguments, so the word means the
+    // same thing in both.
     args.iter()
         .map(|(arg, _)| arg)
         // A written `--` is a terminator *value* now, so the search stops on one
         // of those. The string still stops it too, for a computed `"--"` that
         // reached here through the call-site scan.
         .take_while(|arg| !matches!(arg, Value::FlagTerminator))
-        .any(is_help)
+        .any(is_written_help)
 }
 
 fn configure_prompt(args: &[String], shell: &mut Shell) -> Step {
@@ -11759,21 +11767,33 @@ fn call_func_for_value(
     in_function: bool,
     shell: &mut Shell,
 ) -> Result<Value, Step> {
-    let Some((params, body, captured, wrapper, declared)) = shell.funcs.get(name).map(|def| {
-        (
-            def.params.clone(),
-            def.body.clone(),
-            def.captures.clone(),
-            def.wrapper,
-            def.return_type,
-        )
-    }) else {
+    let Some((params, body, captured, wrapper, declares_help, declared)) =
+        shell.funcs.get(name).map(|def| {
+            (
+                def.params.clone(),
+                def.body.clone(),
+                def.captures.clone(),
+                def.wrapper,
+                def.declares_help(),
+                def.return_type,
+            )
+        })
+    else {
         unreachable!("call_func_for_value is only reached for a declared function");
     };
     // A `wrapper func` parses no flags of its own in either call form, so the
     // value spelling forwards `--flag` verbatim just as command position does.
     // The captures are the definition's, so both call forms bind the same ones: a
     // definition that baked a loop's value must not depend on how it is called.
+    //
+    // Generated `--help` is offered on the same two conditions command position
+    // uses in `dispatch_function_call`: not a wrapper, and not a signature that
+    // declares the switch itself. It reads the *snapshot* taken just above, for
+    // the reason `AutoHelp` gives.
+    let auto_help = (!wrapper && !declares_help).then_some(AutoHelp {
+        params: &params,
+        return_type: declared,
+    });
     call_signature_for_value(
         name,
         &params,
@@ -11782,6 +11802,7 @@ fn call_func_for_value(
         declared,
         arguments,
         !wrapper,
+        auto_help,
         last,
         in_function,
         shell,
@@ -11803,6 +11824,7 @@ fn call_signature_for_value(
     declared: Option<ReturnType>,
     arguments: &[parser::Argument],
     flags_enabled: bool,
+    auto_help: Option<AutoHelp<'_>>,
     last: u8,
     in_function: bool,
     shell: &mut Shell,
@@ -11827,6 +11849,7 @@ fn call_signature_for_value(
         params,
         arguments,
         flags_enabled,
+        auto_help,
         last,
         in_function,
         shell,
@@ -11847,7 +11870,17 @@ fn call_signature_for_value(
         return Ok(Value::String(String::new()));
     }
     let (positionals, switches_on, flag_values) = match scanned {
-        Ok(scanned) => scanned,
+        Ok(ScannedCall::Arguments(scanned)) => scanned,
+        // The generated help answered the call, so no body runs — but the call
+        // still produces the status it printed with, the way a value-called
+        // builtin's help does. Returning a control step instead unwound the
+        // enclosing expression, leaving `x = f(--help)` unbound and skipping the
+        // outer call in `puts before f(--help) after`.
+        Ok(ScannedCall::Helped(code)) => {
+            shell.result = caller_result;
+            shell.produced = caller_produced;
+            return Ok(Value::Status(code));
+        }
         Err(step) => {
             shell.result = caller_result;
             shell.produced = caller_produced;
@@ -14205,7 +14238,8 @@ fn call_modifier_ref(
     // is written out rather than left to `run_call_body_for_value`.
     let caller_result = shell.result.clone();
     let caller_produced = shell.produced;
-    let scanned = evaluate_value_arguments(&label, &[], arguments, true, last, in_function, shell);
+    let scanned =
+        evaluate_value_arguments(&label, &[], arguments, true, None, last, in_function, shell);
     // A `break`/`continue` an argument raised belongs to the caller's loop, and is
     // answered before the argument outcome — an out-of-loop one arrives as an error
     // *and* leaves the flag set. Leaving it set stops the enclosing function where
@@ -14220,7 +14254,9 @@ fn call_modifier_ref(
         return Ok(Value::String(String::new()));
     }
     let (positionals, switches_on, flag_values) = match scanned {
-        Ok(scanned) => scanned,
+        // `Helped` needs an `AutoHelp`, and a modifier reference passes none.
+        Ok(ScannedCall::Helped(_)) => unreachable!("a modifier offers no generated help"),
+        Ok(ScannedCall::Arguments(scanned)) => scanned,
         Err(step) => {
             shell.result = caller_result;
             shell.produced = caller_produced;
@@ -14274,6 +14310,19 @@ type ScannedArguments<'p> = (
     std::collections::HashSet<&'p str>,
     std::collections::HashMap<&'p str, Value>,
 );
+
+/// What a value call's argument list came to: arguments to bind, or a written
+/// `--help` that the call answered instead.
+enum ScannedCall<'p> {
+    Arguments(ScannedArguments<'p>),
+    /// The generated help was printed and the call is over — no body runs. Carried
+    /// as an outcome rather than raised as a `Step` because the call still has to
+    /// **produce a value**: `x = f(--help)` binds the status and
+    /// `puts before f(--help) after` prints it, exactly as the same spellings of a
+    /// value-called builtin's help already do (`DESIGN.md` §"Calling for a value":
+    /// every call yields a value, and a command-shaped one yields a `Status`).
+    Helped(u8),
+}
 
 /// Match `args` against `params` and bind each parameter in the current (already
 /// pushed) scope. Positionals bind left to right, `--flags` in any order, and a
@@ -14435,6 +14484,23 @@ fn bind_scanned<'p>(
     Ok(())
 }
 
+/// What a value call answers a written `--help` from.
+///
+/// A **snapshot**, taken beside the parameters and body in
+/// [`call_func_for_value`] rather than read from the function store when the word
+/// is reached: an argument may redefine the callee mid-call (`f(change(),
+/// --help)`), and the binding that follows uses the snapshot, so reading the store
+/// again would describe one definition while the call used another.
+///
+/// `None` where there is no generated help to offer — a `wrapper`, a signature
+/// that declares its own `--help`, a declared modifier, or a lambda. `wrapper` is
+/// therefore always false here, which is why it is not carried.
+#[derive(Clone, Copy)]
+struct AutoHelp<'p> {
+    params: &'p [parser::Param],
+    return_type: Option<ReturnType>,
+}
+
 /// Evaluate a **value-mode** call's arguments (`f(arg, key: value, ...$spread)`)
 /// in the **caller's** scope into the separated form [`bind_scanned`] expects:
 /// leftover positionals, switches turned on, and valued flags. A `key: value`
@@ -14449,20 +14515,35 @@ fn bind_scanned<'p>(
 /// declared. An explicit `key: value` still binds by name — that is the caller
 /// naming a parameter, not a flag being passed through.
 #[allow(clippy::type_complexity)]
+#[allow(clippy::too_many_arguments)]
 fn evaluate_value_arguments<'p>(
     name: &str,
     params: &'p [parser::Param],
     arguments: &[parser::Argument],
     flags_enabled: bool,
+    auto_help: Option<AutoHelp<'_>>,
     last: u8,
     in_function: bool,
     shell: &mut Shell,
-) -> Result<ScannedArguments<'p>, Step> {
+) -> Result<ScannedCall<'p>, Step> {
     let mut positionals: Vec<Value> = Vec::new();
     let mut switches_on: std::collections::HashSet<&'p str> = std::collections::HashSet::new();
     let mut flag_values: std::collections::HashMap<&'p str, Value> =
         std::collections::HashMap::new();
-    let mut flags_ended = false;
+    // **Evaluate everything, then answer `--help`, then bind** — the order command
+    // position runs in, where `expand_stage` finishes every word before
+    // `dispatch_function_call` looks for the flag and `call_func` binds. Binding as
+    // the scan went along made the two spellings disagree three ways:
+    // `f(--help, side())` never ran `side()`, `f(--help, $missing)` swallowed the
+    // unbound-variable report, and `f(--bogus, --help)` printed the mistake the
+    // command spelling answers with the usage.
+    let mut evaluated: Vec<(&parser::Argument, &parser::Expr, Value)> =
+        Vec::with_capacity(arguments.len());
+    // Tracked over the evaluation pass for two readers: the option scan below, and
+    // the signature an expansion error quotes — which has always meant "the
+    // terminator state the *earlier* arguments left", and still does.
+    let mut scan_ended = false;
+    let mut help_requested = false;
     let mut standing = Standing::new(last, shell);
     for argument in arguments {
         let last = standing.next(shell);
@@ -14489,7 +14570,7 @@ fn evaluate_value_arguments<'p>(
                     // would answer a question the call never posed. A spread is
                     // the same: its expression is the list, not an option.
                     let offered = matches!(argument, parser::Argument::Positional(_));
-                    let signature = (offered && flags_enabled && !flags_ended).then_some(params);
+                    let signature = (offered && flags_enabled && !scan_ended).then_some(params);
                     return Err(option_error(error, Some(name), signature));
                 }
             },
@@ -14501,126 +14582,217 @@ fn evaluate_value_arguments<'p>(
         // expression broke is never type-checked. The caller sees `shell.control`
         // set and skips the call.
         if shell.control.is_some() {
-            return Ok((positionals, switches_on, flag_values));
+            return Ok(ScannedCall::Arguments((
+                positionals,
+                switches_on,
+                flag_values,
+            )));
         }
-        match argument {
-            // Two neighbouring questions with two different answers: `bare` is how
-            // the bound value *types*, and `dashes` is whether a leading `--` names
-            // an option at all. Only a `--name` written at the call site is one, so
-            // `f($w)` and `f("--sleep=0")` hand over data — a string that merely
-            // looks like a flag reaches the parameter instead of being scanned as
-            // one. Reading that from the *runtime* value made `f($w)` work or fail
-            // on what `$w` happened to hold, against the decidability rule
-            // `DESIGN.md` keeps everywhere else, and against quoting making a value
-            // in every other position.
-            //
-            // They must stay separate: `--tag="v2"` is an option whose *value* is
-            // not bare, so answering both with `is_bare_literal_word` stopped
-            // scanning it and pushed the whole token through as a positional.
-            parser::Argument::Positional(_) => {
-                let written_dashed = starts_with_bare_dashes(expression);
-                // A word written as an option whose value is not one string. The
-                // only way to reach here is a glob after the `=`: it evaluates to
-                // a `Value::List` however many paths it matched, and the scan
-                // below inspects `Value::String`, so the word fell through to the
-                // positionals — the option silently unset and the pattern arriving
-                // as data.
-                //
-                // Reported rather than bound, because a list attached to an option
-                // is already an error when it is written as one: `--tag=$xs` says
-                // "list value needs `...`" in both spellings. A glob is the same
-                // shape arriving by a different route, so it gets the same answer
-                // instead of a second rule. Binding the last match would be the
-                // command spelling's answer, but it would put back exactly what
-                // "a glob is a list however many paths it matched" (bf79900)
-                // removed — a value that depends on which files happen to be
-                // there, silently dropping the rest.
-                // A `Flag` is a written option that already parsed, payload and
-                // all, so this shape check does not apply to it — it exists for a
-                // word whose *attached value* evaluated to something that is not
-                // one string.
-                if flags_enabled
-                    && !flags_ended
-                    && written_dashed
-                    && !matches!(
-                        value,
-                        Value::String(_) | Value::Flag(_) | Value::FlagTerminator
-                    )
-                {
-                    // The flag itself is checked first. An undeclared name or a
-                    // switch is a mistake in the line the reader wrote, where the
-                    // value's shape is a consequence of what is on disk — saying
-                    // "not a list" about `--bogus=*.txt` is true and useless.
-                    if let Some(flag) = written_option_name(expression) {
-                        resolve_written_flag(name, params, flag, true)?;
-                    }
-                    let kind = expand::value_kind(&value);
-                    note!("mesh: {name}: an option's value must be one string, not {kind}");
-                    return Err(Step::Error(2));
+        // What this argument offers the option scan, read before anything binds:
+        // a `--` ends the scan, and a written `--help` ahead of one asks for the
+        // generated help. Both questions are the ones `auto_help_requested` asks of
+        // the command spelling's argv, over the values written here instead.
+        if flags_enabled && !scan_ended {
+            for scanned in scanned_values(argument, &value) {
+                if matches!(scanned, Value::FlagTerminator) {
+                    scan_ended = true;
+                    break;
                 }
-                scan_call_value(
-                    name,
-                    params,
-                    value,
-                    flags_enabled,
-                    &mut flags_ended,
-                    &mut positionals,
-                    &mut switches_on,
-                    &mut flag_values,
-                )?
+                // Recorded without stopping: a `--` later in this same spread
+                // still has to end the scan. It cannot un-ask the help — the word
+                // came first — but `scan_ended` is what tells a later argument's
+                // expansion error whether its word was still offered as an option,
+                // and `f(...[--help, --], --bogus=$xs)` has to describe the
+                // payload, not a flag the terminator already said would not be one.
+                if auto_help.is_some() && is_written_help(scanned) {
+                    help_requested = true;
+                }
             }
-            parser::Argument::Named(key, _) => {
-                reject_option_after_terminator(name, key, flags_ended)?;
-                bind_named_option(name, params, key, value, &mut switches_on, &mut flag_values)?;
-            }
-            parser::Argument::Spread(_) => match value {
-                // A spread explodes into call arguments, so each element goes
-                // through the same scan: a `--` element terminates option parsing
-                // and a `--flag` element binds its option, exactly as in command
-                // mode. Elements are values, not literal tokens, so none is `bare`.
-                //
-                // They *are* scanned for flags, unlike a plain positional, and the
-                // split is the point rather than an inconsistency: writing `...`
-                // is the explicit "these are arguments, flags included" gesture —
-                // the forwarding channel a wrapper needs — where `f($w)` says
-                // "this is one value". Both readings stay legible from the line,
-                // which is what a runtime scan cost.
-                Value::List(items) => {
-                    for item in items {
-                        scan_call_value(
-                            name,
-                            params,
-                            item,
-                            flags_enabled,
-                            &mut flags_ended,
-                            &mut positionals,
-                            &mut switches_on,
-                            &mut flag_values,
-                        )?;
-                    }
-                }
-                Value::Map(entries) => {
-                    for (key, value) in entries {
-                        reject_option_after_terminator(name, &key, flags_ended)?;
-                        bind_named_option(
-                            name,
-                            params,
-                            &key,
-                            value,
-                            &mut switches_on,
-                            &mut flag_values,
-                        )?;
-                    }
-                }
-                _ => {
-                    return runtime_error(format!(
-                        "{name}: a spread argument must be a list (of positionals) or a map (of options)"
-                    ));
-                }
-            },
         }
+        evaluated.push((argument, expression, value));
     }
-    Ok((positionals, switches_on, flag_values))
+    // The help is rendered from the signature this call **snapshotted**, not from
+    // the store as it stands here: an argument may have redefined the callee, and
+    // the binding below uses the snapshot, so reading the store again would
+    // describe one definition while the call used another.
+    if let Some(help) = auto_help.filter(|_| help_requested) {
+        let text = funcs::generated_help(name, help.params, help.return_type, false);
+        return Ok(ScannedCall::Helped(builtins::print_generated_help(
+            name, &text,
+        )));
+    }
+    let mut flags_ended = false;
+    for (argument, expression, value) in evaluated {
+        bind_one_argument(
+            name,
+            params,
+            argument,
+            expression,
+            value,
+            flags_enabled,
+            &mut flags_ended,
+            &mut positionals,
+            &mut switches_on,
+            &mut flag_values,
+        )?;
+    }
+    Ok(ScannedCall::Arguments((
+        positionals,
+        switches_on,
+        flag_values,
+    )))
+}
+
+/// The values one evaluated argument offers to the **option scan**, in order.
+///
+/// A positional offers itself, and a spread offers its list's elements — the two
+/// forms `scan_call_value` scans. A `key: value` pair offers nothing: it names a
+/// parameter rather than writing an option, so no `--` or `--help` can arrive that
+/// way, and neither can a spread of a map.
+fn scanned_values<'v>(argument: &parser::Argument, value: &'v Value) -> &'v [Value] {
+    match (argument, value) {
+        (parser::Argument::Positional(_), value) => std::slice::from_ref(value),
+        (parser::Argument::Spread(_), Value::List(items)) => items,
+        _ => &[],
+    }
+}
+
+/// A written, payload-free `--help` — the word that asks for the generated help.
+///
+/// Only a written option is one: a computed `"--help"` string is data, as every
+/// other computed string is. `--help=x` is not this word either; it is a value for
+/// an option nothing declares, and reports so.
+fn is_written_help(value: &Value) -> bool {
+    matches!(value, Value::Flag(flag) if flag.name == "help" && flag.value.is_none())
+}
+
+/// Bind one already-evaluated value-mode argument: the [`evaluate_value_arguments`]
+/// loop body, split out so every argument can be evaluated — and the `--help`
+/// question answered — before the first one binds.
+#[allow(clippy::too_many_arguments)]
+fn bind_one_argument<'p>(
+    name: &str,
+    params: &'p [parser::Param],
+    argument: &parser::Argument,
+    expression: &parser::Expr,
+    value: Value,
+    flags_enabled: bool,
+    flags_ended: &mut bool,
+    positionals: &mut Vec<Value>,
+    switches_on: &mut std::collections::HashSet<&'p str>,
+    flag_values: &mut std::collections::HashMap<&'p str, Value>,
+) -> Result<(), Step> {
+    let flags_ended_now = *flags_ended;
+    match argument {
+        // Two neighbouring questions with two different answers: `bare` is how
+        // the bound value *types*, and `dashes` is whether a leading `--` names
+        // an option at all. Only a `--name` written at the call site is one, so
+        // `f($w)` and `f("--sleep=0")` hand over data — a string that merely
+        // looks like a flag reaches the parameter instead of being scanned as
+        // one. Reading that from the *runtime* value made `f($w)` work or fail
+        // on what `$w` happened to hold, against the decidability rule
+        // `DESIGN.md` keeps everywhere else, and against quoting making a value
+        // in every other position.
+        //
+        // They must stay separate: `--tag="v2"` is an option whose *value* is
+        // not bare, so answering both with `is_bare_literal_word` stopped
+        // scanning it and pushed the whole token through as a positional.
+        parser::Argument::Positional(_) => {
+            let written_dashed = starts_with_bare_dashes(expression);
+            // A word written as an option whose value is not one string. The
+            // only way to reach here is a glob after the `=`: it evaluates to
+            // a `Value::List` however many paths it matched, and the scan
+            // below inspects `Value::String`, so the word fell through to the
+            // positionals — the option silently unset and the pattern arriving
+            // as data.
+            //
+            // Reported rather than bound, because a list attached to an option
+            // is already an error when it is written as one: `--tag=$xs` says
+            // "list value needs `...`" in both spellings. A glob is the same
+            // shape arriving by a different route, so it gets the same answer
+            // instead of a second rule. Binding the last match would be the
+            // command spelling's answer, but it would put back exactly what
+            // "a glob is a list however many paths it matched" (bf79900)
+            // removed — a value that depends on which files happen to be
+            // there, silently dropping the rest.
+            // A `Flag` is a written option that already parsed, payload and
+            // all, so this shape check does not apply to it — it exists for a
+            // word whose *attached value* evaluated to something that is not
+            // one string.
+            if flags_enabled
+                && !flags_ended_now
+                && written_dashed
+                && !matches!(
+                    value,
+                    Value::String(_) | Value::Flag(_) | Value::FlagTerminator
+                )
+            {
+                // The flag itself is checked first. An undeclared name or a
+                // switch is a mistake in the line the reader wrote, where the
+                // value's shape is a consequence of what is on disk — saying
+                // "not a list" about `--bogus=*.txt` is true and useless.
+                if let Some(flag) = written_option_name(expression) {
+                    resolve_written_flag(name, params, flag, true)?;
+                }
+                let kind = expand::value_kind(&value);
+                note!("mesh: {name}: an option's value must be one string, not {kind}");
+                return Err(Step::Error(2));
+            }
+            scan_call_value(
+                name,
+                params,
+                value,
+                flags_enabled,
+                flags_ended,
+                positionals,
+                switches_on,
+                flag_values,
+            )?;
+        }
+        parser::Argument::Named(key, _) => {
+            reject_option_after_terminator(name, key, flags_ended_now)?;
+            bind_named_option(name, params, key, value, switches_on, flag_values)?;
+        }
+        parser::Argument::Spread(_) => match value {
+            // A spread explodes into call arguments, so each element goes
+            // through the same scan: a `--` element terminates option parsing
+            // and a `--flag` element binds its option, exactly as in command
+            // mode. Elements are values, not literal tokens, so none is `bare`.
+            //
+            // They *are* scanned for flags, unlike a plain positional, and the
+            // split is the point rather than an inconsistency: writing `...`
+            // is the explicit "these are arguments, flags included" gesture —
+            // the forwarding channel a wrapper needs — where `f($w)` says
+            // "this is one value". Both readings stay legible from the line,
+            // which is what a runtime scan cost.
+            Value::List(items) => {
+                for item in items {
+                    scan_call_value(
+                        name,
+                        params,
+                        item,
+                        flags_enabled,
+                        flags_ended,
+                        positionals,
+                        switches_on,
+                        flag_values,
+                    )?;
+                }
+            }
+            Value::Map(entries) => {
+                for (key, value) in entries {
+                    reject_option_after_terminator(name, &key, *flags_ended)?;
+                    bind_named_option(name, params, &key, value, switches_on, flag_values)?;
+                }
+            }
+            _ => {
+                return runtime_error(format!(
+                    "{name}: a spread argument must be a list (of positionals) or a map (of options)"
+                ));
+            }
+        },
+    }
+    Ok(())
 }
 
 /// A bare `--` ends option parsing, so no option may follow it — and a `key:
@@ -14641,6 +14813,9 @@ fn reject_option_after_terminator(name: &str, key: &str, flags_ended: bool) -> R
 /// positional. Shared by direct positional arguments and spread elements so both
 /// follow the command-mode rules (`DESIGN.md` §"Functions"), including the
 /// `flags_enabled` gate a `wrapper func` turns off.
+///
+/// A written `--help` never reaches here: [`evaluate_value_arguments`] answers it
+/// before any argument binds, as command position does.
 #[allow(clippy::too_many_arguments)]
 fn scan_call_value<'p>(
     name: &str,

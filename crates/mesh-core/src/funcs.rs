@@ -45,9 +45,7 @@ impl FuncDef {
     /// function that claims `--help` keeps it: the canned help never overrides the
     /// function's own contract (`DESIGN.md` §"Command resolution and help").
     pub fn declares_help(&self) -> bool {
-        self.params.iter().any(|param| {
-            param.name == "help" && matches!(param.kind, ParamKind::Switch | ParamKind::Flag(_))
-        })
+        declares_help(&self.params)
     }
 
     /// Produce help in the same conventional shape used by builtin commands: a
@@ -61,59 +59,83 @@ impl FuncDef {
     /// completion is built from, so `g --<Tab>` would offer a flag that goes
     /// straight to `...rest`.
     pub fn help(&self, name: &str) -> String {
-        let mut usage = format!("Usage: {name}");
-        let mut arguments = String::new();
-        let mut options = String::new();
-        for param in &self.params {
-            let upper = param.name.to_uppercase();
-            match &param.kind {
-                ParamKind::Required => {
-                    usage.push_str(&format!(" <{upper}>"));
-                    arguments.push_str(&format!("  <{upper}>\n"));
-                }
-                ParamKind::Optional(_) => {
-                    usage.push_str(&format!(" [<{upper}>]"));
-                    arguments.push_str(&format!("  [<{upper}>]\n"));
-                }
-                ParamKind::Rest => {
-                    usage.push_str(&format!(" [<{upper}>...]"));
-                    arguments.push_str(&format!("  [<{upper}>...]\n"));
-                }
-                ParamKind::Switch => {
-                    options.push_str(&format!("  --{}\n", param.name));
-                }
-                ParamKind::Flag(_) => {
-                    options.push_str(&format!("  --{}=<{upper}>\n", param.name));
-                }
+        generated_help(name, &self.params, self.return_type, self.wrapper)
+    }
+}
+
+/// Whether a signature declares its own `--help` — the [`FuncDef::declares_help`]
+/// question asked of a signature on its own, for a caller holding the parameters
+/// rather than the definition they came from.
+pub fn declares_help(params: &[Param]) -> bool {
+    params.iter().any(|param| {
+        param.name == "help" && matches!(param.kind, ParamKind::Switch | ParamKind::Flag(_))
+    })
+}
+
+/// [`FuncDef::help`] over a signature rather than a definition.
+///
+/// Split out so a caller that has already **snapshotted** the signature renders
+/// from that snapshot: a value call clones the parameters before evaluating its
+/// arguments, and one of those arguments may redefine the callee, which would
+/// otherwise describe one definition while binding into another.
+pub fn generated_help(
+    name: &str,
+    params: &[Param],
+    return_type: Option<ReturnType>,
+    wrapper: bool,
+) -> String {
+    let mut usage = format!("Usage: {name}");
+    let mut arguments = String::new();
+    let mut options = String::new();
+    for param in params {
+        let upper = param.name.to_uppercase();
+        match &param.kind {
+            ParamKind::Required => {
+                usage.push_str(&format!(" <{upper}>"));
+                arguments.push_str(&format!("  <{upper}>\n"));
+            }
+            ParamKind::Optional(_) => {
+                usage.push_str(&format!(" [<{upper}>]"));
+                arguments.push_str(&format!("  [<{upper}>]\n"));
+            }
+            ParamKind::Rest => {
+                usage.push_str(&format!(" [<{upper}>...]"));
+                arguments.push_str(&format!("  [<{upper}>...]\n"));
+            }
+            ParamKind::Switch => {
+                options.push_str(&format!("  --{}\n", param.name));
+            }
+            ParamKind::Flag(_) => {
+                options.push_str(&format!("  --{}=<{upper}>\n", param.name));
             }
         }
-        let mut help = format!("{usage}\n");
-        // The result is part of the signature a caller reads, and the whole point
-        // of declaring it is that `help` can answer "what does this return?"
-        // without anyone opening the body. A `func` that declares nothing prints
-        // no line rather than "status": absence is what says there is no value
-        // channel, and spelling it out here would read as a promise of one.
-        if let Some(declared) = self.return_type {
-            help.push_str(&format!("\nReturns: {}\n", declared.as_str()));
-        }
-        if !arguments.is_empty() {
-            help.push_str("\nArguments:\n");
-            help.push_str(&arguments);
-        }
-        if self.wrapper {
-            // No literal flag in this line: completion is built from this text,
-            // so naming one here would put it back in the candidate list.
-            help.push_str("\nParses no flags; every argument is forwarded verbatim.\n");
-            return help;
-        }
-        help.push_str("\nOptions:\n");
-        help.push_str(&options);
-        // A declared `--help` is already listed above; don't duplicate it.
-        if !self.declares_help() {
-            help.push_str("  --help  Print help\n");
-        }
-        help
     }
+    let mut help = format!("{usage}\n");
+    // The result is part of the signature a caller reads, and the whole point
+    // of declaring it is that `help` can answer "what does this return?"
+    // without anyone opening the body. A `func` that declares nothing prints
+    // no line rather than "status": absence is what says there is no value
+    // channel, and spelling it out here would read as a promise of one.
+    if let Some(declared) = return_type {
+        help.push_str(&format!("\nReturns: {}\n", declared.as_str()));
+    }
+    if !arguments.is_empty() {
+        help.push_str("\nArguments:\n");
+        help.push_str(&arguments);
+    }
+    if wrapper {
+        // No literal flag in this line: completion is built from this text,
+        // so naming one here would put it back in the candidate list.
+        help.push_str("\nParses no flags; every argument is forwarded verbatim.\n");
+        return help;
+    }
+    help.push_str("\nOptions:\n");
+    help.push_str(&options);
+    // A declared `--help` is already listed above; don't duplicate it.
+    if !declares_help(params) {
+        help.push_str("  --help  Print help\n");
+    }
+    help
 }
 
 /// The session's defined functions (name → definition).
