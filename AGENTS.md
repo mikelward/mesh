@@ -11,6 +11,12 @@ for build/test/layout and `ROADMAP.md` for the plan. The code-style and testing
 rules below are now in force for anything under `crates/`; the process rules
 apply throughout.
 
+Keep this file as short as it can be and still work. Every session loads it
+whole, so each rule costs context on every turn: add one the first time
+something bites, say it once in the fewest words that carry the *why*, rewrite
+or trim an existing rule rather than appending beside it, and delete one that
+has stopped biting.
+
 ## Responding to review comments
 
 - **Codex is the automated reviewer on this repo** — not Copilot. Its reviews
