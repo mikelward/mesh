@@ -227,6 +227,39 @@ Delete an entry once you have agreed with it or reversed it.
       refusal would break any config relying on it. Reviewed and kept as built —
       left listed rather than deleted, to be judged once it has been used.
 
+- [ ] **A line probes with its own operands.** `ssh host <Tab>` runs `ssh host
+      --help`, which OpenSSH reads as a remote command and connects. This predates
+      wrapper completion — checked against a fake executable on `main`, which
+      recorded `operand --help` — and `DESIGN.md` §"Completion" already names the
+      eventual answer: an opt-out denylist for commands whose `--help` is not safe,
+      plus the other bounds listed there. **A forwarded line is the same path**:
+      `alias h = ssh host` probes `ssh host --help` too, because the words an alias
+      stands for are forwarded to the probe verbatim — completing it is the user
+      running it, which is the point. So a denylist has to be consulted on the
+      rewritten words, not only on what was typed.
+
+- [ ] **A call-site environment prefix is dropped before completion.**
+      `command_segment_words` strips the `PATH=/opt/v2` of `PATH=/opt/v2 tool
+      --<Tab>` along with the rest of the prefix, so the spec, the probe and the
+      answer all describe whichever `tool` the ambient `PATH` finds rather than
+      the one the line would run. True of every line since that function was
+      written, and a forwarded one inherits it unchanged: `PATH=/opt/v2 x <Tab>`
+      for `alias x = tool` completes exactly as the typed line does, which is what
+      this rule promises. Two ways out — carry the prefix into the lookup and the
+      probe, or decline to complete a prefixed line at all — and the first is the
+      honest one, since declining would leave a line the shell runs and cannot
+      complete, which is the rough edge this all started from. Left alone here
+      because it is one behavior of the *typed* path, not something forwarding
+      introduced; fixing it in one place fixes both.
+
+- [ ] **An unrecognized wrapper keeps its own (empty) completion spec** (rough
+      edge 22) rather than falling through to a probe. A wrapper that pipes,
+      guards, runs two statements, or *uses* its rest instead of forwarding it is
+      doing something of its own, and there is no single command to say it fronts;
+      guessing from the first word of its body would be wrong whenever it is not a
+      passthrough. Taken under autopilot, and a few lines in `forwarded_command`
+      to revisit.
+
 ## Build and toolchain
 
 - [ ] **Nothing nags when the pinned Rust release falls behind.**
@@ -5332,14 +5365,46 @@ thing a reader takes on trust.*
       against that one definition, so the rest of a config survives it. What this
       entry is actually about — that there is no spelling for the shortcut — is
       untouched.
-- [ ] **22. An alias cannot be tab-completed.** `co --` offers nothing:
+- [x] **22. An alias cannot be tab-completed.** `co --` offered nothing:
       completion builds a spec from a function's generated help, which a wrapper
-      leaves empty by design, and it cannot fall back to probing because the name
-      is a function rather than a program on `PATH`. Since `alias` exists to make
-      forwarding terse, every alias in a config is a name the shell can run and
-      cannot complete. Related to the open `$sh.complete` item under "Beyond M3 —
-      Interactive completion", though the likelier fix is that a wrapper's spec
-      should be the spec of whatever it forwards to.
+      leaves empty by design, and it could not fall back to probing because the
+      name is a function rather than a program on `PATH`. Since `alias` exists to
+      make forwarding terse, every alias in a config was a name the shell can run
+      and cannot complete.
+
+      **Built.** `CompletionState` carries a `forwards` map, built from every
+      wrapper whose body is a single command ending in its own `...rest` — the
+      shape `alias` desugars to and the shape a wrapper is written in by hand. The
+      line is rewritten through it in `segment_completions`, the outermost point,
+      ahead of every dispatch keyed on the command's own name: `command`'s
+      program-name completion, the namespace `type` completes its operand from,
+      the value hint an option takes, the help-derived flags.
+
+      **The body's words are forwarded verbatim.** `alias co = git checkout`
+      completes as `git checkout`, `alias ll = ls -l` as `ls -l`, `alias t =
+      type --` as `type --`. The line the reader would have typed is the line that
+      gets completed, which is the whole of the rule — nothing here needs to decide
+      whether `checkout` is a subcommand and `host` an operand, since both are
+      words of the invocation and the spec `CMD WORDS --help` yields is the one
+      describing it. A terminator needs no handling of its own either: forwarded as
+      itself, `t --tool` becomes `type -- --tool` and the `terminated` check
+      downstream reads the word after it as a name.
+
+      That rests on the probe decision `DESIGN.md` §"Completion" already made —
+      Tab at argument position is the reader asking about a command they are
+      already invoking, and a typed `ssh host <Tab>` has always probed the same
+      way. An alias is that same question in fewer keystrokes, so it gets the same
+      answer rather than a narrower one. *(This was briefly re-litigated during
+      review and the feature narrowed to a bare rename on the strength of it; the
+      repo owner pointed out the decision already existed, and it was widened
+      back.)*
+
+      Words that change the command's **identity** still stop it: a `NAME=value`
+      prefix can point `PATH` elsewhere, so the spec, the probe and the answer
+      would belong to a binary this lookup never finds. So does a glob, refused on
+      sight rather than expanded — the map is rebuilt before every prompt, and
+      `alias x = /**/*` would have walked the filesystem on each one.
+
 - [x] **23. `'…'` is not literal, which surprises on paste.** mesh processes
       escapes inside single quotes as well as double, so a pasted sed/awk/grep
       program is a *syntax error* (`invalid escape \(`) rather than a working

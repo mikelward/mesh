@@ -9813,6 +9813,31 @@ fn dispatch_function_call(name: &str, args: Vec<(Value, bool)>, shell: &mut Shel
     call_func(name, args, !wrapper, shell)
 }
 
+/// The literal text a word spells, **however it was quoted** — piece by piece,
+/// each paired with whether the reader left that piece bare.
+///
+/// [`bare_word`] asks the narrower question — whether the reader typed it bare —
+/// which is what tells a construct from a word that merely spells the same
+/// letters. This one is for a caller that only needs the text: `alias g = "git"`
+/// names the same command `alias g = git` does, since quoting decides whether a
+/// word is data rather than which command it is.
+///
+/// The pieces stay apart rather than joined because expansion reads them that
+/// way: quoting can change within a word (`g"it"`, `*"a"`), and which half a `*`
+/// fell in decides whether it is a pattern.
+fn text_word_pieces(token: &parser::Word) -> Option<Vec<(&str, bool)>> {
+    token
+        .pieces
+        .iter()
+        .map(|piece| match piece {
+            parser::WordPiece::Text { text, quote } => {
+                Some((text.as_str(), *quote == parser::QuoteMode::Bare))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
 /// The bare word a token spells, when it spells one at all.
 ///
 /// A single unquoted `Text` piece and nothing else. Anything built from a
@@ -16836,6 +16861,15 @@ struct CompletionState {
     /// would drop the program along with the builtin.
     programs: Vec<String>,
     help: HashMap<String, CompletionSpec>,
+    /// What each **forwarding wrapper** stands in front of — `co` → `git
+    /// checkout` — so its arguments complete as that command's do.
+    ///
+    /// A wrapper's generated help names no options on purpose (it parses none),
+    /// so a spec built from it is empty, and being *present* in `help` stopped
+    /// the fallback that would otherwise have probed. Since `alias` desugars to a
+    /// `wrapper func` whose body is one forwarded command, that made every alias
+    /// in a config a name the shell can run and cannot complete.
+    forwards: HashMap<String, Forwarding>,
     cache: CompletionCache,
     variables: Vec<(String, Value)>,
     /// Every **name** `whence` can answer about, which is a wider set than
@@ -16889,6 +16923,16 @@ impl CompletionState {
                 .get(name)
                 .map(|def| (name.into(), CompletionSpec::from_help(&def.help(name))))
         }));
+        let forwards: HashMap<String, Forwarding> = shell
+            .funcs
+            .names()
+            .filter_map(|name| {
+                Some((
+                    name.to_owned(),
+                    forwarded_command(shell.funcs.get(name)?, &shell.vars)?,
+                ))
+            })
+            .collect();
         let variables: Vec<(String, Value)> = shell
             .vars
             .visible()
@@ -16908,6 +16952,7 @@ impl CompletionState {
             commands,
             programs,
             help,
+            forwards,
             cache: CompletionCache::default(),
             variables,
             names,
@@ -16918,6 +16963,248 @@ impl CompletionState {
     fn man_pages(&self) -> &[String] {
         self.man_pages.get_or_init(man_pages)
     }
+
+    /// Rewrite a command line's words as the command a forwarding wrapper stands
+    /// in front of, leaving everything already typed after the name in place:
+    /// `co --col` looks up `git checkout --col`.
+    ///
+    /// Chains resolve — one alias may name another — and a cycle stops rather
+    /// than spinning, since `alias a = b` / `alias b = a` is writable and only
+    /// fails when it is *run*. Completion must not be the thing that hangs.
+    fn forwarding(&self, words: &[String]) -> Option<(Vec<String>, Lookup)> {
+        let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        let mut words = words.to_vec();
+        let mut lookup = Lookup::Shell;
+        while let Some(first) = words.first()
+            && let Some((name, target)) = self.forwards.get_key_value(first.as_str())
+            && seen.insert(name.as_str())
+        {
+            let mut rewritten = target.words.clone();
+            rewritten.extend_from_slice(&words[1..]);
+            words = rewritten;
+            if target.external {
+                lookup = Lookup::External;
+                break;
+            }
+        }
+        (!seen.is_empty()).then_some((words, lookup))
+    }
+}
+
+/// What a forwarding wrapper stands in front of.
+struct Forwarding {
+    /// The words that pick a spec — a command and any subcommands.
+    words: Vec<String>,
+    /// Written `command NAME`, so the name means the **program** rather than
+    /// whatever the shell would resolve it to. A self-naming alias desugars
+    /// through that escape — it is how `alias grep = grep --color=auto` reaches
+    /// grep instead of itself — so completion has to read it the same way, or it
+    /// resolves the rewritten name straight back to the alias's own empty spec.
+    external: bool,
+}
+
+/// The command a **forwarding wrapper** stands in front of — the words that pick
+/// which spec describes it.
+///
+/// The shape recognized is the one `alias` desugars to and the one a wrapper is
+/// written as by hand: a single command whose last word is the wrapper's own
+/// `...rest`, spread verbatim. Anything else — a pipeline, a guard, two
+/// statements, a rest that is used rather than forwarded — is a wrapper that does
+/// something of its own, and guessing at what it fronts would be wrong more often
+/// than useful.
+///
+/// Only the leading **bare, undashed** words are taken. Those are what select a
+/// spec — a command and its subcommands — where a flag in the wrapper's body
+/// (`alias ll = ls -l`) narrows the invocation without changing which command's
+/// options are being offered.
+fn forwarded_command(def: &FuncDef, vars: &Vars) -> Option<Forwarding> {
+    if !def.wrapper {
+        return None;
+    }
+    // The rest has to be the *whole* signature. A wrapper that takes something of
+    // its own first — `wrapper func w(prefix, ...rest) { git ...$rest }` — binds
+    // the reader's next word to `prefix`, where the forwarded command never sees
+    // it, so completing it as that command's argument would describe a word that
+    // does not reach it. An alias always has exactly this one parameter.
+    let [rest] = def.params.as_slice() else {
+        return None;
+    };
+    if !matches!(rest.kind, parser::ParamKind::Rest) {
+        return None;
+    }
+    let rest = rest.name.as_str();
+    let [statement] = def.body.statements.as_slice() else {
+        return None;
+    };
+    if statement.background || !statement.and_or.rest.is_empty() {
+        return None;
+    }
+    let parser::Executable::Pipeline(pipeline) = &statement.and_or.first else {
+        return None;
+    };
+    let [stage] = pipeline.stages.as_slice() else {
+        return None;
+    };
+    let command = stage.as_command()?;
+    if command.guard.is_some() {
+        return None;
+    }
+    // A `NAME=value` prefix stops it. It consumes no argument, which is why this
+    // once let it through — but `PATH=/opt/v2 tool` changes which *binary* `tool`
+    // is, so the spec, the probe and the answer all belong to a command this
+    // lookup would never find. Excluded whole rather than special-casing `PATH`:
+    // deciding which variables change a command's behavior is the same guess
+    // about arbitrary programs that the rest of this function refuses to make.
+    if !command.env.is_empty() {
+        return None;
+    }
+    // Redirection does not change which command receives the arguments, so it is
+    // skipped rather than disqualifying the wrapper: `alias gs = git status >log`
+    // fronts `git status` exactly as the unredirected one does. A `Value` item is
+    // an argument, though, and not one this scan can read.
+    let mut items = Vec::with_capacity(command.items.len());
+    for item in &command.items {
+        match item {
+            parser::CommandItem::Word(word) => items.push(word),
+            parser::CommandItem::Redirect { .. } => {}
+            parser::CommandItem::Value { .. } => return None,
+        }
+    }
+    let [items @ .., last] = items.as_slice() else {
+        return None;
+    };
+    // The forwarded rest, built by the desugaring as a bare `...` beside the
+    // variable — the command-position spread `expand::spread_var` recognizes.
+    let forwards_rest = matches!(
+        last.value.pieces.as_slice(),
+        [
+            parser::WordPiece::Text { text, quote: parser::QuoteMode::Bare },
+            parser::WordPiece::Variable { name, quote: parser::QuoteMode::Bare },
+        ] if text == "..." && name.strip_prefix('$') == Some(rest)
+    );
+    if !forwards_rest || last.value.qualifiers.is_some() {
+        return None;
+    }
+    // `alias grep = grep --color=auto` desugars through the self-reach escape, so
+    // the body reads `command grep …`. What completes is `grep`, not the builtin
+    // that got it there — and the escape is *kept*, as `external`, because it is
+    // the whole reason the name means the program here.
+    //
+    // The escape is `command` followed by a **name**, and `command`'s own `--` may
+    // sit between them (`alias g = command -- git`). Without a name after it there
+    // is no escape at all, and what is left decides on its own: `alias c =
+    // command` is a rename of the builtin, while `alias c = command --` keeps a
+    // fixed terminator and so forwards nothing, with every other terminator.
+    // Every word of the escape is read as **running it** reads it: command
+    // resolution works on expanded text, so `alias g = "command" printf` really
+    // does reach the program, and `alias x = command ""-tool` really is `-tool`.
+    // Asking only the first piece let that second one through as an external
+    // rename — a line `command` itself refuses, which completion would then have
+    // probed by running `-tool --help`.
+    let spelled = |word: &parser::Spanned<parser::Word>| {
+        text_word_pieces(&word.value).map(|pieces| {
+            pieces
+                .iter()
+                .map(|(text, _)| *text)
+                .collect::<Vec<_>>()
+                .concat()
+        })
+    };
+    let mut items = items;
+    let mut external = false;
+    // Did `command`'s own `--` protect the name it escapes to? Kept, because
+    // stripping the terminator is what would otherwise forget it: past one the
+    // next word is the program *however it reads*, which is exactly the case the
+    // dash refusal below must not catch.
+    let mut protected = false;
+    if items.first().and_then(|word| spelled(word)).as_deref() == Some("command") {
+        let past = &items[1..];
+        let (past, terminated) = match past.first().and_then(|word| spelled(word)).as_deref() {
+            Some("--") => (&past[1..], true),
+            _ => (past, false),
+        };
+        // Whether that name is dashed is asked *after* expansion, below — the one
+        // place it can be answered, since a `~` is a plain name here and may not
+        // be one by the time it is looked up.
+        if past.first().is_some_and(|word| spelled(word).is_some()) {
+            external = true;
+            protected = terminated;
+            items = past;
+        }
+    }
+    // **The body's words are forwarded verbatim.** `alias co = git checkout`
+    // completes as `git checkout`, `alias ll = ls -l` as `ls -l`, `alias t =
+    // type --` as `type --`. The line the reader would have typed is the line
+    // that gets completed, which is the whole of the rule.
+    //
+    // Nothing here needs to know whether `checkout` is a subcommand and `host` an
+    // operand: both are words of the invocation, and whatever spec `CMD WORDS
+    // --help` yields is the one describing *that* invocation. Probing it is
+    // settled — `DESIGN.md` §"Completion": Tab at argument position is the reader
+    // asking about a command they are already invoking, and a typed
+    // `ssh host <Tab>` has always probed the same way.
+    //
+    // A terminator needs no special handling for the same reason. Forwarded as
+    // itself, `t --tool` becomes `type -- --tool`, and the `terminated` check in
+    // `argument_completions` already reads the word after it as a name.
+    let mut words: Vec<String> = Vec::with_capacity(items.len());
+    for word in items {
+        // Quoted or not, and however the quoting moves *within* the word: `alias
+        // g = "git"` and `alias g = g"it"` name the same command. Quoting decides
+        // whether a word is *data* rather than which command it names.
+        //
+        // Read the way running it reads it, so `alias tool = ~/bin/tool` names the
+        // file the alias actually runs rather than a literal `~` directory. No
+        // variable is left among text pieces, so the tilde and a glob are what
+        // expansion can still do.
+        let pieces = text_word_pieces(&word.value)?;
+        // A glob is refused on **sight**, before anything expands it. This map is
+        // rebuilt before every prompt, so expanding one would walk the filesystem
+        // on each, for an alias nobody invoked — `alias x = /**/*` would have made
+        // the prompt itself stall. Asked of the pieces rather than of joined text,
+        // since that is how the question is decided: the `*` of `*"a"` is a
+        // pattern and the `*` of `"*"a` is not.
+        if expand::segments_glob(pieces.iter().copied()) || word.value.qualifiers.is_some() {
+            return None;
+        }
+        let expanded = expand::expand(
+            vec![expand::Word {
+                pieces: pieces
+                    .iter()
+                    .map(|(text, bare)| expand::Piece::Text {
+                        text: (*text).to_owned(),
+                        expandable: *bare,
+                    })
+                    .collect(),
+                qualifiers: None,
+            }],
+            vars,
+        )
+        .ok()?;
+        let [expanded] = expanded.as_slice() else {
+            return None;
+        };
+        words.push(expanded.clone());
+    }
+    // The escape reaches past a **name**, and whether a word is one is settled
+    // after expansion rather than where it is written: `command -tool` is dashed
+    // as written, and `command ~` becomes so with a `HOME` of `-tool`. Either way
+    // `command` reads it as an option of its own and refuses, so recording an
+    // external rename would let completion probe a `-tool` on `PATH` for a line
+    // that cannot execute.
+    //
+    // Unless a `--` came first, which is the one thing that answers it: past the
+    // terminator `command` takes the next word as the program however it reads,
+    // and `command -- -tool` is what its own error message tells a reader to
+    // write. Only the escape asks at all — with nothing in front of it a dashed
+    // word is an ordinary command head, which is why `alias x = -tool` forwards.
+    if external && !protected && words.first().is_some_and(|name| name.starts_with('-')) {
+        return None;
+    }
+    if words.is_empty() {
+        return None;
+    }
+    Some(Forwarding { words, external })
 }
 
 struct MeshCompleter {
@@ -16962,7 +17249,7 @@ fn suggestions(values: Vec<String>, start: usize, pos: usize) -> Vec<Suggestion>
 /// that will not run and reads the wrong command's flags: with a `func ls` defined,
 /// `command ls --<Tab>` must ask the *program* for its options, not the function
 /// whose whole reason for existing is that it wraps it.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Lookup {
     Shell,
     External,
@@ -16984,8 +17271,39 @@ enum Lookup {
 /// for `-v` — and would have run a `$PATH` file of that name to probe its help —
 /// for a line that reports a usage error rather than running anything.
 fn segment_completions(state: &CompletionState, words: &[String], word: &str) -> Vec<String> {
+    // A forwarding wrapper is completed as the command it fronts, and the rewrite
+    // happens here — the outermost point, ahead of every dispatch keyed on the
+    // command's own *name*: `command`'s program-name completion just below, the
+    // namespace `type` completes its operand from, the value hint an option takes,
+    // the help-derived flags. Resolving it further in gave an alias some of those
+    // and not others, so `alias t = type` offered `--quiet` but not `unless`.
+    //
+    // Rewritten **once**, never re-entered. `forwarding` already walks the chain
+    // to its end under a visited set, and re-resolving its answer would undo that:
+    // `alias a = b x` / `alias b = a y` settles on `a y x …`, which differs from
+    // the line it started from, so a second pass with a fresh visited set grew it
+    // by `y x` forever and Tab overflowed the stack.
+    if let Some((forwarded, lookup)) = state.forwarding(words) {
+        return match lookup {
+            // `command NAME` names the program, and nothing after it is the
+            // shell's to read.
+            Lookup::External => argument_completions(state, &forwarded, word, lookup),
+            _ => segment_completions_resolved(state, &forwarded, word, Lookup::Shell),
+        };
+    }
+    segment_completions_resolved(state, words, word, Lookup::Shell)
+}
+
+/// [`segment_completions`] over words a forwarding wrapper has already been
+/// resolved out of.
+fn segment_completions_resolved(
+    state: &CompletionState,
+    words: &[String],
+    word: &str,
+    lookup: Lookup,
+) -> Vec<String> {
     if words[0] != "command" {
-        return argument_completions(state, words, word, Lookup::Shell);
+        return argument_completions(state, words, word, lookup);
     }
     let typed = usize::from(!word.is_empty());
     let entered = words
@@ -17002,7 +17320,7 @@ fn segment_completions(state: &CompletionState, words: &[String], word: &str) ->
         // flag here is `command`'s too — unless `--` already ended its options,
         // after which the word is the program however it reads.
         CommandLine::Nothing if word.starts_with('-') && !terminated => {
-            argument_completions(state, words, word, Lookup::Shell)
+            argument_completions(state, words, word, lookup)
         }
         // The program's *name* completes from `$PATH` alone, since a builtin or a
         // function is exactly what `command` will not run.
@@ -17011,7 +17329,7 @@ fn segment_completions(state: &CompletionState, words: &[String], word: &str) ->
         // line does — print its help, or report the flag — so there is no program
         // to ask and nothing past them to complete.
         CommandLine::Help | CommandLine::Unknown(_) => {
-            argument_completions(state, words, word, Lookup::Shell)
+            argument_completions(state, words, word, lookup)
         }
     }
 }
@@ -17020,6 +17338,17 @@ fn segment_completions(state: &CompletionState, words: &[String], word: &str) ->
 /// word is data — a name, for `whence` — which is the whole point of writing it.
 fn terminated(earlier: &[String]) -> bool {
     earlier.iter().skip(1).any(|word| word == "--")
+}
+
+/// Does this `whence` line carry `-P`, which narrows the answer to the program a
+/// name would run? Only counted before a `--`, past which the same word is a name
+/// being asked about rather than a flag.
+fn asks_for_path(earlier: &[String]) -> bool {
+    earlier
+        .iter()
+        .skip(1)
+        .take_while(|word| *word != "--")
+        .any(|word| word == "-P")
 }
 
 fn argument_completions(
@@ -17061,11 +17390,20 @@ fn argument_completions(
     // came first**, which is exactly what that terminator is for: past it,
     // `whence` reads every word as a name, so a program really called `--tool`
     // has to be completable the same way it is lookupable.
-    if words.first().is_some_and(|first| first == "type")
+    if lookup == Lookup::Shell
+        && words.first().is_some_and(|first| first == "type")
         && !word.contains('/')
         && (!word.starts_with('-') || terminated(&words[..words.len().saturating_sub(1)]))
     {
-        return rank_candidates(state.names.clone(), word);
+        // `-P` answers with the **program** a name would run, so it reports on
+        // `$PATH` alone: offering a function there names something the lookup is
+        // bound to fail on. Every other spelling reports on all the namespaces.
+        let candidates = if asks_for_path(parent) {
+            state.programs.clone()
+        } else {
+            state.names.clone()
+        };
+        return rank_candidates(candidates, word);
     }
     let parent_help = completion_for(state, parent, lookup);
     let paths = parent_help.positional_hint().map_or_else(
@@ -19406,6 +19744,28 @@ mod tests {
     }
 
     #[test]
+    fn a_path_lookup_completes_only_programs() {
+        // `type -P` answers with the program a name runs and fails on a name that
+        // resolves to a function, so the candidates have to narrow with the flag —
+        // otherwise the completion offers exactly the words the lookup rejects.
+        let state = CompletionState {
+            names: vec!["my_func".into(), "lsof".into()],
+            programs: vec!["lsof".into()],
+            ..CompletionState::default()
+        };
+        let complete = |words: &[&str], word: &str| {
+            let owned: Vec<String> = words.iter().map(|w| (*w).to_owned()).collect();
+            argument_completions(&state, &owned, word, Lookup::Shell)
+        };
+        assert_eq!(complete(&["type", "-P", "ls"], "ls"), ["lsof"]);
+        assert!(complete(&["type", "-P", "my_"], "my_").is_empty());
+        // Without it the answer covers every namespace, functions included.
+        assert_eq!(complete(&["type", "my_"], "my_"), ["my_func"]);
+        // Past a `--` a `-P` is a name being asked about, not the flag.
+        assert_eq!(complete(&["type", "--", "-P", "my_"], "my_"), ["my_func"]);
+    }
+
+    #[test]
     fn a_terminator_makes_whence_complete_a_flag_looking_name() {
         // `whence -- --tool` looks up a program really called `--tool`, so the
         // completion has to agree: past the terminator every word is a name, and
@@ -19460,6 +19820,419 @@ mod tests {
         assert_eq!(flags("prompt", "--r"), ["--reset"]);
         // `--help` is still there, and still last.
         assert!(flags("type", "--").contains(&"--help".to_owned()));
+    }
+
+    #[test]
+    fn an_alias_completes_as_the_command_it_forwards_to() {
+        // `alias` desugars to a `wrapper func`, whose generated help names no
+        // options on purpose — it parses none. That empty spec was *present* in
+        // `help`, so it answered instead of falling through, and every alias in a
+        // config became a name the shell could run and could not complete.
+        let forwarding = |source: &str, name: &str| {
+            let mut shell = Shell::new();
+            assert!(
+                matches!(run_line(source, 0, false, &mut shell), Step::Continue(0)),
+                "{source:?} should define cleanly"
+            );
+            CompletionState::from_shell(&shell)
+                .forwarding(&[name.to_owned(), "--col".to_owned()])
+                .map(|(words, _)| words)
+        };
+
+        // What a forwarding wrapper fronts is a **rename**: the command's name and
+        // nothing else.
+        assert_eq!(
+            forwarding("alias g = git\n", "g"),
+            Some(vec!["git".into(), "--col".into()])
+        );
+        // A self-naming alias desugars through `command`, which is how it reaches
+        // the program rather than itself. The escape has to survive the rewrite —
+        // the name it rewrites to is the alias's own, so resolving that through
+        // the shell again found the alias's empty spec.
+        // Quoted or not, on both halves: the escape is inserted for a quoted
+        // self-naming alias too, and the name it reaches past is the reader's word.
+        for source in ["alias grep = grep\n", "alias grep = \"grep\"\n"] {
+            let mut shell = Shell::new();
+            assert!(matches!(
+                run_line(source, 0, false, &mut shell),
+                Step::Continue(0)
+            ));
+            assert_eq!(
+                CompletionState::from_shell(&shell).forwarding(&["grep".into(), "--col".into()]),
+                Some((vec!["grep".into(), "--col".into()], Lookup::External)),
+                "{source:?}"
+            );
+        }
+        // Where an alias naming something else keeps the ordinary lookup.
+        {
+            let mut shell = Shell::new();
+            assert!(matches!(
+                run_line("alias g = git\n", 0, false, &mut shell),
+                Step::Continue(0)
+            ));
+            assert_eq!(
+                CompletionState::from_shell(&shell)
+                    .forwarding(&["g".into(), "--col".into()])
+                    .map(|(_, lookup)| lookup),
+                Some(Lookup::Shell)
+            );
+        }
+        // `alias c = command` fronts the builtin itself: the escape is `command`
+        // followed by a *name*, and there is none here to reach past. `command`'s
+        // own terminator may sit in front of the name it reaches, though, so
+        // `alias g = command -- git` still fronts git.
+        assert_eq!(
+            forwarding("alias c = command\n", "c"),
+            Some(vec!["command".into(), "--col".into()])
+        );
+        assert_eq!(
+            forwarding("alias g = command -- git\n", "g"),
+            Some(vec!["git".into(), "--col".into()])
+        );
+        // Written by hand, the same shape and the same answer — this is about
+        // wrappers, and `alias` is the terse spelling of one.
+        assert_eq!(
+            forwarding("wrapper func g(...rest) { git ...$rest }\n", "g"),
+            Some(vec!["git".into(), "--col".into()])
+        );
+        // One alias may name another.
+        assert_eq!(
+            forwarding("alias g = git\nalias h = g\n", "h"),
+            Some(vec!["git".into(), "--col".into()])
+        );
+        // Quoting decides whether a word is *data*, not which command it names, so
+        // a quoted one-word target is the same rename — and runs the same command.
+        assert_eq!(
+            forwarding("alias g = \"git\"\n", "g"),
+            Some(vec!["git".into(), "--col".into()])
+        );
+        // The head is read the way running it reads it, so a tilde names the file
+        // the alias actually runs rather than a literal `~` directory.
+        {
+            let home = std::env::var("HOME").expect("a home directory");
+            assert_eq!(
+                forwarding("alias tool = ~/bin/tool\n", "tool"),
+                Some(vec![format!("{home}/bin/tool"), "--col".into()])
+            );
+            // Quoted, it is that path literally — as running it would be.
+            assert_eq!(
+                forwarding("alias tool = \"~/bin/tool\"\n", "tool"),
+                Some(vec!["~/bin/tool".into(), "--col".into()])
+            );
+        }
+        // A glob names no one command, and this map is rebuilt before every
+        // prompt — so it is refused on *sight* rather than expanded to find that
+        // out, which would walk the filesystem once per prompt for an alias nobody
+        // invoked (`alias x = /**/*` would stall the prompt itself).
+        //
+        // A many-match pattern is refused either way, so the case that tells the
+        // two apart is one matching **exactly one** file: expanding it would
+        // succeed and forward the resolved path.
+        {
+            let dir = std::env::temp_dir().join(format!("mesh-alias-glob-{}", std::process::id()));
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("onlyone"), "").unwrap();
+            let pattern = dir.join("only*");
+            let forwarded = forwarding(&format!("alias x = {}\n", pattern.display()), "x");
+            // Cleaned up before the assertion, so a failure leaves nothing behind
+            // — and a cleanup that itself fails is reported rather than swallowed.
+            std::fs::remove_dir_all(&dir).expect("the pattern directory should be removable");
+            assert_eq!(forwarded, None);
+        }
+        // Every word of the escape reads the way running it reads: command
+        // resolution works on expanded text, so a quoted `"command"` is the escape.
+        assert_eq!(
+            forwarding("alias g = \"command\" printf\n", "g"),
+            Some(vec!["printf".into(), "--col".into()])
+        );
+        // And the *whole* name decides the dashed question, not its first piece.
+        // `command ""-tool` is `command -tool`, which `command` refuses — so it is
+        // no rename, and completion must not probe a `-tool` on `PATH` for a line
+        // that cannot run.
+        assert_eq!(forwarding("alias x = command \"\"-tool\n", "x"), None);
+        // Written dashed, the same refusal — and it is decided on the name as
+        // *expanded*, which is the only point that can answer it: a `~` is a plain
+        // name where the escape is written and need not be one once looked up.
+        assert_eq!(forwarding("alias x = command -tool\n", "x"), None);
+        // Past `command`'s own `--` the next word is the program however it reads
+        // — the very line its error message tells a reader to write — so there the
+        // dashed name runs, and completion has to describe it rather than refuse.
+        {
+            let mut shell = Shell::new();
+            assert!(matches!(
+                run_line("alias x = command -- -tool\n", 0, false, &mut shell),
+                Step::Continue(0)
+            ));
+            assert_eq!(
+                CompletionState::from_shell(&shell).forwarding(&["x".into(), "--col".into()]),
+                Some((vec!["-tool".into(), "--col".into()], Lookup::External))
+            );
+        }
+        // Quoting may change *within* the word, and running it concatenates the
+        // pieces — so this is the same rename, and the `*` of `"*"a` is not a
+        // pattern where the `*` of `*"a"` is.
+        assert_eq!(
+            forwarding("alias g = g\"it\"\n", "g"),
+            Some(vec!["git".into(), "--col".into()])
+        );
+        assert_eq!(
+            forwarding("alias x = \"*\"a\n", "x"),
+            Some(vec!["*a".into(), "--col".into()])
+        );
+        // Quoted, the same characters are a literal name rather than a pattern, so
+        // there is nothing to walk and it forwards.
+        assert_eq!(
+            forwarding("alias x = \"to?l\"\n", "x"),
+            Some(vec!["to?l".into(), "--col".into()])
+        );
+        // With nothing in front of it the word *is* the command head, so a program
+        // called `-tool` renames like any other.
+        assert_eq!(
+            forwarding("alias x = -tool\n", "x"),
+            Some(vec!["-tool".into(), "--col".into()])
+        );
+        // A redirection changes neither which command receives the arguments nor
+        // what it does with them, so it does not stop the wrapper being a
+        // forwarder.
+        assert_eq!(
+            forwarding("alias gs = git >log\n", "gs"),
+            Some(vec!["git".into(), "--col".into()])
+        );
+        // A cycle is writable and only fails when it is *run*, so completion has
+        // to stop rather than spin — and a cycle that *adds* words settles
+        // somewhere other than where it started, so re-resolving its answer looked
+        // like progress and overflowed the stack.
+        assert_eq!(
+            forwarding("alias a = b\nalias b = a\n", "a"),
+            Some(vec!["a".into(), "--col".into()])
+        );
+        {
+            let mut shell = Shell::new();
+            assert!(matches!(
+                run_line("alias a = b x\nalias b = a y\n", 0, false, &mut shell),
+                Step::Continue(0)
+            ));
+            let state = CompletionState::from_shell(&shell);
+            assert_eq!(
+                segment_completions(&state, &["a".into(), "--h".into()], "--h"),
+                Vec::<String>::new()
+            );
+        }
+
+        // The body's words ride along verbatim — the line the reader would have
+        // typed is the line that gets completed. Nothing here needs to know that
+        // `checkout` is a subcommand and `host` an operand: both are words of the
+        // invocation, and the spec `CMD WORDS --help` yields describes it.
+        for (source, expect) in [
+            ("alias co = git checkout\n", vec!["git", "checkout"]),
+            ("alias prod = ssh host\n", vec!["ssh", "host"]),
+            ("alias ll = ls -l\n", vec!["ls", "-l"]),
+            (
+                "alias grep = grep --color=auto\n",
+                vec!["grep", "--color=auto"],
+            ),
+            ("alias p = type -P\n", vec!["type", "-P"]),
+            // A terminator needs no handling of its own: forwarded as itself, the
+            // `terminated` check downstream reads the next word as a name.
+            ("alias t = type --\n", vec!["type", "--"]),
+            ("alias t = type -P --\n", vec!["type", "-P", "--"]),
+            ("alias c = command --\n", vec!["command", "--"]),
+        ] {
+            let name = source.split_whitespace().nth(1).expect("an alias name");
+            let mut expect: Vec<String> = expect.into_iter().map(str::to_owned).collect();
+            expect.push("--col".into());
+            assert_eq!(forwarding(source, name), Some(expect), "{source:?}");
+        }
+
+        // An environment prefix is the one word that still stops it: `PATH=/opt/v2
+        // tool` changes which *binary* `tool` is, so the spec, the probe and the
+        // answer would all belong to a command this lookup never finds.
+        assert_eq!(forwarding("alias tool = PATH=/opt/v2 tool\n", "tool"), None);
+        assert_eq!(forwarding("alias g = GIT_DIR=/repo git\n", "g"), None);
+
+        // A wrapper that does something of its own is not a passthrough, and
+        // guessing what it fronts would be wrong more often than useful.
+        for source in [
+            // Something of its own is bound first, so the word being completed
+            // reaches `prefix` rather than the forwarded command.
+            "wrapper func w(prefix, ...rest) { git ...$rest }\n",
+            // Two statements.
+            "wrapper func w(...rest) { puts hi; git ...$rest }\n",
+            // The rest is used, not forwarded.
+            "wrapper func w(...rest) { git $rest }\n",
+            // Not forwarded last.
+            "wrapper func w(...rest) { git ...$rest status }\n",
+            // A pipeline.
+            "wrapper func w(...rest) { git ...$rest | cat }\n",
+            // Not a wrapper at all — it reads its own flags, so its own help is
+            // the right spec.
+            "func w(...rest) { git ...$rest }\n",
+        ] {
+            assert_eq!(forwarding(source, "w"), None, "{source:?}");
+        }
+
+        // End to end, against a builtin target so nothing is probed: the alias
+        // offers the flags of what it fronts, where it offered only `--help`.
+        let mut shell = Shell::new();
+        assert!(matches!(
+            run_line("alias t = type\n", 0, false, &mut shell),
+            Step::Continue(0)
+        ));
+        let state = CompletionState::from_shell(&shell);
+        let offered = |word: &str| segment_completions(&state, &["t".into(), word.into()], word);
+        assert_eq!(offered("--q"), ["--quiet"]);
+        assert_eq!(offered("-P"), ["-P"]);
+        // Not only the help-derived flags: `type` completes its operand from every
+        // namespace it reports on, and that dispatch keys on the command's own
+        // name. Resolving the forwarding deeper down — inside `completion_for` —
+        // left the alias with the flags and none of the operands.
+        assert!(
+            offered("unl").contains(&"unless".to_owned()),
+            "{:?}",
+            offered("unl")
+        );
+
+        // `type`'s namespace completion is the *builtin's*, so a line that names
+        // the program instead must not get it — `command type` runs whatever is on
+        // `PATH`, whose operands are its own business. This was true of a typed
+        // `command type name<Tab>` before any alias existed; the rewrite only
+        // reached it by a second route.
+        {
+            let mut shell = Shell::new();
+            assert!(matches!(
+                run_line("func my_func() { puts hi }\n", 0, false, &mut shell),
+                Step::Continue(0)
+            ));
+            let state = CompletionState::from_shell(&shell);
+            assert!(
+                segment_completions(&state, &["type".into(), "my_f".into()], "my_f")
+                    .contains(&"my_func".to_owned())
+            );
+            assert!(
+                !segment_completions(
+                    &state,
+                    &["command".into(), "type".into(), "my_f".into()],
+                    "my_f"
+                )
+                .contains(&"my_func".to_owned())
+            );
+        }
+
+        // An alias that fixes a flag hands that flag to the same dispatch a typed
+        // line would, so `p my_f<Tab>` narrows to programs exactly as
+        // `type -P my_f<Tab>` does rather than offering the function.
+        {
+            let mut shell = Shell::new();
+            assert!(matches!(
+                run_line("func my_func() { puts hi }\n", 0, false, &mut shell),
+                Step::Continue(0)
+            ));
+            assert!(matches!(
+                run_line("alias p = type -P\n", 0, false, &mut shell),
+                Step::Continue(0)
+            ));
+            let state = CompletionState::from_shell(&shell);
+            assert!(
+                !segment_completions(&state, &["p".into(), "my_f".into()], "my_f")
+                    .contains(&"my_func".to_owned())
+            );
+            // Still the namespace completion, though — the alias reaches it, and
+            // only the flag narrows what it offers.
+            assert!(
+                segment_completions(&state, &["type".into(), "my_f".into()], "my_f")
+                    .contains(&"my_func".to_owned())
+            );
+        }
+
+        // End to end on the case the entry is about: `co --<Tab>` offers what
+        // `git checkout --<Tab>` offers, which is the subcommand's options rather
+        // than git's own.
+        {
+            let mut shell = Shell::new();
+            assert!(matches!(
+                run_line("alias co = git checkout\n", 0, false, &mut shell),
+                Step::Continue(0)
+            ));
+            let aliased = CompletionState::from_shell(&shell);
+            let direct = CompletionState::from_shell(&Shell::new());
+            let through_alias = segment_completions(&aliased, &["co".into(), "--f".into()], "--f");
+            let typed_out = segment_completions(
+                &direct,
+                &["git".into(), "checkout".into(), "--f".into()],
+                "--f",
+            );
+            // The candidates themselves are the machine's business — `git
+            // checkout --help` opens a manual page, and a minimized container has
+            // none, so what comes back varies. What this pins is the thing the
+            // entry is about: the alias answers with whatever the line it stands
+            // for answers with.
+            assert_eq!(through_alias, typed_out);
+        }
+
+        // `command`'s own dispatch sits ahead of everything else, which is why the
+        // rewrite happens outside it: `c tru` offers the programs it would run.
+        let mut shell = Shell::new();
+        assert!(matches!(
+            run_line("alias c = command\n", 0, false, &mut shell),
+            Step::Continue(0)
+        ));
+        let state = CompletionState::from_shell(&shell);
+        let programs = segment_completions(&state, &["c".into(), "tru".into()], "tru");
+        assert!(programs.contains(&"true".to_owned()), "{programs:?}");
+    }
+
+    #[test]
+    fn an_alias_probes_the_line_it_would_have_run() {
+        // Tab at argument position is the reader asking about a command they are
+        // already invoking, so the probe runs the line the alias stands for —
+        // `DESIGN.md` §"Completion" settles that, and a typed `ssh host <Tab>` has
+        // always probed the same way. The alias spelling is the same question in
+        // fewer keystrokes, so it gets the same answer rather than a narrower one.
+        //
+        // Asserted with a logging executable, because the alternative reading —
+        // probing the bare command instead — is invisible in the candidate list
+        // and shows up only in what ran.
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+
+        // No punctuation in the name: the path is written into mesh source below,
+        // where a `(` would not be part of a bare word.
+        let dir = std::env::temp_dir().join(format!("mesh-alias-probe-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let log = dir.join("argv");
+        let bin = dir.join("fronted");
+        fs::write(
+            &bin,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> {}\necho 'Usage: fronted'\n",
+                log.display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&bin, fs::Permissions::from_mode(0o755)).unwrap();
+
+        // Named by absolute path so the test never touches `PATH`, which is
+        // process-wide and would race the other tests in this binary.
+        let mut shell = Shell::new();
+        assert!(matches!(
+            run_line(
+                &format!("alias prod = {} operand\n", bin.display()),
+                0,
+                false,
+                &mut shell
+            ),
+            Step::Continue(0)
+        ));
+        let state = CompletionState::from_shell(&shell);
+        let _ = segment_completions(&state, &["prod".into(), String::new()], "");
+
+        // Read before the cleanup and asserted after it, so a failing assertion
+        // leaves nothing behind — and each step says which thing went wrong: a log
+        // that cannot be read is the probe never having run, not a wrong line.
+        let ran = fs::read_to_string(&log);
+        fs::remove_dir_all(&dir).expect("the probe directory should be removable");
+        let ran = ran.expect("the probe should have run the alias's command and logged its argv");
+        assert_eq!(ran, "operand  --help\n", "{ran:?}");
     }
 
     #[test]
