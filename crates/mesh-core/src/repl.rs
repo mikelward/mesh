@@ -2155,16 +2155,16 @@ fn run_executable(
             channel,
             guard,
         } => {
-            match guard_allows(guard.as_ref(), last, in_function, shell) {
-                Ok(true) => {}
+            let last = match guard_allows(guard.as_ref(), last, in_function, shell) {
+                Ok(Some(inherited)) => inherited,
                 // Skipped entirely: it produced neither a value nor a status of
                 // its own, so the result so far is still whatever came before.
-                Ok(false) => {
+                Ok(None) => {
                     shell.produced = Produced::Nothing;
                     return Step::Continue(last);
                 }
                 Err(step) => return step,
-            }
+            };
             match kind {
                 parser::ControlKind::Return => {
                     // A `return` leaves the innermost unit that has an invoker to
@@ -2241,15 +2241,15 @@ fn run_executable(
             }
         }
         Expression { expression, guard } => {
-            match guard_allows(guard.as_ref(), last, in_function, shell) {
-                Ok(true) => {}
+            let last = match guard_allows(guard.as_ref(), last, in_function, shell) {
+                Ok(Some(inherited)) => inherited,
                 // Skipped entirely — see the `Control` arm above.
-                Ok(false) => {
+                Ok(None) => {
                     shell.produced = Produced::Nothing;
                     return Step::Continue(last);
                 }
                 Err(step) => return step,
-            }
+            };
             // A lone quoted scalar used to run here, the spelling that reached a
             // program whose path needs quoting (`"/opt/my program"`). It is a string
             // literal now: quoting makes a value, and `command -- "…"` is how a path
@@ -2484,14 +2484,24 @@ fn bare_word_names_a_command(word: &parser::Word) -> bool {
     )
 }
 
+/// Did the guard let its statement run, and with **what status standing**?
+///
+/// The `u8` is the `last` the statement should see. A guard that allows also
+/// *publishes*, so the two spellings of one conditional agree — but publishing
+/// alone only reached the readers that consult `$sh.status`. A bare `return` and
+/// a bare `exit` take their code from `last` instead, so `return if true` kept
+/// the status from before the guard where `if true { return }` reads the
+/// condition's, and the two answered differently: `7` against `0` after an
+/// `sh -c "exit 7"`. Handing the published status back as the new `last` is what
+/// makes the *whole* statement see one story rather than two. Raised in review.
 fn guard_allows(
     guard: Option<&parser::Guard>,
     last: u8,
     in_function: bool,
     shell: &mut Shell,
-) -> Result<bool, Step> {
+) -> Result<Option<u8>, Step> {
     match guard {
-        None => Ok(true),
+        None => Ok(Some(last)),
         // A guard only decides *whether* the statement runs; it is not the
         // statement, so its bookkeeping is the operand's — see `eval_operand_of`.
         // A guard that raised `break`/`continue` produced no truth value, so the
@@ -2501,7 +2511,7 @@ fn guard_allows(
             let records = shell.status_records;
             let value = eval_operand_of(&guard.condition, last, in_function, shell)?;
             if shell.control.is_some() {
-                return Ok(false);
+                return Ok(None);
             }
             let truth = condition_bool(&value).map_err(runtime_message)?;
             let allows = truth != guard.unless;
@@ -2517,10 +2527,24 @@ fn guard_allows(
             // `docs/REFERENCE.md` §Guards already states. The guard's own truth is
             // not a result the statement produced — it is the reason there is no
             // statement.
-            if allows {
-                publish_condition_status(status_of(&value), records, shell);
+            if !allows {
+                return Ok(None);
             }
-            Ok(allows)
+            publish_condition_status(status_of(&value), records, shell);
+            // **The statement inherits the guard's *decision*, not what it
+            // published**, and the two part company only for `unless`.
+            // `DESIGN.md` settles the publication: `unless` inverts the decision
+            // rather than the expression, so `puts X unless false` publishes `1`
+            // — the status of the expression actually written — where
+            // `if not false { … }` publishes `0`, those being different
+            // expressions. Inheriting that `1` is a different claim, and a wrong
+            // one: it made `return unless false` *fail*, breaking the ordinary
+            // early return, where the block form succeeds. A guard that allows
+            // has had its test come out the way the statement needed, which is
+            // success — so the statement starts from `0` however the guard was
+            // spelled. Raised in review, after a first fix inherited the
+            // publication and contradicted the design.
+            Ok(Some(0))
         }
     }
 }
@@ -3701,6 +3725,11 @@ fn run_ast_pipeline(
     in_function: bool,
     shell: &mut Shell,
 ) -> Step {
+    // A stage's guard publishes when it allows, and the stage inherits what it
+    // published — so a bare `exit` behind a guard defaults from the same place a
+    // bare `return` does. Carried out of the loop because the stages run after
+    // it, in `run_pipeline`.
+    let mut last = last;
     let mut stages = Vec::with_capacity(node.stages.len());
     for (index, stage) in node.stages.iter().enumerate() {
         // A compound stage names no command, so none of the word, prefix and
@@ -3720,16 +3749,16 @@ fn run_ast_pipeline(
             }
         };
         match guard_allows(command.guard.as_ref(), last, false, shell) {
-            Ok(true) => {}
+            Ok(Some(inherited)) => last = inherited,
             // Skipped entirely, as for a guarded expression or control word: it
             // produced neither a value nor a status, so the previous result still
             // stands rather than being replaced by the inherited one.
-            Ok(false) => {
+            Ok(None) => {
                 shell.produced = Produced::Nothing;
                 return Step::Continue(last);
             }
             Err(step) => return step,
-        }
+        };
         // A value in a command that does not redirect travels to the stage and is
         // evaluated in its fork, so backgrounding one is ordinary now. One that
         // *does* redirect cannot travel: the shell resolves every stage's targets
@@ -8109,15 +8138,15 @@ fn eval_body(
                         // `run_source`. One a guard skipped answers for nothing, so
                         // the earlier error still stands — and stays *answerable*,
                         // since nothing has run since it.
-                        Ok(true) => {
+                        Ok(Some(inherited)) => {
                             shell.settle_error();
-                            eval_expr(expression, last, in_function, shell)
+                            eval_expr(expression, inherited, in_function, shell)
                         }
                         // A skipped tail answers for nothing, so an earlier
                         // statement's result still stands.
-                        Ok(false) if errored => Err(Step::Error(last)),
-                        Ok(false) if recorded => Ok(shell.result.clone()),
-                        Ok(false) => Ok(Value::String(String::new())),
+                        Ok(None) if errored => Err(Step::Error(last)),
+                        Ok(None) if recorded => Ok(shell.result.clone()),
+                        Ok(None) => Ok(Value::String(String::new())),
                         // The guard ran and *failed*, which is still the guard
                         // having run — so an earlier statement's failure is out of
                         // reach, and only the guard's own is left for a `||` around
@@ -21614,6 +21643,87 @@ mod tests {
         // `status(0)` stays the code test it is today rather than becoming a
         // binder — only a bare *non-numeric* word takes the slot's string case.
         assert_eq!(match_result(arms, "status(0)"), "ok");
+    }
+
+    /// **A guarded statement and its block form default from the same place.**
+    /// A bare `return` / `exit` takes its code from `last`, and a guard that
+    /// allows publishes to `$sh.status` without touching it — so `return if
+    /// true` kept the code from before the guard while `if true { return }` read
+    /// the condition's, answering `7` and `0` after the same failing command.
+    /// The guard now hands its published status back as the statement's `last`.
+    #[test]
+    fn a_guard_and_its_block_form_agree_on_the_default_status() {
+        /// The status a guard **published**, captured into `x` by the statement
+        /// it allowed — the statement's own result would otherwise overwrite it.
+        fn published(script: &str) -> u8 {
+            let mut shell = Shell::new();
+            // The script's own final status is not the subject here.
+            run_line(script, 0, false, &mut shell);
+            match shell.vars.get("x") {
+                Some(Value::Status(code)) => *code,
+                other => panic!("x is {other:?}"),
+            }
+        }
+
+        fn status_after(script: &str) -> u8 {
+            let mut shell = Shell::new();
+            match run_line(script, 0, false, &mut shell) {
+                Step::Continue(code) | Step::Error(code) | Step::Exit(code) => code,
+                Step::Return(_, code) => code,
+            }
+        }
+
+        // **The prior status is set in-process.** Spawning `sh` here made the
+        // test depend on resolving an external program while the crate's
+        // process-global environment tests run concurrently, and it failed once
+        // that way in a fresh `make check` and passed on a rerun. Raised in
+        // review; a test that passes most of the time is broken.
+        let seven = "func seven() { status 7 }\n";
+
+        // A guard that allows: both spellings read what the condition published.
+        assert_eq!(
+            status_after(&format!(
+                "{seven}func f() {{ seven ; return if true }}\nf\n"
+            )),
+            0
+        );
+        assert_eq!(
+            status_after(&format!(
+                "{seven}func f() {{ seven ; if true {{ return }} }}\nf\n"
+            )),
+            0
+        );
+        assert_eq!(status_after(&format!("{seven}seven\nexit if true\n")), 0);
+        assert_eq!(
+            status_after(&format!("{seven}seven\nif true {{ exit }}\n")),
+            0
+        );
+
+        // **An `unless` allows on a *false* condition.** The statement inherits
+        // the guard's decision — success — so the ordinary early return succeeds
+        // as its block form does.
+        assert_eq!(status_after("func f() { return unless false }\nf\n"), 0);
+        assert_eq!(status_after("func f() { if not false { return } }\nf\n"), 0);
+
+        // **What it *publishes* is unchanged, and deliberately differs**:
+        // `DESIGN.md` settles that `unless` inverts the decision rather than the
+        // expression, so the status read back is the one the written expression
+        // produced. A first fix inherited the publication and so contradicted
+        // this; pinned here because the two are easy to conflate.
+        assert_eq!(
+            published("func f() { return $sh.status unless false }\nx = f()\n"),
+            1,
+            "an allowing `unless` publishes its expression's status"
+        );
+        assert_eq!(
+            published("func g() { if not false { return $sh.status } }\nx = g()\n"),
+            0,
+            "`not false` is a different expression, and publishes its own"
+        );
+
+        // With no guard there is nothing to publish, so the previous status
+        // still stands — the fix must not swallow that.
+        assert_eq!(status_after(&format!("{seven}seven\nexit\n")), 7);
     }
 
     /// **A name is what [`valid_name`] says it is**, not what a character test

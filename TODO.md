@@ -3802,17 +3802,42 @@ thing a reader takes on trust.*
       own `$UID` for free. Mesh now exposes the effective user id directly, captured
       with the shell's process identity and kept stable in a forked stage, so a
       prompt does not need to fork `id -u` or keep its own cache.
-- [ ] **A guarded bare `return` and its block form disagree.** `return if true`
-      and `if true { return }` answer different statuses — measured at `f`, `7`
+- [x] **A guarded bare `return` and its block form disagree.** `return if true`
+      and `if true { return }` answered different statuses — measured at `f`, `7`
       against `0` after an `sh -c "exit 7"`. **Pre-existing**, not introduced by the
-      condition-publishing change: the same pair gives the same two numbers on the
-      commit before it. The cause is that bare `return` takes its code from the
-      `last` argument threaded down the call, while a bare `exit` reads the
-      published `$sh.status`, so the two controls default from different places
-      and only agree where nothing has published in between. Raised in review of
-      #500 and left out of it deliberately, since fixing it means changing what
-      `last` means on a path this branch does not otherwise touch. Whichever way
-      it goes, `return` and `exit` should default from the same place.
+      condition-publishing change.
+
+      **The recorded diagnosis was wrong, and checking it first is what found the
+      real one.** It read: bare `return` takes its code from the `last` argument
+      while bare `exit` reads the published `$sh.status`, so the two *controls*
+      default from different places. They do not — `exit` reads `last` too
+      (`builtins.rs`, the `None => Builtin::Exit(last)` arm), and measured against
+      a build the two agree with each other exactly. The split is between the two
+      **spellings**: `exit if true` answers `7` and `if true { exit }` answers `0`,
+      the same pair `return` gives. So the fix was never about reconciling two
+      controls.
+
+      **Fixed** where the disagreement actually lives: a guard that *allows* its
+      statement already publishes its condition's status, deliberately, "so the
+      postfix form matches the block one" — but publishing only reached readers
+      that consult `$sh.status`, and `last` was left standing at its pre-guard
+      value. `guard_allows` now hands the guard's **decision** back as the
+      statement's `last` — success, since the test came out the way the statement
+      needed.
+
+      **Not what the guard *published*, which is a different question** and where
+      a first fix went wrong. `DESIGN.md` §Guards settles that an `unless`
+      inverts the decision rather than the expression, so `puts X unless false`
+      publishes `1` — the status of the expression actually written — while
+      `if not false { … }` publishes `0`, those being different expressions.
+      Inheriting that `1` made `return unless false` **fail**, breaking the
+      ordinary early return, and contradicted the design in the same stroke.
+      Publication is unchanged; only the inheritance moved.
+
+      A guard that **skips** still publishes nothing and leaves the previous
+      status standing, unchanged; and an unguarded bare `exit` still carries the
+      last command's code. The regression test pins all four: both spellings,
+      both guard kinds, the two publications, and the unguarded case.
 
 - [x] **15. `$sh.status` was cleared while an `if` condition was evaluated**, so it
       read `0` in *both* arms and a command used as a condition could not have its
