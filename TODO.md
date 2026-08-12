@@ -1089,10 +1089,31 @@ Delete an entry once you have agreed with it or reversed it.
       stopped job does not finish on its own. Our own `kill -KILL` clears that
       mark so the wait blocks for the real status, but a `kill -9` typed in
       another terminal cannot be intercepted that way: if the drain has not yet
-      run when `wait` is asked, the stop is still what it knows. Closing it means
-      the wait consulting the kernel about whether the process is still stopped,
-      which has no portable answer, or treating any pending nudge as a reason to
-      re-drain before trusting the mark.
+      run when `wait` is asked, the stop is still what it knows.
+
+      **Narrowed to the in-flight window, and the rest is covered.** The entry's
+      second option — re-drain before trusting the mark, rather than ask the
+      kernel whether a process is still stopped, which has no portable answer —
+      is what the code already does, in three places: `JobTable::info`, the
+      boundary refresh that keeps `$sh.jobs` current, polls a job **whatever**
+      its state; `wait` polls before reading the mark; and a blocking wait
+      drains before it sleeps. Taking each away in turn leaves the behavior
+      intact, so none of them is load-bearing alone. Once an outside kill has
+      been *observed*, `wait` reports how the job ended — both routes are in
+      `a_stopped_job_is_still_watched` now, `kill -KILL %1 | cat` signalling
+      from a copy of the table that dies with the pipeline stage, and
+      `command kill -9 $j.pid` never touching the table at all.
+
+      What is left is the kill that has been **issued and not yet acted on**.
+      There the job really is still stopped when `wait` asks, so 147 is the
+      honest answer to the question at that instant — and the entry's own
+      framing ("reported stopped") is what makes it look like a bug. It is a
+      race rather than a certainty: asserting 137 without waiting for the kill
+      to be observed comes out 147 about twice in a hundred runs. Closing it for
+      real needs a decision, not code: whether `wait` should treat a stopped
+      job with a *pending* signal as one to block on — which means knowing a
+      signal is pending, and `sigpending` answers for this process, not for a
+      child. Bash has the same window.
 - [x] **Job handles.** `j = cmd &` binds the job rather than the status of
       launching it, as a distinct `Value::Job` carrying the id. Reading a member
       resolves it against the live table, so `$j.state` moves on with the job
