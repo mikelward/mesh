@@ -1293,12 +1293,107 @@ fn one_semicolon_separates_from_anywhere_in_the_run() {
 #[test]
 fn a_backgrounded_statement_still_takes_one_semicolon() {
     let out = run_command_line("true &; puts done");
-    assert_eq!(out.status.code(), Some(0));
+    // The `&` is refused, and the point here is that the `;` still separates, so
+    // `puts done` runs anyway. The run reports the refusal on the way out — the
+    // batch contract — which is what tells it apart from a line that was fine.
+    assert_eq!(out.status.code(), Some(2));
     assert!(
         String::from_utf8_lossy(&out.stdout).contains("done"),
         "{}",
         String::from_utf8_lossy(&out.stdout)
     );
+}
+
+/// A non-interactive run exits nonzero when the shell **refused** a statement,
+/// even if a later one succeeded — `DESIGN.md` §"Recovery", the batch contract,
+/// so automation fails hard rather than reading the last statement's success.
+///
+/// The distinction this turns on is the one the `Step` type already draws: a
+/// *command reporting failure* is a result the run carries on from, while an
+/// invalid program is a breakage. `false; true` still exits 0.
+#[test]
+fn a_batch_that_broke_exits_nonzero_however_it_ended() {
+    // Every route a non-interactive run arrives by, since each has its own loop.
+    let broke = "xs = [a b]\nputs $xs[99]\ntrue\n";
+    assert_eq!(run_command_line(broke).status.code(), Some(1), "-c");
+    assert_eq!(run_with_input(broke).status.code(), Some(1), "stdin");
+    let path = script("batch_broke", broke);
+    assert_eq!(
+        run_with_args(&[path.to_str().unwrap()]).status.code(),
+        Some(1),
+        "script file"
+    );
+
+    // A command that ran and answered is not a breakage, which is the whole of
+    // the distinction — without it this would be `errexit`, which `DESIGN.md`
+    // rules out.
+    assert_eq!(run_command_line("false; true").status.code(), Some(0));
+    // Nor is a total access that has no error to report.
+    assert_eq!(
+        run_command_line("xs = [a b]; puts $xs:get(99, none); true")
+            .status
+            .code(),
+        Some(0)
+    );
+
+    // An error a `||` answered for is answered, so it never becomes the run's.
+    assert_eq!(
+        run_command_line("xs = [a b]; puts $xs[99] || puts handled; true")
+            .status
+            .code(),
+        Some(0)
+    );
+
+    // `exit` says what to leave with, and says it knowing the breakage was
+    // already reported on stderr — otherwise `exit 0` could not mean it.
+    assert_eq!(
+        run_command_line("xs = [a b]; puts $xs[99]; exit 0")
+            .status
+            .code(),
+        Some(0)
+    );
+
+    // The reported status is the *first* breakage, not the last: a run that
+    // failed to parse a name and then failed a pattern reports the parse.
+    let out = run_command_line("puts $nope; xs = [a b]; puts $xs[99]");
+    assert_eq!(out.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("unbound variable"), "{stderr}");
+    assert!(stderr.contains("list index out of range"), "{stderr}");
+}
+
+/// Piped input is the one route that runs a *unit at a time*, so a refusal the
+/// statement loop never saw — input the parser rejected, or bytes that would not
+/// decode — has nothing behind it in the record, and the next unit's success
+/// overwrote the status. `-c` and a script file are each a single unit, so their
+/// parse failure already *is* the run's last step.
+#[test]
+fn a_piped_refusal_survives_a_later_unit_that_worked() {
+    // Rejected by the parser: never reaches the statement loop at all.
+    let out = run_with_input("x = )\ntrue\n");
+    assert_eq!(out.status.code(), Some(2));
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("syntax error"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // Undecodable bytes: refused before there is anything to parse.
+    let out = run_with_bytes(b"puts \xff\xfe\ntrue\n");
+    assert_eq!(out.status.code(), Some(1));
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("invalid UTF-8"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // Still the first refusal when a later unit breaks differently — the parse
+    // error's 2, not the index error's 1.
+    let out = run_with_input("x = )\nxs = [a b]\nputs $xs[99]\ntrue\n");
+    assert_eq!(out.status.code(), Some(2));
+
+    // And `exit` still says what to leave with.
+    assert_eq!(run_with_input("x = )\nexit 0\n").status.code(), Some(0));
 }
 
 #[test]
@@ -24879,11 +24974,10 @@ fn loop_control_stops_a_function_body_without_leaking_to_the_callers_loop() {
         String::from_utf8_lossy(&out.stdout),
         "seen-a\nafter-stop\nseen-b\nafter-stop\nfinished\n"
     );
-    assert!(
-        out.status.success(),
-        "{}",
-        String::from_utf8_lossy(&out.stderr)
-    );
+    // `break` / `continue` in a function body are refused rather than reaching the
+    // caller's loop — which is the subject here, and three channel-2 errors. The
+    // run carries on to `finished` and then reports them, the batch contract.
+    assert_eq!(out.status.code(), Some(1));
 }
 
 #[test]
@@ -25103,7 +25197,10 @@ fn list_patterns_bind_names_discards_and_a_middle_rest_atomically() {
         String::from_utf8_lossy(&out.stdout),
         "a b c d yes\nunchanged\n"
     );
-    assert_eq!(out.status.code(), Some(0));
+    // The mismatched binding is refused whole — `$first` keeps `unchanged` rather
+    // than taking `only` — and the refusal is what the run exits with, even though
+    // the `puts` after it succeeded.
+    assert_eq!(out.status.code(), Some(1));
     assert!(String::from_utf8_lossy(&out.stderr).contains("does not match binding pattern"));
 }
 

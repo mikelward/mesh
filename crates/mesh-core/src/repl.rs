@@ -521,8 +521,23 @@ fn run_batch(text: &str, options: &StartupOptions) -> ExitCode {
             return ExitCode::from(run_logout(options, code, &mut shell));
         }
     };
-    let code = match run_line(text, last, false, &mut shell) {
-        Step::Continue(code) | Step::Error(code) | Step::Exit(code) => code,
+    let step = run_line(text, last, false, &mut shell);
+    // The batch is over, so there is no statement left for a `||` to answer
+    // through — whatever the last one left pending is a failure nobody answered
+    // for. Same reasoning, and the same reader, as the end of a sourced file.
+    shell.settle_error();
+    let code = match step {
+        // A batch that broke exits nonzero whatever it went on to end with
+        // (`DESIGN.md` §"Recovery": an uncaught error exits nonzero, so automation
+        // still fails hard). The status alone could not carry it — it is the last
+        // statement's, so `puts $xs[99]; true` reported success over a statement
+        // the shell had refused to run. A command's nonzero *status* is untouched:
+        // `grep` finding nothing is a result, not a breakage.
+        Step::Continue(code) | Step::Error(code) => shell.input_error.unwrap_or(code),
+        // `exit` says what to leave with, and says it after the breakage was
+        // already reported on stderr. Overriding it would make `exit 0` unable to
+        // mean it — the same reason a sourced file's `exit` outranks its record.
+        Step::Exit(code) => code,
         Step::Return(..) => unreachable!("top-level return handled in run_line"),
     };
     ExitCode::from(run_logout(options, code, &mut shell))
@@ -17936,6 +17951,28 @@ fn handle_signal(
 /// Piped / non-interactive loop: read commands unbuffered from fd 0 so bytes
 /// past a command's newline stay in the pipe/file for a child that inherits
 /// stdin. A malformed (non-UTF-8) line is rejected loudly and skipped.
+/// Close the books on one unit of piped input, returning its status.
+///
+/// A unit is a whole parse, so no `||` in a later one can reach back to answer
+/// for a failure in this one — which makes the unit boundary the moment a
+/// pending error stops being answerable.
+///
+/// The second `settle` is for the refusals that never reach the statement loop
+/// where `pending_error` is written: input the **parser** rejected returns
+/// `Step::Error` with nothing recorded behind it. `settle` keeps the first
+/// error, so a unit that ran and broke still reports where it broke rather than
+/// the status this step carries out.
+fn settle_unit(shell: &mut Shell, step: Step) -> u8 {
+    shell.settle_error();
+    let (Step::Continue(code) | Step::Error(code)) = step else {
+        unreachable!("only a completed unit settles");
+    };
+    if matches!(step, Step::Error(_)) {
+        shell.settle(Some(code));
+    }
+    code
+}
+
 fn run_piped(options: &StartupOptions) -> ExitCode {
     // `ManuallyDrop` keeps us from closing fd 0 when the shell exits.
     let mut stdin = ManuallyDrop::new(unsafe { File::from_raw_fd(0) });
@@ -17991,6 +18028,13 @@ fn run_piped(options: &StartupOptions) -> ExitCode {
             Err(_) => {
                 note!("mesh: invalid UTF-8 in input");
                 last = 1;
+                // Undecodable input is refused, not run, so it belongs in the
+                // record the batch contract reports from — `last` alone is
+                // overwritten by the next unit that succeeds. Recorded here to
+                // cover both dispositions below: a whole unit dropped on the
+                // spot, and one poisoned mid-buffer and discarded after the
+                // parser has found its end.
+                shell.settle(Some(1));
                 lossy = String::from_utf8_lossy(&line).into_owned();
                 if pending.is_empty() && !needs_more_input(&lossy) {
                     // A whole unit on its own, dropped here rather than buffered.
@@ -18022,7 +18066,9 @@ fn run_piped(options: &StartupOptions) -> ExitCode {
             Step::Exit(code) => {
                 return ExitCode::from(run_logout(options, code, &mut shell));
             }
-            Step::Continue(code) | Step::Error(code) => last = code,
+            step @ (Step::Continue(_) | Step::Error(_)) => {
+                last = settle_unit(&mut shell, step);
+            }
             Step::Return(..) => unreachable!("top-level return handled in run_line"),
         }
         // After the unit runs, so its own diagnostics are numbered from where it
@@ -18035,10 +18081,17 @@ fn run_piped(options: &StartupOptions) -> ExitCode {
             Step::Exit(code) => {
                 return ExitCode::from(run_logout(options, code, &mut shell));
             }
-            Step::Continue(code) | Step::Error(code) => last = code,
+            step @ (Step::Continue(_) | Step::Error(_)) => {
+                last = settle_unit(&mut shell, step);
+            }
             Step::Return(..) => unreachable!("top-level return handled in run_line"),
         }
     }
+    // The batch contract, as in `run_batch`: piped input is the same
+    // non-interactive run reading a line at a time, so a breakage anywhere in it
+    // exits nonzero rather than being overwritten by whatever ran last. An `exit`
+    // still says what to leave with — those two returns are above.
+    let last = shell.input_error.unwrap_or(last);
     ExitCode::from(run_logout(options, last, &mut shell))
 }
 

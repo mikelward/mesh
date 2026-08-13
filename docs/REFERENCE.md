@@ -1793,6 +1793,29 @@ Every command leaves a status, and so does every expression that is evaluated.
 mesh keeps the **last** one and returns it as its own exit code at end of
 input.
 
+With one override, in a **non-interactive** run — a script, `-c`, or piped
+input. If the shell **refused** a statement anywhere in it — an unbound name, an
+out-of-range index, a value that did not match its binding pattern — that is what
+the run exits with, however it went on to end. A later success does not cover it:
+
+```mesh
+xs = [a b]
+puts $xs[99]    # reported on stderr; the shell ran nothing here
+true            # succeeds
+                # …and the run still exits 1
+```
+
+This is the *batch contract*, so automation fails hard rather than reading the
+last statement's success. It is not `errexit`, and the difference is the whole of
+it: a **command that ran and answered** is a result the run carries on from, so
+`false; true` exits `0` and `grep` finding nothing is not a breakage. Only the
+shell declining to run something counts. An error a `||` answered for is
+answered, and an explicit `exit n` says what to leave with — the refusal was
+already reported on stderr, so `exit 0` still means it.
+
+An interactive session contains these instead: the line is abandoned, the error
+prints, and the next prompt draws.
+
 | Status | Meaning |
 | --- | --- |
 | `0` | Success. |
