@@ -54,12 +54,12 @@ mesh, in one screen. `help NAME` explains one entry; for a builtin,
 `NAME --help` prints the same thing.
 
 Builtins:
-  bg [JOB]                       Resume a stopped job in the background
-  cd [DIR]                       Change the working directory
+  bg [JOB]                          Resume a stopped job in the background
+  cd [--logical|--physical] [DIR]   Change the working directory
   …
 Syntax:
-  cmd arg …                      Run a builtin, a function, or a program
-  cmd | cmd                      Pipe one command's output into the next
+  cmd arg …                         Run a builtin, a function, or a program
+  cmd | cmd                         Pipe stdout on; `|&` carries stderr too
   …
 </pre>
 
@@ -91,7 +91,7 @@ ll is a function
     func ll(...args)
 mesh$ <strong>type cd</strong>
 cd is a shell builtin
-    cd [DIR]
+    cd [--logical|--physical] [DIR]
 mesh$ <strong>type rg</strong>
 rg is /usr/local/bin/rg
 </pre>

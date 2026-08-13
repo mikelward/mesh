@@ -9,7 +9,8 @@ use std::ffi::{OsStr, OsString};
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::os::unix::ffi::OsStrExt;
-use std::path::{Path, PathBuf};
+use std::os::unix::fs::MetadataExt;
+use std::path::{Component, Path, PathBuf};
 
 use crate::vars::{Decoration, NEST_INDENT, Value};
 
@@ -21,12 +22,15 @@ use crate::vars::{Decoration, NEST_INDENT, Value};
 /// The **name is the usage's first word** — a usage that did not start with the
 /// command you type would be wrong anyway, so there is nothing to keep in step.
 const TABLE: &[(&str, &str)] = &[
-    ("cd [DIR]", "Change the working directory"),
+    (
+        "cd [--logical|--physical] [DIR]",
+        "Change the working directory",
+    ),
     // Two spellings, like `gets`: the command prints the path and the call yields
     // it, so a prompt segment can say `style(pwd(), fg: blue)` without forking a
     // `$(pwd)` to get the same string.
     (
-        "pwd · pwd()",
+        "pwd [--logical|--physical] · pwd()",
         "Print the working directory, or yield it as a value",
     ),
     ("puts [ARG ...]", "Render the arguments, then a newline"),
@@ -772,19 +776,68 @@ fn run_help(args: &[String]) -> u8 {
 /// If `words[0]` names a builtin, run it and return its outcome; otherwise
 /// return `None` so the caller falls through to external execution.
 ///
-/// `words` is guaranteed non-empty by the caller. `last` is the status of the
-/// previous command, used as the default for a bare `exit`.
-pub fn dispatch(words: &[String], last: u8) -> Option<Builtin> {
+/// `words` is guaranteed non-empty by the caller, and `written` is its marks —
+/// what each word *was* at the call site, which is how a builtin that reads
+/// options tells `pwd -P` from a `pwd $x` whose value happens to spell one.
+/// `last` is the status of the previous command, the default for a bare `exit`.
+pub fn dispatch(words: &[String], written: &[crate::expand::Written], last: u8) -> Option<Builtin> {
     match words[0].as_str() {
         // `cd` is absent on purpose: it is dispatched by the REPL, which owns the
         // `precd` / `postcd` hooks that bracket the move.
-        "pwd" => Some(Builtin::Status(pwd(&words[1..]))),
+        "pwd" => Some(Builtin::Status(pwd(
+            &words[1..],
+            written.get(1..).unwrap_or(&[]),
+        ))),
         "puts" => Some(Builtin::Status(puts(&words[1..], true))),
         "print" => Some(Builtin::Status(puts(&words[1..], false))),
         "clip" => Some(Builtin::Status(clip(&words[1..]))),
         "notify" => Some(Builtin::Status(notify(&words[1..]))),
         "help" => Some(Builtin::Status(run_help(&words[1..]))),
         "exit" => Some(exit(&words[1..], last)),
+        _ => None,
+    }
+}
+
+/// Is this argument an option of `cd` / `pwd`, rather than data that spells one?
+///
+/// Only a word *written* `--physical` is a `Flag` value, so `pwd $x` holding
+/// that text stays data — the rule every option in mesh follows (`DESIGN.md`
+/// §"Arguments do not word-split").
+///
+/// **These two builtins take the long spellings only**, which is what lets that
+/// rule hold end to end: a `Flag` is a value, so it survives a wrapper's
+/// `...rest`, where a mark beside argv cannot. `-L` and `-P` would each be a
+/// second spelling that works typed and fails through an alias, and a directory
+/// really called `-P` is a place a reader can stand in. See the entry under
+/// *Decisions needing review* in `TODO.md` for what would change that.
+fn written_flag(mark: crate::expand::Written) -> bool {
+    mark == crate::expand::Written::Flag
+}
+
+/// Does this argument at least *read* as an option, for the sake of the message
+/// a rejected one gets? Telling the writer of `-P` "takes no operands" sends
+/// them looking for the wrong mistake.
+///
+/// Both marks count, since both mean the reader wrote an option here: `--tidy`
+/// is a `Flag` of a name these builtins do not have, and `-P` is `Dashed` — the
+/// mark earns its keep here even though it decides nothing, since it is what
+/// separates a *written* short flag from a `$dir` that holds one. Data that
+/// merely spells an option is an operand and is reported as such. A lone `-` is
+/// `cd`'s previous-directory operand rather than a malformed flag, and carries
+/// no mark to say otherwise.
+fn reads_as_option(mark: crate::expand::Written) -> bool {
+    matches!(
+        mark,
+        crate::expand::Written::Flag | crate::expand::Written::Dashed
+    )
+}
+
+/// The long spelling a POSIX-shaped short flag is asking for, if it is one —
+/// the useful half of refusing `-P`, since that is what muscle memory types.
+fn long_spelling(argument: &str) -> Option<&'static str> {
+    match argument {
+        "-L" => Some("--logical"),
+        "-P" => Some("--physical"),
         _ => None,
     }
 }
@@ -796,8 +849,9 @@ pub fn dispatch(words: &[String], last: u8) -> Option<Builtin> {
 /// so that a handler which itself `cd`s elsewhere cannot make a *relative* outer
 /// `cd` land somewhere unintended.
 pub(crate) struct CdTarget {
-    /// Absolute, with symlinks and `..` already resolved: what `$env.PWD` will
-    /// read after the move, which is what a `precd` handler is told.
+    /// Absolute and free of `.` and `..`: what `$env.PWD` will read after the
+    /// move, which is what a `precd` handler is told. Symlinks survive it under
+    /// the default logical reading and are resolved under `-P`.
     path: std::path::PathBuf,
     /// `cd -`, and a `CDPATH` hit, print where they landed, as POSIX does.
     echo: bool,
@@ -814,24 +868,64 @@ impl CdTarget {
 /// `$OLDPWD`; a plain relative name → the first `$CDPATH` entry that holds it.
 /// `Err` carries the status, its diagnostic already reported.
 ///
-/// Resolution is `canonicalize`, so the path handed on is the physical one
-/// `$PWD` will hold, and a destination that does not exist is reported here —
-/// before any hook has run for a move that was never going to happen.
+/// **Logical by default**, `-P` for physical, as POSIX requires. The path handed
+/// on is what `$env.PWD` will hold, so it is absolute either way and a
+/// destination that does not exist is reported here — before any hook has run
+/// for a move that was never going to happen.
 ///
-/// Not yet implemented (deferred to the language layer): `--physical`, autocd,
-/// and a shell-maintained *logical* cwd — `$PWD` is the physical `getcwd` path
-/// for now.
-pub(crate) fn cd_target(args: &[String]) -> Result<CdTarget, u8> {
-    if args.len() > 1 {
+/// Not yet implemented (deferred to the language layer): autocd.
+pub(crate) fn cd_target(
+    args: &[String],
+    written: &[crate::expand::Written],
+) -> Result<CdTarget, u8> {
+    let mut physical = false;
+    let mut options = true;
+    let mut operands: Vec<&str> = Vec::new();
+    for (index, arg) in args.iter().enumerate() {
+        let mark = written
+            .get(index)
+            .copied()
+            .unwrap_or(crate::expand::Written::Data);
+        let flag = options && written_flag(mark);
+        match arg.as_str() {
+            "-P" | "--physical" if flag => physical = true,
+            "-L" | "--logical" if flag => physical = false,
+            // `cd` owns its terminator now that it reads options, which is what
+            // makes a written `-P` reachable as the directory: `cd -- -P`.
+            _ if options && mark == crate::expand::Written::Terminator => options = false,
+            other if options && other != "-" && reads_as_option(mark) => {
+                match long_spelling(other) {
+                    Some(long) => note!(
+                        "mesh: cd: {other}: write `{long}`; \
+                         `cd -- {other}` goes to a directory of that name"
+                    ),
+                    None => note!(
+                        "mesh: cd: {other}: not an option of `cd` (`--logical` or \
+                         `--physical`); `cd -- {other}` goes to a directory of that name"
+                    ),
+                }
+                return Err(1);
+            }
+            other => operands.push(other),
+        }
+    }
+    if operands.len() > 1 {
         note!("mesh: cd: too many arguments");
         return Err(1);
     }
     // Keep targets as `OsString` so a non-UTF-8 `$HOME`/`$OLDPWD` reaches the OS
     // unchanged rather than being mangled by lossy UTF-8 conversion.
     let mut echo = false;
-    let target: OsString = match args.first().map(String::as_str) {
+    // Which of the three the target came from, for the empty check below: an
+    // empty one names no directory, and saying *which* is empty is the whole
+    // content of that diagnostic.
+    let mut source = "the operand";
+    let target: OsString = match operands.first().copied() {
         None => match env::var_os("HOME") {
-            Some(home) => home,
+            Some(home) => {
+                source = "`$env.HOME`";
+                home
+            }
             None => {
                 note!("mesh: cd: HOME not set");
                 return Err(1);
@@ -839,6 +933,7 @@ pub(crate) fn cd_target(args: &[String]) -> Result<CdTarget, u8> {
         },
         Some("-") => match env::var_os("OLDPWD") {
             Some(old) => {
+                source = "`$env.OLDPWD`";
                 echo = true;
                 old
             }
@@ -847,7 +942,7 @@ pub(crate) fn cd_target(args: &[String]) -> Result<CdTarget, u8> {
                 return Err(1);
             }
         },
-        Some(dir) => match cdpath_hit(dir) {
+        Some(dir) => match cdpath_hit(dir, physical) {
             Some((found, announce)) => {
                 echo = announce;
                 found
@@ -856,7 +951,50 @@ pub(crate) fn cd_target(args: &[String]) -> Result<CdTarget, u8> {
         },
     };
 
+    // Refused before anything resolves it. Logically an empty target adds no
+    // segments, so it would come back as the directory the shell is already in —
+    // a move that "succeeds", fires the `precd` / `postcd` hooks and overwrites
+    // `$env.OLDPWD`, all for a word that names nowhere.
+    if target.is_empty() {
+        note!("mesh: cd: {source} is empty; it names no directory");
+        return Err(1);
+    }
     let path = Path::new(&target);
+    // A logical move keeps the spelling the reader used, so `cd link` lands in
+    // `link` and `cd ..` out of it goes back where the *name* came from rather
+    // than where the link pointed. `..` is taken off the written path textually
+    // and the result is entered as it stands — resolving symlinks *after* the
+    // `..`, which is exactly how POSIX and bash define `-L`. Resolving first is
+    // `-P`, and it is a different directory whenever the link crosses trees.
+    if !physical {
+        let logical = match logical_path(path) {
+            Ok(logical) => logical,
+            // The base a relative target resolves against is gone — the cwd was
+            // unlinked out from under the shell, say. Reported rather than
+            // guessed past: falling back to the physical reading here would
+            // quietly answer a different question than the one `-L` asked.
+            Err(message) => {
+                note!(
+                    "mesh: cd: {}: cannot read the current directory to resolve it: {message}",
+                    path.display()
+                );
+                return Err(1);
+            }
+        };
+        // The one thing that can go wrong: a spelling that names nothing.
+        // `link/../sibling` is a real place through the link and no place at
+        // all textually, so the physical reading answers for it rather than the
+        // move failing over a path the reader never typed.
+        if logical.is_dir() {
+            return Ok(CdTarget {
+                path: logical,
+                echo,
+            });
+        }
+    }
+    // `-P`, and the fallback above: the destination with its symlinks resolved.
+    // Canonicalizing is also what proves it exists and is enterable, which is
+    // the check this function owes its caller before any hook runs.
     match path.canonicalize() {
         Ok(resolved) => Ok(CdTarget {
             path: resolved,
@@ -869,6 +1007,55 @@ pub(crate) fn cd_target(args: &[String]) -> Result<CdTarget, u8> {
             Err(1)
         }
     }
+}
+
+/// `target` as an absolute path with `.` and `..` taken out **textually** —
+/// the logical spelling of where `cd target` lands.
+///
+/// Relative targets resolve against the logical cwd rather than `getcwd`, so a
+/// shell that walked in through a symlink keeps walking in the same terms — and
+/// that is the one thing here that can fail, since reading the cwd can. An
+/// absolute target needs no base and never asks.
+fn logical_path(target: &Path) -> Result<PathBuf, String> {
+    let base = if target.is_absolute() {
+        None
+    } else {
+        Some(working_directory()?)
+    };
+    // **Exactly two** leading slashes are a root of their own, kept as written:
+    // POSIX leaves `//` implementation-defined, and where it means something (a
+    // UNC-style namespace) collapsing it changes which place the path names.
+    // Three or more are one, which POSIX does settle. A relative target takes
+    // the root of the base it starts from.
+    let root = match &base {
+        Some(base) => double_slash_root(base),
+        None => double_slash_root(target),
+    };
+    // Assembled from the segments rather than by pushing and popping a
+    // `PathBuf`: `pop` on `//tmp` yields `/`, which would drop that root the
+    // first time a `..` walked out of it.
+    let mut parts: Vec<&OsStr> = Vec::new();
+    for path in base.as_deref().into_iter().chain(std::iter::once(target)) {
+        for part in path.components() {
+            match part {
+                // The root is decided above, and a `.` is nothing to walk.
+                Component::RootDir | Component::CurDir => {}
+                // A `..` above the root is the root, as it is to the kernel.
+                Component::ParentDir => {
+                    parts.pop();
+                }
+                part => parts.push(part.as_os_str()),
+            }
+        }
+    }
+    let mut path = OsString::from(if root { "//" } else { "/" });
+    for (index, part) in parts.iter().enumerate() {
+        if index > 0 {
+            path.push("/");
+        }
+        path.push(part);
+    }
+    Ok(PathBuf::from(path))
 }
 
 /// Search `$CDPATH` for `operand`, yielding the directory found and whether the
@@ -890,19 +1077,51 @@ pub(crate) fn cd_target(args: &[String]) -> Result<CdTarget, u8> {
 /// - **A hit through a non-empty entry prints where it landed**, since the
 ///   destination is not the one the operand appears to name. An empty entry *is*
 ///   the current directory, so that one is silent.
-fn cdpath_hit(operand: &str) -> Option<(OsString, bool)> {
+fn cdpath_hit(operand: &str, physical: bool) -> Option<(OsString, bool)> {
     if operand.is_empty() || resolves_from_here(operand) {
         return None;
     }
     let cdpath = env::var_os("CDPATH")?;
-    env::split_paths(&cdpath).find_map(|entry| {
-        let candidate = entry.join(operand);
+    for entry in env::split_paths(&cdpath) {
+        let announce = !entry.as_os_str().is_empty();
         // `is_dir` follows symlinks, so a link to a directory is one — the same
         // answer `cd` itself would give.
-        candidate
-            .is_dir()
-            .then(|| (candidate.into_os_string(), !entry.as_os_str().is_empty()))
-    })
+        let raw = entry.join(operand);
+        // Under `-P` the candidate is left as written for `canonicalize` to
+        // resolve: symlinks before `..`, which is that flag's whole rule.
+        if physical {
+            if raw.is_dir() {
+                return Some((raw.into_os_string(), announce));
+            }
+            continue;
+        }
+        // Logically, a relative entry starts from the logical cwd: `CDPATH=../x`
+        // means the parent of the *name* the reader walked in by, and testing it
+        // against `getcwd` would look in the link's tree instead — then report
+        // the operand missing when it is right there.
+        //
+        // An entry whose base cannot be read — a relative one with the cwd
+        // unlinked — names nothing, so the search moves on rather than ending:
+        // an **absolute** entry further down needs no base and may well answer.
+        // Nothing is swallowed by skipping it, because the operand is relative
+        // too (a `/`-leading one never reaches here), so if no entry answers,
+        // resolving the operand hits the same failure and reports it.
+        let Ok(logical) = logical_path(&raw) else {
+            continue;
+        };
+        if logical.is_dir() {
+            return Some((logical.into_os_string(), announce));
+        }
+        // The same fallback a written operand gets, for the same reason: the
+        // logical spelling can name nothing where the entry itself crosses a
+        // link (`CDPATH=link/..`, whose `..` textually cancels the name). The
+        // raw candidate is a real place, so this entry answers rather than the
+        // search moving on to the next one.
+        if raw.is_dir() {
+            return Some((raw.into_os_string(), announce));
+        }
+    }
+    None
 }
 
 /// Is this operand one that always resolves from the current directory? An
@@ -936,12 +1155,14 @@ pub(crate) fn cd_change(target: &CdTarget, previous: Option<&Path>) -> Result<u8
         if let Some(previous) = previous {
             env::set_var("OLDPWD", previous);
         }
-        if let Ok(current) = env::current_dir() {
-            env::set_var("PWD", &current);
-            if target.echo {
-                status = write_stdout("cd", &path_line(current.as_os_str()));
-            }
-        }
+        // The target's own path rather than a fresh `getcwd`, which is what
+        // makes `$env.PWD` the *logical* cwd a reader typed their way into: the
+        // two are the same directory and differ only where a symlink is
+        // involved, which is exactly the case worth keeping.
+        env::set_var("PWD", &target.path);
+    }
+    if target.echo {
+        status = write_stdout("cd", &path_line(target.path.as_os_str()));
     }
     Ok(status)
 }
@@ -1016,26 +1237,112 @@ pub(crate) fn write_stdout(label: &str, bytes: &[u8]) -> u8 {
     }
 }
 
-/// The working directory **both** `pwd` spellings report.
+/// The working directory **both** `pwd` spellings report: the shell-owned
+/// **logical** cwd of `DESIGN.md` §"Built-ins", validated against the real one.
 ///
 /// One reader so the command and the call cannot come to disagree about what the
-/// cwd is, or about how a failure reads. Physical `getcwd` for now: the
-/// shell-owned logical cwd of `DESIGN.md` §"Built-ins" — maintained by `cd` and
-/// validated against a stale or forged `$env.PWD` — is not built yet, and when it
-/// lands it lands here, for both spellings at once.
+/// cwd is, or about how a failure reads — and now so they cannot disagree about
+/// *which* directory either, since the logical path is a second answer to the
+/// same question.
 pub(crate) fn working_directory() -> Result<PathBuf, String> {
+    let physical = physical_directory()?;
+    Ok(logical_directory(&physical).unwrap_or(physical))
+}
+
+/// The symlink-resolved cwd — what `getcwd` answers, and what `-P` asks for.
+pub(crate) fn physical_directory() -> Result<PathBuf, String> {
     env::current_dir().map_err(|err| err.to_string())
 }
 
-/// `pwd` — print the current working directory.
+/// `$env.PWD` read as the logical cwd, or `None` when it cannot be trusted.
 ///
-/// M0-level: no `-L`/`-P` flags. The value spelling is `pwd()`, in `repl.rs`.
-fn pwd(args: &[String]) -> u8 {
-    if !args.is_empty() {
-        note!("mesh: pwd: too many arguments");
-        return 1;
+/// A logical path is a different **spelling** of the directory the shell is in,
+/// never a different place: absolute, and free of `.` and `..`, which is what
+/// makes it a spelling rather than a route. Then it has to *be* that directory —
+/// asked by inode, since comparing text would only ask whether two spellings
+/// match, which is the one thing a logical path is allowed to fail.
+///
+/// Anything else is stale or forged: inherited from a shell that has since
+/// moved, or assigned by hand. The physical path answers for it, so `pwd` cannot
+/// lie — which also covers the case of being launched from a shell sitting in a
+/// symlinked directory, where the inherited `$env.PWD` is somebody else's truth.
+fn logical_directory(physical: &Path) -> Option<PathBuf> {
+    let claimed = PathBuf::from(env::var_os("PWD")?);
+    if !claimed.is_absolute() || spells_a_route(&claimed) {
+        return None;
     }
-    match working_directory() {
+    same_directory(&claimed, physical).then_some(claimed)
+}
+
+/// Does this path spell a *route* rather than a place — does any segment read
+/// `.` or `..`?
+///
+/// Asked of the literal segments, because `Path::components` is already a
+/// normalizer: it drops an interior or trailing `.` on the way past, so a
+/// `PWD` of `/project/.` would pass the check and then be printed back with the
+/// dot still in it, contradicting the very invariant the check states.
+/// Does this absolute path open with the two-slash root POSIX leaves to the
+/// implementation? Three or more slashes are one, so they are not it.
+fn double_slash_root(path: &Path) -> bool {
+    let bytes = path.as_os_str().as_bytes();
+    bytes.starts_with(b"//") && !bytes.starts_with(b"///")
+}
+
+fn spells_a_route(path: &Path) -> bool {
+    path.as_os_str()
+        .as_bytes()
+        .split(|byte| *byte == b'/')
+        .any(|segment| segment == b"." || segment == b"..")
+}
+
+/// Do these two paths name the same directory? By `(device, inode)` rather than
+/// by text, which is the whole point: a logical path and the physical one differ
+/// as strings whenever a symlink is involved.
+fn same_directory(one: &Path, other: &Path) -> bool {
+    let (Ok(one), Ok(other)) = (std::fs::metadata(one), std::fs::metadata(other)) else {
+        return false;
+    };
+    one.dev() == other.dev() && one.ino() == other.ino()
+}
+
+/// `pwd [--logical|--physical]` — print the current working directory.
+///
+/// Logical by default, as POSIX requires and as bash, zsh, dash and fish all
+/// answer: `cd link; pwd` says `link`. The value spelling is `pwd()`, in
+/// `repl.rs`, which reports the same logical path.
+fn pwd(args: &[String], written: &[crate::expand::Written]) -> u8 {
+    let mut physical = false;
+    let mut options = true;
+    for (index, arg) in args.iter().enumerate() {
+        let mark = written
+            .get(index)
+            .copied()
+            .unwrap_or(crate::expand::Written::Data);
+        let flag = options && written_flag(mark);
+        match arg.as_str() {
+            "-P" | "--physical" if flag => physical = true,
+            "-L" | "--logical" if flag => physical = false,
+            // `pwd` owns its terminator — it has options — so a `--` ends them
+            // and anything past it is an operand, which `pwd` has none of.
+            _ if options && mark == crate::expand::Written::Terminator => options = false,
+            other => {
+                match (options && reads_as_option(mark), long_spelling(other)) {
+                    (true, Some(long)) => note!("mesh: pwd: {other}: write `{long}`"),
+                    (true, None) => note!(
+                        "mesh: pwd: {other}: not an option of `pwd` (`--logical` or `--physical`)"
+                    ),
+                    (false, _) => note!("mesh: pwd: {other}: pwd takes no operands"),
+                }
+                return 2;
+            }
+        }
+    }
+    let directory = if physical {
+        physical_directory()
+    } else {
+        working_directory()
+    };
+    match directory {
         Ok(dir) => write_stdout("pwd", &path_line(dir.as_os_str())),
         Err(message) => {
             note!("mesh: pwd: {message}");
@@ -2053,11 +2360,17 @@ mod tests {
         // listing it would put `--` in the `Options:` block of every builtin that
         // says so.
         assert_eq!(options("command [--] NAME [ARG ...]"), Vec::<&str>::new());
+        assert_eq!(
+            options("cd [--logical|--physical] [DIR]"),
+            ["--logical", "--physical"]
+        );
         // Nothing to find where a builtin takes only operands.
-        assert_eq!(options("cd [DIR]"), Vec::<&str>::new());
         assert_eq!(options("puts [ARG ...]"), Vec::<&str>::new());
         // The name itself is skipped even when it starts with a dash-like word.
-        assert_eq!(options("pwd"), Vec::<&str>::new());
+        assert_eq!(
+            options("pwd [--logical|--physical] · pwd()"),
+            ["--logical", "--physical"]
+        );
     }
 
     #[test]

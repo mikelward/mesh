@@ -1041,8 +1041,8 @@ argument by hand, and repeating it walks back through earlier commands.
 | `style(text, fg: …, bg: …, bold: …)` | A [styled value](#styled-values) — text plus display attributes. A **value call**, parens attached, because a command position yields a status. Colors are the sixteen ANSI names: `black`, `red`, `green`, `yellow`, `blue`, `magenta`, `cyan`, `white`, `grey` (or `gray`, or `bright-black`), and `bright-` forms of the rest. |
 | `link(text, url)` | A [styled value](#styled-values) carrying an `OSC 8` hyperlink, so `text` is clickable. The url needs a **scheme** (`https://…`, `file://host/path`) and anything RFC 3986 forbids raw is percent-encoded, a space included; over 2083 encoded bytes is refused, since past a terminal's own limit the whole sequence — link text included — is dropped. |
 | `glob(pattern)` · `files(dir = ".")` · `dirs(dir = ".")` | The paths a pattern matches, and a directory's immediate files or subdirectories — a **list**, since these are [value calls](#the-glob-family) rather than commands. |
-| `cd [dir]` | Change directory. No argument goes to `$env.HOME`; `cd -` returns to the previous directory and prints it. A plain relative name is searched in [`$env.CDPATH`](#cdpath). Updates `$env.PWD` and `$env.OLDPWD`, and runs the [`precd` / `postcd` hooks](#custom-prompts-and-hooks) around the move. Autocd is not implemented, so a bare directory name is a command, not a `cd`. |
-| `pwd` · `pwd()` | The working directory. The command **prints** it; the [value call](#functions) **yields** it as a string and writes nothing, so the path composes — `here = pwd()`, `pwd():base`, `style(pwd(), fg: blue)`. `$(pwd)` answers the same question by forking a capture and trimming the newline off what came back; the call hands over the string the shell was already holding, which is what puts it on the prompt path. Neither spelling takes an argument, `--physical` included: mesh does not track a logical cwd yet, so both report `getcwd` and there is nothing to be physical *about*. A directory name that is not valid UTF-8 is printed byte-for-byte by the command and arrives **lossily** in the call, since a mesh string is UTF-8 — print it when the bytes matter. |
+| `cd [--logical\|--physical] [dir]` | Change directory. No argument goes to `$env.HOME`; `cd -` returns to the previous directory and prints it. A plain relative name is searched in [`$env.CDPATH`](#cdpath). **Logical by default** — `cd link` lands in `link`, and a later `cd ..` goes back to where that *name* came from rather than where the link pointed, because `..` is taken off the written path textually. **`--physical`** resolves symlinks first, so the destination is the one `getcwd` would name. A logical path that names *nothing* — `link/../sibling`, a real place through the link and no place at all textually — gives way to the physical reading rather than failing the move. **Long spellings only**, on purpose: a flag is a *value* in mesh, and only a word written `--name` becomes one — so `--physical` survives a wrapper's `...rest` where a short spelling could not, and `cd $dir` with a `$dir` of `-P` goes to that directory rather than being read as an option. POSIX's `-L` / `-P` are refused with the long spelling named (`cd: -P: write `--physical``), and `cd -- -P` reaches a directory of that name. Updates `$env.PWD` and `$env.OLDPWD`, and runs the [`precd` / `postcd` hooks](#custom-prompts-and-hooks) around the move. Autocd is not implemented, so a bare directory name is a command, not a `cd`. |
+| `pwd [--logical\|--physical]` · `pwd()` | The working directory. The command **prints** it; the [value call](#functions) **yields** it as a string and writes nothing, so the path composes — `here = pwd()`, `pwd():base`, `style(pwd(), fg: blue)`. `$(pwd)` answers the same question by forking a capture and trimming the newline off what came back; the call hands over the string the shell was already holding, which is what puts it on the prompt path. The command takes **`--logical`** (the default) and **`--physical`**; the call has no argument and answers logically. The logical cwd is the shell's own: `$env.PWD` is a *claim* about it, believed only when it is absolute, free of `.` and `..`, and names — by inode, not by text — the directory the shell is actually in. A claim that fails any of that is stale or forged, and `getcwd` answers instead, so `pwd` cannot lie. A directory name that is not valid UTF-8 is printed byte-for-byte by the command and arrives **lossily** in the call, since a mesh string is UTF-8 — print it when the bytes matter. |
 | `clip [text …]` | Copy to the terminal's clipboard with `OSC 52`, so it works over `ssh`. Arguments join with a space; with none, stdin is read (`puts hi \| clip`). The bytes are copied as given, a trailing newline included. Goes to the terminal, not stdout, so a redirect cannot swallow it. Whether the copy lands is up to the terminal — xterm needs `allowWindowOps`, tmux `set-clipboard on` — and there is no reply, so success means "asked". |
 | `notify [text …]` | Raise a desktop notification through the terminal with `OSC 9`. Arguments or stdin, like `clip`. A command that runs for more than ten seconds notifies on its own, with its outcome and duration — `$sh.options.command-notify = false` turns that off. Inside tmux the sequence is wrapped for passthrough, which tmux forwards only with `allow-passthrough` set. Support is uneven and unreportable — iTerm2, WezTerm, Ghostty, kitty and ConEmu raise these; xterm and Alacritty discard them; tmux needs `allow-passthrough` — so success means "asked". |
 | `status code` · `status(code)` | A [**status value**](#exit-status) — how a command went — from a code between `0` and `255`. Out of range is refused rather than truncated, and so is a code that is not an integer: both spellings read the operand as a *value*, so `code = "5"; status $code` is refused exactly as `status($code)` is. The call is the constructor (`file-not-found = status(5)`), and the command form leaves the same value as the statement's result, which is what a `match` arm writes: `x = match $kind { missing => { status 5 } }`. `status(0)` is legal where `fail 0` is not: naming a zero status is reasonable, while a `fail` that succeeds is a mistake. It writes nothing and answers with a value, so — like `return` — it is refused in a pipeline, under a redirection, and in the background, where that value would be discarded. |
@@ -1090,8 +1090,9 @@ kill -- -9 %1                 # looks for a job named `-9`, not signal 9
 ```
 
 Which command consumes it depends on which has options to end. `puts`, `print`,
-`clip`, `notify`, `cd`, `source` and `help` have none of their own, so the terminator
-is simply removed. `gets`, `kill`, `disown`, `prompt`, `on`, `wait`, `command`, `exec`
+`clip`, `notify`, `source` and `help` have none of their own, so the terminator
+is simply removed. `gets`, `kill`, `disown`, `prompt`, `on`, `wait`, `command`, `exec`,
+`cd`, `pwd`
 and `type` do, so each ends its own options at `--` — only they know where those stop.
 
 `command` is also where the `--help` rule stops applying, because the arguments
@@ -1122,7 +1123,7 @@ meant.
 type ll            # ll is a function
                    #     func ll(...args)
 type cd            # cd is a shell builtin
-                   #     cd [DIR]
+                   #     cd [--logical|--physical] [DIR]
 type unless        # unless is a shell keyword
                    #     cmd if COND
 type true          # true is a boolean literal
@@ -1724,10 +1725,12 @@ on postcd history remember
 
 Three rules make them predictable:
 
-- **The target is resolved before `precd` runs**, to the absolute, physical path
-  `$env.PWD` will hold. So a handler that changes directory itself cannot make a
-  *relative* outer `cd` land somewhere unintended, and `$env.OLDPWD` still names
-  where the move began rather than wherever a handler wandered to.
+- **The target is resolved before `precd` runs**, to the absolute path
+  `$env.PWD` will hold — the [logical](#built-ins) one, so a handler is told the
+  spelling the reader walked in by, and `--physical` is what asks for the other. So a
+  handler that changes directory itself cannot make a *relative* outer `cd` land
+  somewhere unintended, and `$env.OLDPWD` still names where the move began
+  rather than wherever a handler wandered to.
 - **A handler's own `cd` does not fire them again.** Changing directory from a
   handler is allowed; re-dispatching would recurse without end.
 - **A `cd` that fails runs neither.** A destination that does not exist is

@@ -9,6 +9,29 @@ file as tasks land.
 Calls autopilot made without asking, each one chosen for being cheap to undo.
 Delete an entry once you have agreed with it or reversed it.
 
+- [ ] **`cd` and `pwd` take the long spellings only — `--logical` and
+      `--physical`, not `-L` and `-P`.** *(Decided by the repo owner, so this is
+      a record rather than a guess — delete it once read.)* A flag in mesh is a
+      **value**, and only a word written `--name` becomes one — which is what
+      makes `pwd $x` holding that text data, and what lets `--physical` survive
+      a wrapper's `...rest`. A short spelling has no value
+      type to carry it, so every route to supporting one leaks: reading the
+      characters makes `cd $dir` with a `$dir` of `-P` go to `$HOME`; a mark
+      beside argv (`Written::Dashed`) fixes that but cannot cross a wrapper, so
+      `alias c = cd; c -P` fails where `c --physical` works. Long-only has no
+      such seam, and `-P` is refused with the long spelling named.
+
+      `Written::Dashed` stays, earning its keep in the *diagnostic*: it is what
+      separates a written `-P` (told to write `--physical`) from a `$dir` that
+      holds one (a directory of that name). Nothing decides behavior from it.
+
+      **Still open, and the reason this is short-term:** whether short flags
+      should become real `Flag` values in the parser. Adding `-L` / `-P` back on
+      top of that is a two-line change; adding them back *without* it is what
+      this entry rejects. The shape it would take is sketched under *Circle back:
+      two flag rules the value type overwrote*, so that decision is about
+      something concrete rather than a blank page.
+
 - [ ] **The typed-func implementation rides the same branch as the design
       commit** rather than merging the design PR and cutting a fresh one. The PR
       title drops its `design:` prefix as soon as behavior changes, which is the
@@ -342,7 +365,8 @@ Delete an entry once you have agreed with it or reversed it.
       control/pipes.
 - [x] `cd` builtin (basic): `$HOME` default, `cd -`, updates `$PWD`/`$OLDPWD`,
       rejects surplus operands. `CDPATH` search landed later — see
-      "Beyond M3 — Navigation". Still deferred: `--physical`, autocd, logical cwd.
+      "Beyond M3 — Navigation", as did `--logical`/`--physical` and the logical
+      cwd. Still deferred: autocd.
 - [x] `pwd` and `puts` builtins
 - [x] Globs + `~` expansion (glob no-match → **empty**). `~user` and expansion
       suppression (quoting) still to come; non-UTF-8 lossy under String words.
@@ -1966,9 +1990,10 @@ all under "Beyond M3 — External tool integration".
       prompt to ask where they are.
 
       Both spellings read one function (`builtins::working_directory`), so they
-      cannot drift apart about what the cwd is, and the shell-owned **logical**
-      cwd lands there for both when it lands — `--physical` waits for it, since
-      there is nothing to be physical *about* until then. A non-UTF-8 directory
+      cannot drift apart about what the cwd is — which is why the shell-owned
+      **logical** cwd reached both at once when it landed, in the entry below,
+      and `--physical` waited for it, since there was nothing to be physical
+      *about* until then. A non-UTF-8 directory
       name arrives lossily in the call and byte-exact from the command form: a
       mesh string is UTF-8, the same boundary `precd` / `postcd` already hand a
       path across.
@@ -1990,32 +2015,34 @@ all under "Beyond M3 — External tool integration".
       follow, with `$paths:map(:ancestors)` for the nesting. A relative path stops
       at its first component rather than stepping off the front into the empty
       path, and the empty string walks nothing.
-- [ ] **`pwd` disagrees with every other `pwd`, and not only about flags.** Three
+- [x] **`pwd` disagreed with every other `pwd`, and not only about flags.** Three
       separate gaps, found while moving a shell config's `$(pwd)` captures onto
-      `pwd()`. They are listed together because a single answer — the logical cwd
-      — closes the first two, and it is worth knowing that until it lands the
-      *default* spelling is the incompatible one, not just the flag nobody types.
-  - [ ] **The default is physical where POSIX makes it logical.** `cd link; pwd`
-        answers the resolved path; bash, zsh, dash and fish all answer `link`,
-        because POSIX makes `-L` the default and only `-P` resolves. `pwd()` and
-        `$env.PWD` follow `pwd` here, so mesh is self-consistent and consistently
-        different — which is the shape that bites, since nothing looks wrong until
-        a path is compared against one a different shell produced.
-  - [ ] **`-P` and `-L` are refused as `pwd: too many arguments`.** The message
-        names an arity problem, so it reads as a bug in the caller rather than a
-        flag mesh does not have yet. `-P` is *already* what mesh does, so it could
-        be accepted as a no-op today and only `-L` wait for the logical cwd —
-        or both could be refused with a diagnostic that says which, and names
-        `command pwd -P` for the external. What it should not keep saying is
-        "too many arguments".
-  - [ ] **An inherited `$env.PWD` can disagree with `pwd` until the first `cd`.**
-        Launch mesh from a shell sitting in a symlinked directory and `$env.PWD`
-        holds the parent's logical path while `pwd` reads `getcwd`. The
-        "both spellings read one `working_directory`, so they cannot drift apart"
-        note above is about `pwd` and `pwd()`; the environment variable is a third
-        reader and is not covered by it. Whether entry should re-stamp `$env.PWD`,
-        adopt it when it resolves to the same directory, or leave the two to
-        disagree is the decision.
+      `pwd()`, and one answer closed all three: the **logical cwd** of
+      `DESIGN.md` §"Built-ins", built at last.
+  - [x] **The default was physical where POSIX makes it logical.** `cd link; pwd`
+        answered the resolved path where bash, zsh, dash and fish all answer
+        `link`. Now `cd` is logical by default and `--physical` resolves, so
+        `cd link` lands in `link` and a later `cd ..` goes back to where that
+        *name* came from — `..` is taken off the written path textually, which is
+        the whole of the difference. `pwd()` and `$env.PWD` follow, as they did
+        before.
+  - [x] **`-P` and `-L` were refused as `pwd: too many arguments`**, a message
+        that named an arity problem `pwd` does not have. Both builtins read
+        options now — **`--logical` and `--physical`, the long spellings only**
+        (see the entry under *Decisions needing review*) — so they own their `--`
+        terminator, and a short spelling is refused with the long one named:
+        `pwd: -P: write `--physical``. That terminator is also what makes a
+        directory literally called `-P` reachable, as `cd -- -P`.
+  - [x] **An inherited `$env.PWD` could disagree with `pwd` until the first
+        `cd`.** Settled by making `$env.PWD` a *claim* rather than a fact:
+        believed when it is absolute, free of `.` and `..`, and names the
+        directory the shell is in — asked by inode, since comparing text would
+        only ask whether two spellings match, which is the one thing a logical
+        path may fail. So an inherited claim that checks out is adopted (a login
+        shell handing over a symlinked home), and one that is stale or forged
+        gives way to `getcwd`. That is the third of the three options the entry
+        listed, and it needed no separate decision: it is what "validated
+        against a stale or forged `$env.PWD`" in the design already asked for.
 - [ ] **Should the cwd have a variable form too — `$sh.pwd` or `$sh.cwd`?** Three
       spellings already answer this question (`pwd`, `pwd()`, `$env.PWD`), and the
       case for a fourth is **interpolation**: a prompt segment is mostly a string,
@@ -4362,6 +4389,42 @@ thing a reader takes on trust.*
       landing — "a value that knows what it is needs neither copy" — since the
       predicates existed only to re-derive from characters what the value now
       carries.
+
+- [ ] **Sketch: short flags as `Flag` values.** Not decided — this is the shape
+      the option would take, written down while the reasoning is fresh. It
+      settles the same question for every builtin at once, which is what makes it
+      worth more than the two spellings that prompted it: `type "-P"`,
+      `disown "-h"` and `kill "-9"` all still read quoted data as flags.
+  - [ ] **What becomes one.** A bare, unquoted `-` followed by ASCII letters,
+        decided in `expand::scalar_literal` beside the `--name` rule it already
+        applies. Letters are the whole line: `-2` stays an integer and `-2.5` a
+        string (rough edge 20), `-` alone stays `cd`'s operand, and `--` is
+        already the terminator. Quoting still opts out, so `"-P"` is data, as it
+        is for every other literal.
+  - [ ] **Clustering is the reader's, not the parser's.** `-la` becomes one flag
+        *named* `la`, and a builtin that knows its own letters splits it. Having
+        the parser emit two flags would decide the clustering question for the
+        whole language from inside a value rule — and that question deserves its
+        own answer (see the entry above it). One flag named `la` also lets a
+        signature declare a two-letter short flag, which splitting would forbid.
+  - [ ] **Declaring one.** `func f(--force|-f)` — one parameter, two spellings,
+        which is what a writer means. `func f(-f)` alone should probably be a
+        parse error: a flag a caller can only spell one letter at a time is the
+        thing this repo's own style rules argue against.
+  - [ ] **What it breaks, and the escape.** `f -x` binds a flag where it binds a
+        positional today, so a function taking a dashed operand needs `f -- -x`
+        or `f "-x"`. Externals are unaffected (a `Flag` renders to its text, so
+        argv is identical), and a `wrapper func` forwards verbatim, so aliases
+        are too. The exposure is mesh functions and builtins that take
+        dash-leading *data* — worth a survey before committing.
+  - [ ] **`kill` is the wrinkle.** `kill -9` is a **signal**, not an option —
+        `-SIGNAL` is a metavariable in its usage line, which is why
+        `usage_options` already reports none for it. Under this rule `-9` stays
+        an integer (digits, not letters), so `kill -9` is unaffected, but
+        `kill -KILL` would become a flag named `KILL`. `kill` would read the
+        flag's *name* as the signal rather than scanning characters, which is
+        arguably clearer — but it is the one builtin whose whole option surface
+        is not options.
 
 - [ ] **Circle back: two flag rules the value type overwrote.** *(Both are
       implemented and green; both replaced a rule that had been argued through

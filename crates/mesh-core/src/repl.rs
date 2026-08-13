@@ -10717,8 +10717,12 @@ fn run_expanded(mut argv: Argv, last: u8, shell: &mut Shell) -> Step {
         "title" => return set_title_builtin(&words[1..], shell),
         "on" => return configure_hook(&words[1..], shell),
         // `cd` fires the `precd` / `postcd` hooks, which are this shell's, so it
-        // cannot go through `builtins::dispatch` either.
-        "cd" => return change_directory(&words[1..], shell),
+        // cannot go through `builtins::dispatch` either. It reads options, so it
+        // takes the call-site marks with the words, as `gets` does.
+        "cd" => {
+            let written = argv.written_from(1).to_vec();
+            return change_directory(&argv.words[1..], &written, shell);
+        }
         // `source` runs mesh code in *this* shell, so it belongs here rather than
         // in `builtins::dispatch`, which is handed only words and a status.
         "source" => return source_file(&words[1..], last, shell),
@@ -10772,7 +10776,8 @@ fn run_expanded(mut argv: Argv, last: u8, shell: &mut Shell) -> Step {
     }
     // Command resolution: builtins, then external (a function was already
     // resolved above).
-    match builtins::dispatch(words, last) {
+    let marks = argv.written.clone();
+    match builtins::dispatch(words, &marks, last) {
         Some(Builtin::Exit(code)) => Step::Exit(code),
         Some(Builtin::Status(code)) => Step::Continue(code),
         None => {
@@ -10823,14 +10828,16 @@ fn callable_variable_note(name: &str, shell: &Shell) -> Option<String> {
 /// deferring to function return would run it somewhere else. A handler that
 /// `cd`s itself does not re-dispatch them (`Shell::in_cd_hooks`), and a move
 /// that fails owes no `postcd`.
-fn change_directory(args: &[String], shell: &mut Shell) -> Step {
-    let target = match builtins::cd_target(args) {
+fn change_directory(args: &[String], written: &[expand::Written], shell: &mut Shell) -> Step {
+    let target = match builtins::cd_target(args, written) {
         Ok(target) => target,
         Err(code) => return Step::Continue(code),
     };
     // Captured before `precd`, so a handler that wanders cannot become what
-    // `$env.OLDPWD` and `postcd` report as where this move started.
-    let previous = env::current_dir().ok();
+    // `$env.OLDPWD` and `postcd` report as where this move started. The logical
+    // cwd rather than `getcwd`, so `cd -` comes back to the spelling the reader
+    // left from — the one `cd` published to `$env.PWD` on the way in.
+    let previous = builtins::working_directory().ok();
     let hooks = !shell.in_cd_hooks;
     if hooks {
         run_cd_hooks(HookEvent::PreCd, target.path(), shell);
