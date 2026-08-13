@@ -9,6 +9,21 @@ file as tasks land.
 Calls autopilot made without asking, each one chosen for being cheap to undo.
 Delete an entry once you have agreed with it or reversed it.
 
+- [ ] **The batch contract applies under `-i` too.** `mesh -i -c '…'` and
+      `printf … | mesh -i` now exit nonzero on a refused statement, like their
+      plain forms. `DESIGN.md` §"Recovery" names the category "Script / `-c` /
+      non-interactive" and lists `-c` unconditionally, and neither form has a
+      prompt to return to — but `-i` *is* the flag that declares a session
+      interactive, and containment is meant to be an interactive affordance, so
+      the other reading is available.
+
+      Chosen for being the simpler rule and for changing nothing about what runs:
+      containment is "the shell keeps going", which both forms still do. Only the
+      status the session finally leaves with is different, and nothing consumes
+      it before the process is over. Reversing it is one `options.interactive`
+      test in each of `run_batch` and `run_piped`, plus a case in
+      `a_batch_that_broke_exits_nonzero_however_it_ended`.
+
 - [ ] **`cd` and `pwd` take the long spellings only — `--logical` and
       `--physical`, not `-L` and `-P`.** *(Decided by the repo owner, so this is
       a record rather than a guess — delete it once read.)* A flag in mesh is a
@@ -8907,35 +8922,59 @@ of each PR had landed by another route, but these pieces had not.
       examples by which package they assume rather than exempting the file, so
       it is a change to the test, not to the document.
 
-- [ ] **A channel-2 error is loud on stderr and silent in the exit code.**
+- [x] **A channel-2 error was loud on stderr and silent in the exit code** —
+      *the status half landed; see the sub-item below for the half that did not.*
       Found re-checking `docs/INTRO.md`'s "absence is loud" claims against the
       built shell. Every strict/soft pair there holds — `$xs[99]` names the
       index, `$config.k` says "no `k` in this map", `$env.K` says "not set", a
       mismatched `[a b] = $xs` is refused, and each has its soft twin — but the
-      error does not carry past the statement it happened in:
+      error did not carry past the statement it happened in:
 
       ```
       $ mesh -c 'xs = [a b]; puts $xs[99]; true'
       mesh: $xs[99]: list index out of range
       $ echo $?
-      0
+      0        # now 1
       ```
 
-      The statement's own status is `1`, and a script whose *last* statement is
-      the failure does exit `1`, so this is not invisible — but any later
-      successful command masks it, and the statements after the error all run.
-      `DESIGN.md` §"Recovery" gives the non-interactive case the opposite rule:
-      an uncaught error "exits nonzero (the batch contract), so automation still
-      fails hard", and the `source` bullet spells out that "subsequent
-      deploy/mutation commands do *not* run". Interactive containment (abort the
-      line, keep the session) is what is built; the batch half is not.
+      The statement's own status was `1`, and a script whose *last* statement is
+      the failure did exit `1`, so this was not invisible — but any later
+      successful command masked it. `DESIGN.md` §"Recovery" gives the
+      non-interactive case the opposite rule: an uncaught error "exits nonzero
+      (the batch contract), so automation still fails hard".
 
       Not `errexit` — `DESIGN.md` rules that out explicitly, and a *failed
-      command* keeping the script alive is correct. What is missing is the
-      distinction between a command reporting failure and the shell refusing
-      invalid input: only the second should abort a non-interactive run. That
-      needs the error to propagate out of the statement, which the fork-crossing
-      item above needs as well, so the two want one channel between them.
+      command* keeping the script alive is correct. The distinction it needed
+      was between a command reporting failure and the shell refusing invalid
+      input, and that already existed in the type: `Step::Error` against
+      `Step::Continue`, written so a site which has to choose cannot be
+      written without choosing. So did the record — `Shell::input_error` keeps
+      the *first* unanswered breakage for a whole input precisely so later
+      statements cannot overwrite the evidence, with `pending_error` holding
+      one a `||` can still answer for.
+
+      What was missing was only that the two non-interactive entry points never
+      read it. `run_sourced_text` already did, which is why a broken `env.mesh`
+      reported; `run_batch` and `run_piped` took the last statement's status and
+      went. Both now settle at end of input and report the breakage, so `-c`, a
+      script file, and piped stdin agree. An `exit n` still outranks it — the
+      refusal was already reported on stderr, so `exit 0` can mean it.
+
+      Three tests asserted the old reading, each on a script that deliberately
+      triggers a refusal and then checks what *else* happened (`true &;` still
+      separating, `break` in a function body not reaching the caller's loop, a
+      mismatched list pattern leaving its names alone). Each keeps its subject
+      and expects the refusal in the status.
+  - [ ] **The statements after a refusal still run.** The `source` bullet in the
+        same section spells out that "subsequent deploy/mutation commands do
+        *not* run", and they do. That is a bigger change than the status: "an
+        error does not stop the body" is deliberate and load-bearing across every
+        body — `$(…)` needs it to tell an invalid program from a status, and
+        `puts "a[$nope]b"; puts after` has always printed `after`. Making it
+        conditional on interactivity means the error propagating *out* of the
+        statement, which the fork-crossing item above needs too, so the two still
+        want one channel between them. The status half needed none of that, which
+        is why it went first.
 
 - [ ] **`docs/INTRO.md` writes `gets()` in the value-call form, which is not
       built.** Also from the same sweep. The prose has been narrowed to the
