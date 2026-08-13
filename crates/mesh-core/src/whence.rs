@@ -924,17 +924,19 @@ mod tests {
     #[test]
     fn a_builtin_shadows_an_external_of_the_same_name() {
         let mut found = Found::default();
-        found.commands.push(Finding::Builtin("cd [DIR]"));
+        found
+            .commands
+            .push(Finding::Builtin("cd [--logical|--physical] [DIR]"));
         found
             .commands
             .push(Finding::External(PathBuf::from("/usr/bin/cd")));
         assert_eq!(
             rendered("cd", &found, false),
-            "cd is a shell builtin\n    cd [DIR]\n"
+            "cd is a shell builtin\n    cd [--logical|--physical] [DIR]\n"
         );
         assert_eq!(
             rendered("cd", &found, true),
-            "cd is a shell builtin\n    cd [DIR]\ncd is /usr/bin/cd\n"
+            "cd is a shell builtin\n    cd [--logical|--physical] [DIR]\ncd is /usr/bin/cd\n"
         );
     }
 

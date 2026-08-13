@@ -540,6 +540,19 @@ pub enum Written {
     Flag,
     /// A `FlagTerminator` value, likewise top level.
     Terminator,
+    /// Written **literally with a leading dash**, and no option value — `-P`,
+    /// `-la`, `-2`. Only `--name` becomes a `Flag`, so a short option has no
+    /// value type to carry it, and a builtin that reads one (`cd -P`, `type -t`,
+    /// `kill -9`) has nothing but the characters to go on — which reads a quoted
+    /// `"-P"` or a `$dir` holding it as the flag, the data-decides-the-call
+    /// answer refused everywhere else. This says *the reader typed a dash here*,
+    /// which is the question those builtins actually mean to ask.
+    ///
+    /// Not a `Flag`: it makes no claim about what the word means, so a function
+    /// signature and the option scanner still see the string they saw before.
+    /// Deciding short options in the type is a language change; this is the mark
+    /// that lets a builtin stop guessing without one.
+    Dashed,
 }
 
 /// Whether this word denotes a written option, for [`Written`].
@@ -556,10 +569,46 @@ pub fn written_of(word: &Word, vars: &Vars) -> Written {
         Some(Err(_)) => return Written::Data,
         None => match scalar_literal(word) {
             Some(value) => value,
-            None => return Written::Data,
+            // Not a typed literal — an ordinary bare string, which is what a
+            // short option is to the parser. Nothing else marks one.
+            None => return dashed_mark(word),
         },
     };
-    written_of_value(&value)
+    // `dashed_literal` is asked of the **word**, so a variable or a quoted piece
+    // never answers to it: that is what keeps `$dir` and `"-P"` data. A typed
+    // literal can still be dashed — `-2` is an integer — and it is written with
+    // a dash either way.
+    match written_of_value(&value) {
+        Written::Data => dashed_mark(word),
+        mark => mark,
+    }
+}
+
+/// Is this word a bare literal spelling a short option — one dash and something
+/// after it? A lone `-` is an operand in every builtin that takes one (`cd -`),
+/// and `--name` has already answered as a `Flag` before this is asked.
+fn dashed_mark(word: &Word) -> Written {
+    if dashed_literal(word) {
+        Written::Dashed
+    } else {
+        Written::Data
+    }
+}
+
+fn dashed_literal(word: &Word) -> bool {
+    matches!(
+        word.pieces.as_slice(),
+        // A word that **globs** is excluded, exactly as `scalar_literal`
+        // excludes one from becoming a `Flag`: `-*` takes its text from
+        // whatever the directory happens to hold, so marking it would let the
+        // filesystem decide that a word is an option — and a directory called
+        // `-place` is a place a reader can be standing in.
+        [Piece::Text { text, expandable: true }]
+            if text.starts_with('-')
+                && text.len() > 1
+                && !text.starts_with("--")
+                && !has_glob_meta(text)
+    )
 }
 
 /// The mark a value carries when it stands as a call argument of its own.

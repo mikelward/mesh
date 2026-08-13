@@ -6157,7 +6157,9 @@ programs or user functions:
     the conventional POSIX exemption, so `cd ../` can't jump to a `CDPATH` entry. It
     updates `$env.PWD` / `$env.OLDPWD` and fires the
     [`precd` / `postcd`](#hooks-and-the-prompt) hooks. Logical by default;
-    **`--physical` / `-P`** resolves symlinks first. The block form `in DIR { }` is
+    **`--physical`** resolves symlinks first — long spelling only, since a flag is
+    a value and only a written `--name` becomes one, which is what lets it survive
+    a wrapper and keeps a directory called `-P` reachable. The block form `in DIR { }` is
     the scoped `pushd` / `popd`.
   - **`pwd`** — the working directory. The shell **maintains the logical cwd
     itself** (updated by `cd` / autocd), so `pwd` reports *that* shell-owned value —
@@ -6165,7 +6167,7 @@ programs or user functions:
     `$env.PWD` has diverged, so `pwd` can't lie. Run bare it **prints** the path; the
     **value call `pwd()` returns** the same validated cwd as a string value — so
     `pwd():ancestors` and `style(pwd(), fg: blue)` read the authoritative path, never
-    the raw `$env.PWD`. **`--physical` / `-P`** calls `getcwd` for the symlink-resolved
+    the raw `$env.PWD`. **`--physical`** calls `getcwd` for the symlink-resolved
     path.
   - **Autocd** — a bare word in command position that is a **directory path ending
     in `/`** (`src/`, `../`, `/tmp/`) is a `cd` into it, no `cd` keyword needed. The

@@ -1451,8 +1451,328 @@ fn pwd_prints_the_working_directory() {
 
 #[test]
 fn pwd_rejects_operands() {
+    // Named for what it is rather than counted: `pwd` takes no operands at all,
+    // so "too many arguments" described an arity it does not have and read as a
+    // bug in the caller. A flag it does not have says so too, and names the two
+    // it does — the message is where a reader finds out what to write instead.
     let out = run_with_input("pwd extra\n");
-    assert!(String::from_utf8_lossy(&out.stderr).contains("too many arguments"));
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("pwd: extra: pwd takes no operands"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let flag = run_with_input("pwd -x\n");
+    assert!(
+        String::from_utf8_lossy(&flag.stderr)
+            .contains("pwd: -x: not an option of `pwd` (`--logical` or `--physical`)"),
+        "{}",
+        String::from_utf8_lossy(&flag.stderr)
+    );
+    // `cd` reads the same two, and its refusal names the way to a directory
+    // that spells one — the terminator, as `kill -- -9` uses it.
+    let unknown = run_with_input("cd -x\n");
+    assert!(
+        String::from_utf8_lossy(&unknown.stderr).contains(
+            "cd: -x: not an option of `cd` (`--logical` or `--physical`); \
+             `cd -- -x` goes to a directory of that name"
+        ),
+        "{}",
+        String::from_utf8_lossy(&unknown.stderr)
+    );
+}
+
+/// The cwd is **logical**: the shell reports the path a reader walked in by,
+/// not the one the kernel resolved it to (`DESIGN.md` §"Built-ins", and POSIX,
+/// where the logical reading is the default). mesh answered physically
+/// everywhere, which made it self-consistent and consistently different from
+/// bash, zsh, dash and fish — the shape that bites, since nothing looks wrong
+/// until a path is compared against one another shell produced.
+#[test]
+fn the_working_directory_is_the_one_you_walked_in_by() {
+    let dir = fresh_dir("logical_cwd");
+    let real = dir.join("real");
+    std::fs::create_dir_all(real.join("inner")).expect("create the real directory");
+    std::os::unix::fs::symlink("real", dir.join("link")).expect("link to it");
+    let link = dir.join("link");
+
+    let out = run_with_input(&format!(
+        "cd {link}\npwd\npwd --physical\n\
+         cd inner\npwd\n\
+         cd ..\npwd\n",
+        link = link.display()
+    ));
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        format!(
+            // Walked in by the link, so that is the answer — and `--physical` is
+            // how you ask for the other one.
+            "{link}\n{real}\n\
+             {link}/inner\n\
+             {link}\n",
+            link = link.display(),
+            real = real.display()
+        ),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // `..` out of a symlinked directory is textual, which is the whole of the
+    // difference: physically `link/inner/..` is `real`, logically it is `link`,
+    // and the line above says `link`. `cd --physical` asks for the other reading, and
+    // `cd -` comes back to the spelling it left from.
+    let physical = run_with_input(&format!(
+        "cd {link}\ncd --physical .\npwd\ncd {link}\ncd {dir}\ncd -\npwd\n",
+        link = link.display(),
+        dir = dir.display()
+    ));
+    assert_eq!(
+        String::from_utf8_lossy(&physical.stdout),
+        format!(
+            // `cd -` echoes where it landed, as POSIX has it, then `pwd` agrees.
+            "{real}\n{link}\n{link}\n",
+            real = real.display(),
+            link = link.display()
+        ),
+        "{}",
+        String::from_utf8_lossy(&physical.stderr)
+    );
+
+    std::fs::remove_dir_all(&dir).expect("the test directory should be removable");
+}
+
+/// The case the two readings actually differ in: a link that crosses into
+/// another tree, where its logical parent and its physical one are different
+/// directories. `-L` resolves symlinks *after* `..`, so `cd link; cd ..` goes
+/// back to where the *name* came from — the earlier test's link sat beside its
+/// target, which made both readings agree and hid it.
+#[test]
+fn a_logical_parent_is_where_the_name_came_from() {
+    let dir = fresh_dir("logical_parent");
+    let project = dir.join("project");
+    let target = dir.join("elsewhere").join("target");
+    std::fs::create_dir_all(&project).expect("create the project directory");
+    std::fs::create_dir_all(&target).expect("create the target directory");
+    std::os::unix::fs::symlink(&target, project.join("link")).expect("link across the trees");
+
+    let out = run_with_input(&format!(
+        "cd {link}\ncd ..\npwd\ncd {link}\ncd --physical ..\npwd\n",
+        link = project.join("link").display()
+    ));
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        format!(
+            // Logical: back out through the name. Physical: the link's own
+            // parent, which is a different directory in a different tree.
+            "{project}\n{elsewhere}\n",
+            project = project.display(),
+            elsewhere = dir.join("elsewhere").display()
+        ),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    std::fs::remove_dir_all(&dir).expect("the test directory should be removable");
+}
+
+/// A **written** flag is an option; text that merely spells one is data — for
+/// short spellings too. Only `--name` becomes a `Flag` value, so `-P` carries
+/// `Written::Dashed` instead: the mark says a dash was *typed here*, without
+/// claiming the word is an option, which is all a builtin that reads short
+/// flags needs in order to stop guessing from characters.
+#[test]
+fn a_cwd_flag_is_the_one_that_was_written() {
+    let dir = fresh_dir("cwd_flags");
+    let named = dir.join("-P");
+    std::fs::create_dir_all(&named).expect("create a directory called -P");
+
+    // Computed, so data — and `pwd` has no operands, so it says so.
+    let computed = run_with_input("x = \"--physical\"\npwd $x\n");
+    assert!(
+        String::from_utf8_lossy(&computed.stderr)
+            .contains("pwd: --physical: pwd takes no operands"),
+        "{}",
+        String::from_utf8_lossy(&computed.stderr)
+    );
+
+    // The short spelling both ways round: quoted and computed `-P` name the
+    // directory rather than asking for the physical path — which is a place a
+    // reader can actually be standing in, so guessing from the characters sent
+    // them to `$HOME` instead.
+    for source in ["cd \"-P\"", "d = \"-P\"\ncd $d"] {
+        let data = run_with_input(&format!("cd {dir}\n{source}\npwd\n", dir = dir.display()));
+        assert_eq!(
+            String::from_utf8_lossy(&data.stdout),
+            format!("{named}\n", named = named.display()),
+            "{source}: {}",
+            String::from_utf8_lossy(&data.stderr)
+        );
+    }
+
+    // Written, so an option.
+    let written = run_with_input(&format!("cd {dir}\npwd --physical\n", dir = dir.display()));
+    assert_eq!(
+        String::from_utf8_lossy(&written.stdout),
+        format!("{dir}\n", dir = dir.display()),
+        "{}",
+        String::from_utf8_lossy(&written.stderr)
+    );
+
+    // POSIX's short spellings are **not** options here, and the refusal says
+    // what to write instead — that is what a reader with the muscle memory
+    // needs, and it is the same answer for `cd`, which adds the terminator.
+    for (line, expect) in [
+        ("pwd -P\n", "pwd: -P: write `--physical`"),
+        ("pwd -L\n", "pwd: -L: write `--logical`"),
+        ("cd -P /tmp\n", "cd: -P: write `--physical`"),
+    ] {
+        let refused = run_with_input(line);
+        assert!(
+            String::from_utf8_lossy(&refused.stderr).contains(expect),
+            "{line}: {}",
+            String::from_utf8_lossy(&refused.stderr)
+        );
+    }
+
+    // Through a **wrapper** only the long spelling survives, and that is the
+    // edge of what a mark can do: `...rest` binds its arguments as *values*, and
+    // a written `--physical` is a `Flag` value where a written `-P` is the
+    // string `-P` — indistinguishable from a quoted one by the time the wrapper
+    // forwards it. It fails loudly rather than picking a mode by accident.
+    for (source, expect) in [
+        ("alias c = cd\nc --physical {link}\npwd\n", true),
+        ("alias c = cd\nc -P {link}\npwd\n", false),
+    ] {
+        let out = run_with_input(&source.replace("{link}", &dir.display().to_string()));
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout).contains(&dir.display().to_string()),
+            expect,
+            "{source}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    // A **glob** that lands on a dash-leading name is data too, for the reason
+    // `scalar_literal` already excludes one from becoming a `Flag`: the text
+    // comes from whatever the directory holds, so marking it would let the
+    // filesystem decide a word is an option. `cd -*` enters `-place`.
+    // In its own directory, so the pattern matches exactly one name — the `-P`
+    // above lives beside it otherwise, and two operands are a different error.
+    let alone = fresh_dir("cwd_flag_glob");
+    let matched = alone.join("-place");
+    std::fs::create_dir_all(&matched).expect("create a directory called -place");
+    let globbed = run_with_input(&format!("cd {dir}\ncd -*\npwd\n", dir = alone.display()));
+    assert_eq!(
+        String::from_utf8_lossy(&globbed.stdout),
+        format!("{matched}\n", matched = matched.display()),
+        "{}",
+        String::from_utf8_lossy(&globbed.stderr)
+    );
+    std::fs::remove_dir_all(&alone).expect("the glob directory should be removable");
+
+    // And the terminator is how a directory that spells a flag is reached.
+    let terminated = run_with_input(&format!("cd {dir}\ncd -- -P\npwd\n", dir = dir.display()));
+    assert_eq!(
+        String::from_utf8_lossy(&terminated.stdout),
+        format!("{named}\n", named = named.display()),
+        "{}",
+        String::from_utf8_lossy(&terminated.stderr)
+    );
+
+    std::fs::remove_dir_all(&dir).expect("the test directory should be removable");
+}
+
+/// **Exactly two** leading slashes are a root of their own — POSIX leaves `//`
+/// implementation-defined, and where it means something collapsing it changes
+/// which place the path names. Three or more are one, which POSIX does settle.
+/// bash answers the same way on all three lines below.
+#[test]
+fn a_double_slash_root_survives_the_logical_path() {
+    let out = run_with_input(
+        "cd //tmp\npwd\n         cd ///tmp\npwd\n         cd //tmp\ncd ..\npwd\n         cd //tmp\ncd ../tmp\npwd\n",
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        // The last two are what a `PathBuf` would have lost: popping `//tmp`
+        // yields `/`, so walking out of that root once dropped it for good.
+        "//tmp\n/tmp\n//\n//tmp\n",
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// The logical cwd is the shell's own, so `$env.PWD` is a *claim* about it that
+/// has to check out: absolute, free of `.` and `..`, and naming the directory
+/// the shell is actually in. A claim that fails any of those is stale or
+/// forged — inherited from a shell that has since moved, or assigned by hand —
+/// and the physical path answers instead, so `pwd` cannot lie.
+#[test]
+fn a_pwd_that_does_not_check_out_is_not_believed() {
+    let dir = fresh_dir("claimed_cwd");
+    let real = dir.join("real");
+    std::fs::create_dir_all(&real).expect("create the real directory");
+    std::os::unix::fs::symlink("real", dir.join("link")).expect("link to it");
+    let link = dir.join("link");
+
+    // Assigned by hand to somewhere else entirely.
+    let forged = run_with_input(&format!(
+        "cd {link}\n$env.PWD = {dir}\npwd\n",
+        link = link.display(),
+        dir = dir.display()
+    ));
+    assert_eq!(
+        String::from_utf8_lossy(&forged.stdout),
+        format!("{real}\n", real = real.display()),
+        "{}",
+        String::from_utf8_lossy(&forged.stderr)
+    );
+
+    // Inherited rather than assigned: launched *in* `real` from a shell whose
+    // own `PWD` claims somewhere else. Same answer — which is what makes the
+    // entry case safe, since mesh starting under a symlink must not adopt
+    // somebody else's truth about where that is.
+    let entered = |claim: &Path| {
+        let mut child = mesh_command()
+            .current_dir(&real)
+            .env("PWD", claim)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn mesh");
+        write_stdin(child.stdin.take(), b"pwd\n");
+        child.wait_with_output().expect("wait for mesh")
+    };
+    let stale = entered(&dir);
+    assert_eq!(
+        String::from_utf8_lossy(&stale.stdout),
+        format!("{real}\n", real = real.display()),
+        "{}",
+        String::from_utf8_lossy(&stale.stderr)
+    );
+
+    // A dot component is a route rather than a place, so the claim fails even
+    // though it names the right directory: `Path::components` drops an interior
+    // or trailing `.` on the way past, so asking it would have accepted this and
+    // then printed the dot straight back.
+    let dotted = entered(&real.join("."));
+    assert_eq!(
+        String::from_utf8_lossy(&dotted.stdout),
+        format!("{real}\n", real = real.display()),
+        "{}",
+        String::from_utf8_lossy(&dotted.stderr)
+    );
+
+    // And a claim that *does* check out is kept: that is how a login shell hands
+    // a symlinked home over, so refusing every inherited one would lose it.
+    let inherited = entered(&link);
+    assert_eq!(
+        String::from_utf8_lossy(&inherited.stdout),
+        format!("{link}\n", link = link.display()),
+        "{}",
+        String::from_utf8_lossy(&inherited.stderr)
+    );
+
+    std::fs::remove_dir_all(&dir).expect("the test directory should be removable");
 }
 
 /// The **value** form: `pwd()` yields the directory into an expression rather
@@ -2278,6 +2598,86 @@ fn an_empty_cdpath_entry_is_the_current_directory_and_is_silent() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+/// A relative `CDPATH` entry starts from the **logical** cwd, like everything
+/// else `-L` governs. With a cwd reached through a symlink into another tree,
+/// `CDPATH=../common` means the parent of the *name* the reader walked in by;
+/// probing it against `getcwd` looks in the link's tree instead and then reports
+/// the operand missing when it is right there. bash reaches it.
+#[test]
+fn a_relative_cdpath_entry_starts_from_the_logical_cwd() {
+    let root = fresh_dir("cdpath_logical");
+    let project = root.join("project");
+    let target = root.join("elsewhere").join("target");
+    std::fs::create_dir_all(project.join("common").join("foo")).expect("create the search tree");
+    std::fs::create_dir_all(&target).expect("create the link target");
+    std::os::unix::fs::symlink(&target, project.join("link")).expect("link across the trees");
+
+    let out = run_with_input(&format!(
+        "cd {link}\n$env.CDPATH = ../common\ncd foo\npwd\n",
+        link = project.join("link").display()
+    ));
+    let found = project.join("common").join("foo");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        // Twice: a `CDPATH` hit announces where it landed, then `pwd` agrees.
+        format!("{found}\n{found}\n", found = found.display()),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // And `-P` searches from the link's own tree, which is the same rule read
+    // the other way: symlinks before `..` rather than after. Only a search tree
+    // on *both* sides tells the two apart — with one, `-P` would have found the
+    // logical hit and looked correct.
+    std::fs::create_dir_all(root.join("elsewhere").join("common").join("foo"))
+        .expect("create the physical search tree");
+    let physical = run_with_input(&format!(
+        "cd {link}\n$env.CDPATH = ../common\ncd --physical foo\npwd\n",
+        link = project.join("link").display()
+    ));
+    let beside = root.join("elsewhere").join("common").join("foo");
+    assert_eq!(
+        String::from_utf8_lossy(&physical.stdout),
+        format!("{beside}\n{beside}\n", beside = beside.display()),
+        "{}",
+        String::from_utf8_lossy(&physical.stderr)
+    );
+
+    std::fs::remove_dir_all(&root).expect("the test directory should be removable");
+}
+
+/// The entry itself may be the thing that crosses the link — `CDPATH=link/..`,
+/// whose `..` textually cancels the name and so points at the *cwd* logically
+/// while the kernel reads it as the link's own parent. When the logical spelling
+/// names nothing, the raw candidate answers, exactly as a written operand's does;
+/// bash lands there too. Without that fallback the entry is skipped and the
+/// search moves on, so `cd foo` fails with the directory sitting right there.
+#[test]
+fn a_cdpath_entry_that_crosses_a_link_still_finds_its_operand() {
+    let root = fresh_dir("cdpath_through_link");
+    let project = root.join("project");
+    let elsewhere = root.join("elsewhere");
+    std::fs::create_dir_all(&project).expect("create the project directory");
+    std::fs::create_dir_all(elsewhere.join("target")).expect("create the link target");
+    std::fs::create_dir_all(elsewhere.join("foo")).expect("create the operand");
+    std::os::unix::fs::symlink(elsewhere.join("target"), project.join("link"))
+        .expect("link across the trees");
+
+    let out = run_with_input(&format!(
+        "cd {project}\n$env.CDPATH = \"link/..\"\ncd foo\npwd\n",
+        project = project.display()
+    ));
+    let found = elsewhere.join("foo");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        format!("{found}\n{found}\n", found = found.display()),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    std::fs::remove_dir_all(&root).expect("the test directory should be removable");
+}
+
 #[test]
 fn a_dot_relative_cd_never_searches_cdpath() {
     // The POSIX exemption: `.`, `..`, `./x` and `../x` resolve from where you
@@ -2314,6 +2714,30 @@ fn an_empty_cd_operand_does_not_jump_to_a_cdpath_entry() {
         "an empty operand must not move: {}",
         String::from_utf8_lossy(&out.stderr)
     );
+
+    // And it is an *error*, not a quiet no-op: logically an empty target adds no
+    // segments, so it resolves to the directory the shell is already in — which
+    // would report success, fire the hooks and overwrite `$env.OLDPWD` for a
+    // word that names nowhere. The diagnostic says which of the three was empty.
+    for (source, script) in [
+        ("the operand", "cd ''\n"),
+        ("`$env.HOME`", "$env.HOME = ''\ncd\n"),
+        ("`$env.OLDPWD`", "$env.OLDPWD = ''\ncd -\n"),
+    ] {
+        let out = run_with_input(&format!("{script}puts status=$sh.status\n"));
+        assert!(
+            String::from_utf8_lossy(&out.stderr)
+                .contains(&format!("cd: {source} is empty; it names no directory")),
+            "{script}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&out.stdout).contains("status=1"),
+            "{script}: {}",
+            String::from_utf8_lossy(&out.stdout)
+        );
+    }
+
     let _ = std::fs::remove_dir_all(&root);
 }
 
@@ -2327,6 +2751,122 @@ fn cd_hook_dirs(tag: &str) -> (PathBuf, PathBuf) {
     let sub = root.join("sub");
     std::fs::create_dir_all(&sub).expect("create sub");
     (root, sub)
+}
+
+/// Reading the cwd can fail — the directory the shell is standing in can be
+/// unlinked out from under it — and a **relative** target is exactly what needs
+/// it, since that is what the logical base resolves against. Reported rather
+/// than guessed past: substituting an empty base would resolve the operand
+/// against the process cwd instead, quietly answering a different question than
+/// the one `-L` asked, and could publish a *relative* `$env.PWD`.
+#[test]
+fn a_cwd_that_cannot_be_read_is_reported_rather_than_guessed() {
+    let root = fresh_dir("cwd_unreadable");
+    let inner = root.join("inner");
+    std::fs::create_dir_all(&inner).expect("create the directory to stand in");
+
+    // Removed from under the shell by an external command, so `getcwd` fails
+    // while mesh is still nominally there.
+    let relative = run_with_input(&format!(
+        "cd {inner}\ncommand rmdir {inner}\ncd sub\nputs status=$sh.status\n",
+        inner = inner.display()
+    ));
+    let seen = String::from_utf8_lossy(&relative.stderr).into_owned();
+    assert!(
+        seen.contains("cd: sub: cannot read the current directory to resolve it:"),
+        "{seen}"
+    );
+    assert!(
+        String::from_utf8_lossy(&relative.stdout).contains("status=1"),
+        "{}",
+        String::from_utf8_lossy(&relative.stdout)
+    );
+
+    // A `CDPATH` entry that needs the same base names nothing, so the search
+    // moves on rather than ending there: an **absolute** entry after it needs no
+    // base and answers. bash does the same.
+    std::fs::create_dir_all(&inner).expect("re-create the directory");
+    let search = root.join("search");
+    std::fs::create_dir_all(search.join("foo")).expect("create the search tree");
+    let searched = run_with_input(&format!(
+        "cd {inner}\n$env.CDPATH = \"../missing:{search}\"\ncommand rmdir {inner}\ncd foo\npwd\n",
+        inner = inner.display(),
+        search = search.display()
+    ));
+    let found = search.join("foo");
+    assert_eq!(
+        String::from_utf8_lossy(&searched.stdout),
+        // Twice: a `CDPATH` hit announces where it landed, then `pwd` agrees.
+        format!("{found}\n{found}\n", found = found.display()),
+        "{}",
+        String::from_utf8_lossy(&searched.stderr)
+    );
+
+    // With nothing else to answer, the operand's own resolution reports the
+    // failure — it is relative too, so it needs the base the entry wanted.
+    std::fs::create_dir_all(&inner).expect("re-create the directory");
+    let unusable = run_with_input(&format!(
+        "cd {inner}\n$env.CDPATH = \"../missing\"\ncommand rmdir {inner}\ncd foo\n",
+        inner = inner.display()
+    ));
+    assert!(
+        String::from_utf8_lossy(&unusable.stderr)
+            .contains("cd: foo: cannot read the current directory to resolve it:"),
+        "{}",
+        String::from_utf8_lossy(&unusable.stderr)
+    );
+
+    // An absolute target needs no base, so it is unaffected — which is also how
+    // a reader gets out of an unlinked directory.
+    std::fs::create_dir_all(&inner).expect("re-create the directory");
+    let absolute = run_with_input(&format!(
+        "cd {inner}\ncommand rmdir {inner}\ncd {root}\npwd\n",
+        inner = inner.display(),
+        root = root.display()
+    ));
+    assert_eq!(
+        String::from_utf8_lossy(&absolute.stdout),
+        format!("{root}\n", root = root.display()),
+        "{}",
+        String::from_utf8_lossy(&absolute.stderr)
+    );
+
+    std::fs::remove_dir_all(&root).expect("the test directory should be removable");
+}
+
+/// A hook is told the **logical** path, like everything else the cwd rule
+/// governs: `$env.PWD` holds the spelling `cd` was given, so handing a handler
+/// the resolved one would make it the only reader seeing a different namespace —
+/// and a handler that persists or compares what it is told would be comparing
+/// against a path no other part of the shell reports.
+#[test]
+fn a_cd_hook_is_told_the_path_the_reader_walked_in_by() {
+    let root = fresh_dir("cd_hook_logical");
+    let target = root.join("target");
+    std::fs::create_dir_all(&target).expect("create the link target");
+    std::os::unix::fs::symlink(&target, root.join("link")).expect("link to it");
+    let link = root.join("link");
+
+    let out = run_with_input(&format!(
+        "func leaving(to) {{ puts \"to $to\" }}\n\
+         func arrived(from) {{ puts \"from $from\" }}\n\
+         on precd trace leaving\n\
+         on postcd trace arrived\n\
+         cd {link}\n\
+         cd {root}\n",
+        link = link.display(),
+        root = root.display()
+    ));
+    let seen = String::from_utf8_lossy(&out.stdout).into_owned();
+    // Told the link on the way in, and told the link as *where it came from* on
+    // the way out — the resolved path would have said `target` both times.
+    assert!(seen.contains(&format!("to {}\n", link.display())), "{seen}");
+    assert!(
+        seen.contains(&format!("from {}\n", link.display())),
+        "{seen}"
+    );
+
+    std::fs::remove_dir_all(&root).expect("the test directory should be removable");
 }
 
 #[test]
@@ -2702,13 +3242,14 @@ fn tilde_expands_to_home() {
 fn cd_tilde_goes_home() {
     let home = fresh_dir("tilde_cd");
     let out = run_with_home("cd ~\npwd\n", &home);
-    // pwd reports the canonical getcwd, so canonicalize the expected path too —
-    // otherwise this fails where the temp dir sits under a symlink (macOS
-    // /var -> /private/var).
-    let expected = home.canonicalize().expect("canonicalize home");
+    // The cwd is logical, so `cd ~` reports `$env.HOME` as it is spelled rather
+    // than what it resolves to. Canonicalizing the expectation was right when
+    // `pwd` was `getcwd` and is wrong now: it would fail exactly where the temp
+    // dir sits under a symlink (macOS `/var` → `/private/var`), which is the
+    // case this reading exists to keep.
     assert_eq!(
         String::from_utf8_lossy(&out.stdout),
-        format!("{}\n", expected.display())
+        format!("{}\n", home.display())
     );
     let _ = std::fs::remove_dir_all(&home);
 }
@@ -12493,10 +13034,9 @@ fn a_redirected_builtin_writes_to_the_target() {
     assert_eq!(String::from_utf8_lossy(&out.stdout), "after\n");
     assert!(out.stderr.is_empty(), "{:?}", out.stderr);
     let written = std::fs::read_to_string(dir.join("f")).expect("pwd wrote the file");
-    assert_eq!(
-        written.trim_end(),
-        dir.canonicalize().unwrap().display().to_string()
-    );
+    // The logical cwd, which is the spelling `cd` was given — the same path,
+    // and not the same string where a parent is a symlink.
+    assert_eq!(written.trim_end(), dir.display().to_string());
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -12535,8 +13075,11 @@ fn a_redirected_builtin_survives_a_failing_write() {
         "{:?}",
         diagnostic.stderr
     );
+    // 2 rather than 1: `pwd` reads options now, which puts its misuse in the
+    // same class as `type`'s and `command`'s — a line that ran nothing, told
+    // apart from a command that ran and failed.
     let misuse = run_with_input("pwd extra 2> /dev/full\n");
-    assert_eq!(misuse.status.code(), Some(1));
+    assert_eq!(misuse.status.code(), Some(2));
 }
 
 #[test]
@@ -14441,7 +14984,8 @@ fn builtins_print_standard_command_line_help() {
     let out = run_with_input("cd --help\n");
     assert_eq!(
         String::from_utf8_lossy(&out.stdout),
-        "Change the working directory\n\nUsage: cd [DIR]\n\nOptions:\n  --help  Print help\n"
+        "Change the working directory\n\nUsage: cd [--logical|--physical] [DIR]\n\n\
+         Options:\n  --logical\n  --physical\n  --help  Print help\n"
     );
     assert!(out.status.success());
     assert!(out.stderr.is_empty());
@@ -14452,7 +14996,7 @@ fn help_lists_every_builtin_with_its_usage() {
     let out = run_with_input("help\n");
     let stdout = String::from_utf8_lossy(&out.stdout);
     for usage in [
-        "cd [DIR]",
+        "cd [--logical|--physical] [DIR]",
         "puts [ARG ...]",
         "print [ARG ...]",
         "clip [TEXT ...]",
@@ -14596,8 +15140,8 @@ fn help_prints_every_name_it_was_given() {
     let out = run_with_input("help pwd jobs\n");
     assert_eq!(
         String::from_utf8_lossy(&out.stdout),
-        "Print the working directory, or yield it as a value\n\nUsage: pwd · pwd()\n\n\
-         Options:\n  --help  Print help\n\
+        "Print the working directory, or yield it as a value\n\nUsage: pwd [--logical|--physical] · pwd()\n\n\
+         Options:\n  --logical\n  --physical\n  --help  Print help\n\
          \nList the jobs\n\nUsage: jobs\n\nOptions:\n  --help  Print help\n"
     );
     assert!(out.stderr.is_empty());
