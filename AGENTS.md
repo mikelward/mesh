@@ -36,8 +36,9 @@ has stopped biting.
   A page fetch finds its review comment's `Useful?` bar instead and reads true on
   any PR it has commented on. The count is an aggregate and nothing here exposes
   who reacted, so **leave PR-body reactions to Codex** — one from anyone else and
-  the gate can no longer tell them apart. No reaction and no review on the head:
-  comment `@codex review`, then keep waiting.
+  the gate can no longer tell them apart. `eyes` is Codex holding the commit and
+  working, so waiting is doing something; **no** reaction at all means it never
+  picked the push up and none is coming — comment `@codex review`, then wait.
 - **Judge every review comment on merit, whoever wrote it.** Verify the claim
   before acting; if it doesn't hold up, reply saying why and decline.
 - **Never leave a review comment silently dismissed** — every thread ends in
