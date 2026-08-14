@@ -9755,8 +9755,75 @@ of each PR had landed by another route, but these pieces had not.
       `$var` and the `"…"` escape set, but `$(cmd)` stays as written — the body is
       interpolated from its *text* by `repl::interpolate_heredoc`, which resolves references
       against `Vars` and has no shell, rather than by the word machinery a string
-      goes through. `docs/REFERENCE.md` §"Heredocs" says so now. Worth closing for
-      consistency, and it wants the same shell-aware treatment `expansion_word` got.
+      goes through.
+
+      **Closed.** `interpolate_heredoc` now takes the session's `last` /
+      `in_function` and runs a `$(…)` through `eval_operand_of`, the same call a
+      word's value piece makes — so a body and a `"…"` string agree. The extent
+      comes from `parser::capture_in_string`, the helper the string scanner
+      already used, which means it is the `)` the *lexer* closes on: `$(puts
+      "a)b")` does not end at the first one, and a syntax error inside stays a
+      syntax error that `-n` reports without running anything.
+
+      `heredoc_carries_a_value` had skipped `$(…)` on the explicit grounds that a
+      body's capture was literal text. That premise is gone, so it counts one now
+      — a stage about to fork has to know its body runs a command, exactly as it
+      already did for a declared modifier.
+  - [ ] **A braced expression still does not interpolate in a body.** `${f()}` is
+        `heredoc: syntax error: expected a variable name or access`, where a string
+        takes it through `braced_expression_in_string` into the same value piece a
+        capture uses. Predates the capture work and was left out of it: it is a
+        second form with its own access-vs-expression test (`braced_is_access`),
+        and the entry above was about `$(…)`. The two should agree, so this is the
+        remaining half rather than a new subject.
+  - [ ] **A body carrying a capture cannot be backgrounded.** `cat << END &` with a
+        `$(…)` in the body is refused with "a value cannot be backgrounded with a
+        redirection yet"; binding first (`m = $(…)`, then `$m` in the body) works,
+        and `docs/REFERENCE.md` §"Heredocs" now says so. Nothing new broke — that is
+        the standing rule for a value in a backgrounded stage with a redirection,
+        and a body only started meeting it when bodies started running captures.
+        Closing it is the same work as lifting that rule generally, not heredoc
+        work, which is why it is a note rather than a fix here.
+- [ ] **`mesh -n` cannot see a heredoc inside a quoted capture.** Predates the
+      capture-in-a-body work and is reachable with no heredoc nesting at all —
+      this passes the check on `origin/main` and fails when run:
+
+      ```mesh
+      puts "$(cat << IN
+      hello ${bad
+      IN
+      )"
+      ```
+
+      `check_heredoc_bodies` finds bodies by tokenizing, and `parser::tokenize`
+      folds a capture inside `"…"` into a **word token**, so the body is inside
+      that token rather than beside it. A `mesh -n file && source file` gate
+      therefore runs a file it declared valid.
+
+      The fix is to stop looking for bodies in the token stream and walk the
+      **parse tree** for `CommandItem::Redirect { body: Some(_) }` — a nested
+      capture is a `WordPiece::Value` holding another `Expr`, so the structure is
+      already there and every position is covered at once. Two attempts at
+      re-tokenizing text each missed a further case, which is the argument for
+      the tree: `check_nested_heredoc_bodies` closes the body position only, and
+      leaves `puts "$(…)"` at top level exactly as broken.
+- [ ] **The parse-depth guard is per parse, and a heredoc body restarts the
+      parse.** A pure nest of 3000 quoted captures is refused correctly at 100
+      levels, because it is one parse and the lexer's `capture_depth` accumulates.
+      Alternate heredocs with captures and each body begins a fresh parse counting
+      from zero, so 50 heredoc levels carrying 49 quoted `$(puts "…")` wrappers
+      each — about 24 KB of generated source — exhausts the stack (`fatal: out of
+      stack`, exit 70) rather than reporting `nested too deeply`.
+
+      `Shell::heredoc_depth` bounds the *alternation*, which is why 500 plain
+      alternating levels now report properly; what is unbounded is the capture
+      frames within each level, and they are what consume the stack. Closing it
+      means carrying the parser's own depth across the heredoc boundary so a
+      nested parse resumes where the enclosing one had reached, rather than adding
+      another counter beside it — a change to the parser's depth contract. Raised
+      by review on the capture-in-a-body PR and deliberately left there, since
+      guessing at that contract inside an interpolation change is how the counter
+      would end up disagreeing with the parser.
 
 - [x] **FreeBSD compile-check in CI.** `cargo check --workspace --all-targets
       --target x86_64-unknown-freebsd` runs alongside the macOS cross-check, so a

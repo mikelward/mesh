@@ -27852,15 +27852,106 @@ fn an_interpolated_capture_yields_its_output_whatever_the_status() {
 }
 
 #[test]
-fn a_heredoc_keeps_a_capture_out_of_its_delimiter_and_its_body() {
-    // A body is interpolated from its text, and only for `$…` references — so a
-    // capture stays as written. `docs/REFERENCE.md` §"Heredocs" says so.
+fn a_heredoc_runs_a_capture_in_its_body_but_not_its_delimiter() {
+    // A body is one long double-quoted run, so a capture interpolates in it exactly
+    // as it does in `"…"`. `docs/REFERENCE.md` §"Heredocs" says so.
     let body = run_with_input("x = X\ncat << END\nvar $x and $(puts cap)\nEND\n");
     assert_eq!(
         String::from_utf8_lossy(&body.stdout),
-        "var X and $(puts cap)\n",
+        "var X and cap\n",
         "{:?}",
         body.stderr
+    );
+
+    // The extent comes from the lexer, not from scanning for a `)`, so a `)` inside
+    // a string in the capture does not end it.
+    let nested = run_with_input("cat << END\n$(puts \"a)b\")\nEND\n");
+    assert_eq!(
+        String::from_utf8_lossy(&nested.stdout),
+        "a)b\n",
+        "{:?}",
+        nested.stderr
+    );
+
+    // A syntax error inside stays a syntax error, and `-n` reports it without
+    // running anything.
+    let unclosed = mesh_command()
+        .arg("-n")
+        .arg("-c")
+        .arg("cat << END\n$(puts\nEND")
+        .output()
+        .expect("mesh");
+    assert_eq!(unclosed.status.code(), Some(2));
+    assert!(
+        String::from_utf8_lossy(&unclosed.stderr).contains("unclosed `(`"),
+        "{:?}",
+        unclosed.stderr
+    );
+
+    // `\$(` is a literal `$`, the same escape a `"…"` string takes.
+    let escaped = run_with_input("cat << END\n\\$(puts cap)\nEND\n");
+    assert_eq!(
+        String::from_utf8_lossy(&escaped.stdout),
+        "$(puts cap)\n",
+        "{:?}",
+        escaped.stderr
+    );
+
+    // A quoted delimiter takes no interpolation at all, so its body stays data.
+    let raw = run_with_input("cat << 'END'\n$(puts cap)\nEND\n");
+    assert_eq!(
+        String::from_utf8_lossy(&raw.stdout),
+        "$(puts cap)\n",
+        "{:?}",
+        raw.stderr
+    );
+
+    // A heredoc written *inside* the capture is checked too. The outer body is one
+    // token, so `check_heredoc_bodies` never sees into it — without the recursion
+    // `mesh -n` passed a file that failed on its first run, which is exactly what a
+    // `mesh -n file && source file` gate is there to prevent.
+    let nested_body = script(
+        "heredoc_nested_capture",
+        "cat << OUT\n$(cat << IN\nhello ${bad\nIN\n)\nOUT\n",
+    );
+    let checked = mesh_command()
+        .arg("-n")
+        .arg(&nested_body)
+        .output()
+        .expect("mesh");
+    assert_eq!(checked.status.code(), Some(2), "{checked:?}");
+    assert!(
+        String::from_utf8_lossy(&checked.stderr).contains("unclosed `}`"),
+        "{:?}",
+        checked.stderr
+    );
+
+    // …and a well-formed one still passes the check and runs.
+    let sound = script(
+        "heredoc_nested_capture_ok",
+        "cat << OUT\n$(cat << IN\nhello\nIN\n)\nOUT\n",
+    );
+    assert_eq!(
+        mesh_command()
+            .arg("-n")
+            .arg(&sound)
+            .output()
+            .expect("mesh")
+            .status
+            .code(),
+        Some(0)
+    );
+    let ran = run_with_args(&[sound.to_str().unwrap()]);
+    assert_eq!(String::from_utf8_lossy(&ran.stdout), "hello\n", "{ran:?}");
+
+    // A stage that forks has to count the capture as a value, the way it already
+    // counts a declared modifier — the body runs a command either way.
+    let piped = run_with_input("cat << END | tr a-z A-Z\n$(puts cap)\nEND\n");
+    assert_eq!(
+        String::from_utf8_lossy(&piped.stdout),
+        "CAP\n",
+        "{:?}",
+        piped.stderr
     );
 
     // A **delimiter** is matched as text, so a capture in one would mean running a
@@ -27878,6 +27969,98 @@ fn a_heredoc_keeps_a_capture_out_of_its_delimiter_and_its_body() {
     // An ordinary quoted delimiter is untouched.
     let quoted = run_with_input("cat << \"END\"\nliteral $x\nEND\n");
     assert_eq!(String::from_utf8_lossy(&quoted.stdout), "literal $x\n");
+}
+
+/// Heredocs and captures can alternate without limit, and each hop re-enters the
+/// body walk — so the depth has to *travel* for the parser's `MAX_DEPTH` guard to
+/// fire. Passing a constant there let generated source recurse until the stack ran
+/// out, where every other over-deep input gets an ordinary diagnostic.
+#[test]
+fn alternating_heredocs_and_captures_hit_the_parser_depth_limit() {
+    let nest = |levels: usize| {
+        let mut lines = vec!["cat << D0".to_string()];
+        lines.extend((1..levels).map(|i| format!("$(cat << D{i}")));
+        lines.push("x".to_string());
+        for i in (1..levels).rev() {
+            lines.push(format!("D{i}"));
+            lines.push(")".to_string());
+        }
+        lines.push("D0".to_string());
+        lines.join("\n") + "\n"
+    };
+
+    // Well past the 100-level limit, and well short of the stack.
+    let deep = script("heredoc_capture_depth", &nest(500));
+    let out = mesh_command().arg("-n").arg(&deep).output().expect("mesh");
+    assert_eq!(out.status.code(), Some(2), "{out:?}");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("nested too deeply"),
+        "{:?}",
+        out.stderr
+    );
+
+    // A nest well inside the limit still checks clean, so the guard is not simply
+    // refusing everything.
+    let shallow = script("heredoc_capture_shallow", &nest(3));
+    assert_eq!(
+        mesh_command()
+            .arg("-n")
+            .arg(&shallow)
+            .output()
+            .expect("mesh")
+            .status
+            .code(),
+        Some(0)
+    );
+
+    // And **running** it reports the same thing. `-n` is opt-in, so a file that is
+    // simply run never passes the checker at all: the depth has to survive the
+    // capture's own evaluation, which lands back in `expand_redirs` and would
+    // otherwise start a fresh walk from zero. Without that this exhausted the
+    // stack — `mesh: fatal: out of stack`, exit 70 — where mesh declares a limit
+    // of 100 and should say so.
+    let ran = run_with_args(&[deep.to_str().unwrap()]);
+    assert!(
+        String::from_utf8_lossy(&ran.stderr).contains("nested too deeply"),
+        "{ran:?}"
+    );
+    assert_ne!(ran.status.code(), Some(70), "should not exhaust the stack");
+    // The shallow one still runs.
+    assert_eq!(
+        run_with_args(&[shallow.to_str().unwrap()]).status.code(),
+        Some(0)
+    );
+}
+
+/// A body that interpolates a capture is a **value**, so it meets the existing
+/// "a value cannot be backgrounded with a redirection yet" rule. That is a
+/// restriction on backgrounding values rather than anything about heredocs, but it
+/// is reachable through a heredoc only since bodies started running captures — so
+/// `docs/REFERENCE.md` §"Heredocs" now qualifies its backgrounding sentence, and
+/// this pins both halves.
+#[test]
+fn a_backgrounded_heredoc_body_may_not_carry_a_capture_yet() {
+    let refused = run_with_input("cat << END &\n$(puts cap)\nEND\nwait\n");
+    assert_eq!(refused.status.code(), Some(2), "{refused:?}");
+    assert!(
+        String::from_utf8_lossy(&refused.stderr).contains("cannot be backgrounded"),
+        "{:?}",
+        refused.stderr
+    );
+
+    // The workaround the diagnostic and the docs both name.
+    let bound = run_with_input("m = $(puts cap)\ncat << END &\n$m\nEND\nwait\n");
+    assert!(
+        String::from_utf8_lossy(&bound.stdout).contains("cap"),
+        "{bound:?}"
+    );
+
+    // A body with nothing to run still backgrounds, which is the documented case.
+    let plain = run_with_input("cat << END &\nplain\nEND\nwait\n");
+    assert!(
+        String::from_utf8_lossy(&plain.stdout).contains("plain"),
+        "{plain:?}"
+    );
 }
 
 #[test]

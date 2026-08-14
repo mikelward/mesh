@@ -727,8 +727,10 @@ puts "$(id -un)@$(hostname)"     # glue it to text by quoting the whole word
   (`$(puts a; puts b)`), a pipeline, or another capture.
 
 It is usable wherever a value is — an assignment, a condition, a command argument
-(see [Values as arguments](#values-as-arguments)), and inside `"…"` (see
-[Quoting](#quoting)) — but **not** inside `'…'`, `r'…'`, or a heredoc body.
+(see [Values as arguments](#values-as-arguments)), inside `"…"` (see
+[Quoting](#quoting)), and in an interpolated [heredoc](#heredocs) body — but
+**not** inside `'…'`, `r'…'`, or a heredoc whose delimiter is quoted, none of
+which interpolate anything.
 
 ### Redirection
 
@@ -838,8 +840,9 @@ string uses, so `$m.key[0]:upper` means the same thing in both, and a malformed
 reference (`${bad`) or a malformed `\u{…}` escape is the same error in both. One
 difference from a string, on purpose: an escape that is not in the set at all —
 `\d`, `\p` — stays as written rather than erroring, because bodies carry regexes,
-JSON, and Windows paths where a stray backslash is ordinary text. A **capture** is
-not substituted in a body — `$(cmd)` stays as written — though it is in a string.
+JSON, and Windows paths where a stray backslash is ordinary text. A **capture**
+interpolates too — `$(cmd)` runs and its output crosses whole, never re-split and
+never globbed — and `\$(` keeps it literal, as in a string.
 
 A body is **data**, so it is never tilde-expanded, globbed, or word-split.
 
@@ -860,7 +863,10 @@ nothing is left behind after.
 
 Backgrounding a command that has a heredoc (`cat << END &`) works: the body
 reaches the stage as memory, and the stage writes the temporary in its own
-process.
+process. One exception, and it is the general rule about backgrounding a value
+rather than anything about heredocs: a body that interpolates a **capture** or a
+declared modifier is a value, and a value cannot yet be backgrounded alongside a
+redirection. Bind it first — `m = $(…)` — and interpolate `$m` in the body.
 
 ### Here-strings
 

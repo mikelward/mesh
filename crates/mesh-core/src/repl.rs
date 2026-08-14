@@ -167,6 +167,15 @@ struct Shell {
     /// be in, and only one of them is recoverable. [`Shell::settle_error`] moves
     /// an error between them, at the moment nothing can reach back to it.
     pending_error: Option<u8>,
+    /// How deep the heredoc body currently being expanded is nested.
+    ///
+    /// A body's `$(…)` runs, and that capture may itself redirect from a heredoc
+    /// whose body holds another capture, so the nesting crosses `eval_operand_of`
+    /// and back into `expand_redirs` — where a fresh walk would otherwise start
+    /// counting from zero again and the parser's `MAX_DEPTH` would never be
+    /// reached. Carried here because that boundary is a whole evaluation, not a
+    /// parameter one call can pass to the next.
+    heredoc_depth: usize,
 }
 
 impl Shell {
@@ -336,6 +345,7 @@ impl Shell {
             in_cd_hooks: false,
             input_error: None,
             pending_error: None,
+            heredoc_depth: 0,
         }
     }
 }
@@ -454,7 +464,9 @@ fn check_heredoc_bodies(text: &str, shell: &Shell) -> Result<(), String> {
         if body.raw {
             continue;
         }
-        if let Err(HeredocProblem::Message(message)) = interpolate_heredoc(&body.text, None) {
+        if let Err(HeredocProblem::Message(message)) =
+            interpolate_heredoc(&body.text, 0, false, 1, None)
+        {
             // Located at the body's first line. The scan reports offsets within
             // the body, which would need threading out to point at the exact
             // character; naming the heredoc is enough to find it.
@@ -3939,10 +3951,15 @@ enum HeredocProblem {
 /// error. One walk rather than two, so the check cannot drift from the thing it
 /// is checking.
 ///
-/// The session rather than its variables, because a body may carry `$x:foo`: a
-/// declared modifier's body is shell code, and only the shell runs it.
+/// The session rather than its variables, because a body may carry `$x:foo` or a
+/// `$(…)` capture: both are shell code, and only the shell runs them. `last` and
+/// `in_function` are what a capture's body needs to run as an operand, and go
+/// unused on the checking half.
 fn interpolate_heredoc(
     text: &str,
+    last: u8,
+    in_function: bool,
+    depth: usize,
     mut shell: Option<&mut Shell>,
 ) -> Result<String, HeredocProblem> {
     let mut out = String::with_capacity(text.len());
@@ -3991,6 +4008,54 @@ fn interpolate_heredoc(
             continue;
         }
         if c == '$' {
+            // `<< END … $(cmd) …` — a capture interpolates in a body exactly as it
+            // does inside `"…"`, and for the same reason: the body is one long
+            // double-quoted run. Parsed here rather than scanned, so the extent is
+            // the `)` the lexer closes on and a syntax error inside stays a syntax
+            // error — `$(puts "a)b")` does not end at the first `)`.
+            if text[i..].starts_with("$(") {
+                // The running depth rather than a fixed 1, so the parser's own
+                // `MAX_DEPTH` guard still fires: heredocs and captures can alternate
+                // indefinitely, and each hop re-enters through here, so a constant
+                // here would let generated source recurse until the stack ran out
+                // instead of reporting the ordinary "nested too deeply".
+                let (expression, end) = parser::capture_in_string(text, i, depth)
+                    .map_err(|error| HeredocProblem::Message(format!("heredoc: {error}")))?;
+                if shell.is_none() {
+                    // The checking half only. `check_heredoc_bodies` walks the
+                    // *outer* token stream, where this whole body is one token, so
+                    // a heredoc written inside the capture is not in any stream it
+                    // sees — and `-n` would pass a file that fails on the first
+                    // run. Everywhere else a capture appears, the tokenizer reaches
+                    // its bodies already; only one inside a body needs this.
+                    check_nested_heredoc_bodies(&text[i..end], depth + 1)?;
+                }
+                if let Some(shell) = shell.as_deref_mut() {
+                    // Through `eval_operand_of` like a word's value piece: a body is
+                    // an operand of the command it redirects into, so what the
+                    // capture produced must not stand as that command's own result.
+                    // Published across the call so a heredoc *inside* this capture
+                    // resumes counting from here rather than from one.
+                    let enclosing = std::mem::replace(&mut shell.heredoc_depth, depth);
+                    let value = eval_operand_of(&expression, last, in_function, shell);
+                    shell.heredoc_depth = enclosing;
+                    let value = value.map_err(HeredocProblem::Unwound)?;
+                    // A `return` inside the capture is unwinding; stop rather than
+                    // finish a body that was never written.
+                    if shell.control.is_some() {
+                        return Err(HeredocProblem::Unwound(Step::Continue(last)));
+                    }
+                    // A body is text, so the rule is `"$xs"`'s: a scalar renders and
+                    // a collection is a loud error rather than a guessed separator.
+                    let value = interpolated_value(value).map_err(HeredocProblem::Unwound)?;
+                    out.push_str(
+                        &expand::text_of(value, "$(…)")
+                            .map_err(|error| HeredocProblem::Message(error.to_string()))?,
+                    );
+                }
+                i = end;
+                continue;
+            }
             let end = heredoc_reference_end(text, i).map_err(HeredocProblem::Message)?;
             if let Some(end) = end {
                 // Checking stops at "the reference is well-formed"; only an
@@ -4015,6 +4080,34 @@ fn interpolate_heredoc(
         i += c.len_utf8();
     }
     Ok(out)
+}
+
+/// Check the heredoc bodies written *inside* a capture's source text.
+///
+/// [`check_heredoc_bodies`] tokenizes the whole input and finds every body in it,
+/// but a body is one token, so a heredoc nested in a capture in a body is inside
+/// that token rather than beside it. This re-tokenizes just the capture and checks
+/// what it finds, recursing through [`interpolate_heredoc`] so a body nested two
+/// deep is checked as well.
+///
+/// No shell and no location: the message names the syntax error and the caller
+/// locates it at the outer body, which is the same precision the outer walk gives.
+fn check_nested_heredoc_bodies(capture: &str, depth: usize) -> Result<(), HeredocProblem> {
+    // The caller has already parsed this successfully, so a tokenize failure here
+    // is not a thing to report twice.
+    let Ok(tokens) = parser::tokenize(capture) else {
+        return Ok(());
+    };
+    for token in tokens {
+        let parser::TokenKind::HeredocBody(body) = &token.value else {
+            continue;
+        };
+        if body.raw {
+            continue;
+        }
+        interpolate_heredoc(&body.text, 0, false, depth, None)?;
+    }
+    Ok(())
 }
 
 /// Where the `$…` reference starting at `i` ends, or `None` when the `$` starts
@@ -4080,6 +4173,12 @@ fn heredoc_carries_a_value(body: &parser::HeredocBody, shell: &Shell) -> bool {
         {
             i += 1 + next.len_utf8();
             continue;
+        }
+        // A capture runs a command, so it is a value by the same rule a declared
+        // modifier is — it stopped being literal text when bodies started
+        // interpolating it.
+        if c == '$' && text[i..].starts_with("$(") {
+            return true;
         }
         if c == '$'
             && let Ok(Some(end)) = heredoc_reference_end(text, i)
@@ -9487,7 +9586,14 @@ fn expand_redirs(
             let text = if body.raw {
                 body.text
             } else {
-                interpolate_heredoc(&body.text, Some(shell)).map_err(|problem| match problem {
+                interpolate_heredoc(
+                    &body.text,
+                    last,
+                    in_function,
+                    shell.heredoc_depth + 1,
+                    Some(shell),
+                )
+                .map_err(|problem| match problem {
                     // The body already said why, and how it left may be an
                     // `exit` — so the step travels rather than being flattened
                     // into another message.
