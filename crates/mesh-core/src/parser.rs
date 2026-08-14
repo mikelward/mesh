@@ -2195,7 +2195,7 @@ fn push_variable(pieces: &mut Vec<WordPiece>, variable: &str, quote: QuoteMode) 
 /// grammar answers — `"$(puts "a)b")"` closes on the second `)`, not the first. So
 /// the body is lexed and parsed here and now, which is also what keeps a syntax
 /// error inside it a *parse* error rather than a surprise at run time.
-fn capture_in_string(
+pub(crate) fn capture_in_string(
     source: &str,
     dollar: usize,
     depth: usize,
