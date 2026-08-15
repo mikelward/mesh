@@ -5,6 +5,13 @@ on:
     branches: [main]
   pull_request:
 
+# CI only builds and tests -- it never writes to the repository, so it runs with
+# a read-only token whatever the repo's default workflow permissions happen to
+# be set to. That default is a repository SETTING this file cannot see, so
+# read-only is declared here rather than assumed.
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
 
@@ -14,6 +21,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          # Don't leave the token in .git/config, where anything later in the
+          # job -- a build script, a dependency's proc macro -- could read it
+          # back out. Nothing here pushes.
+          persist-credentials: false
 
       # Read the pin from rust-toolchain.toml rather than naming a version here,
       # the same way the msrv job reads the floor from Cargo.toml. rustup would
@@ -93,6 +105,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          # Don't leave the token in .git/config, where anything later in the
+          # job -- a build script, a dependency's proc macro -- could read it
+          # back out. Nothing here pushes.
+          persist-credentials: false
 
       # Build against the floor declared in Cargo.toml rather than trusting the
       # number by hand — the previously declared 1.85 had silently stopped
@@ -128,6 +145,11 @@ jobs:
     if: github.event_name == 'push'
     steps:
       - uses: actions/checkout@v4
+        with:
+          # Don't leave the token in .git/config, where anything later in the
+          # job -- a build script, a dependency's proc macro -- could read it
+          # back out. Nothing here pushes.
+          persist-credentials: false
 
       - name: Install stable toolchain
         run: rustup toolchain install stable --profile minimal --component clippy
