@@ -1,0 +1,171 @@
+# Translates Codex's review verdict into a commit status branch protection
+# can require. Codex posts no check run, and a clean pass is only a reaction
+# on the PR body — which emits no webhook — so this polls rather than
+# reacting to an event.
+#
+# The sweep itself lives in mikelward/codex-review, which is where its suite
+# lives too; this file is the part that cannot be shared, and everything in
+# it is here for a reason spelled out below. See that repo's README for what
+# the verdict actually means and how to hold a merge.
+#
+# Scheduled workflows only run from the default branch, so this does nothing
+# until it is merged to main.
+name: codex-review
+
+# No `workflow_dispatch`, deliberately: it takes a ref, and GitHub runs the
+# workflow file *from that ref* — so a branch could ship its own version of
+# this job, keep the `statuses: write` token, and publish `codex: success`
+# for itself. Pinning the action version doesn't help when the branch
+# supplies the steps around it. `pull_request_target` does not have that
+# hole — GitHub takes the workflow definition from the BASE ref, so a PR
+# cannot bring its own sweep — and it is what starts the loop the moment a
+# push lands: pushes emit real webhooks even though reactions never do.
+#
+# That is also why the trigger list is here rather than in the action. The
+# action is code; this is the boundary deciding who may run it with a token
+# that can open the gate, and it belongs where a reviewer of *this* repo
+# sees it.
+#
+# This sweep is the ONLY writer of the `codex` status, on purpose. A commit
+# status belongs to the SHA, so a fresh push fail-closes by absence: the new
+# head has no `codex` status, a required check that has never reported
+# blocks the merge, and the run this event starts writes `pending` within
+# about a minute. A second writer would be an unordered write, and one
+# delayed past this run's exit overwrites a just-published `success` with
+# nothing left to notice. A test pins that no other workflow here can write
+# commit statuses.
+#
+# The schedule is the backstop, not the clock, and it is HOURLY on purpose.
+# The event starts a run within seconds of a push; the run polls every
+# minute for up to ~55 (the action's defaults); everything the schedule
+# alone catches is rare and fails CLOSED — a dropped webhook leaves the new
+# head pending, a reaction-only change waits unread — and every one of those
+# is recoverable on demand, because ANY comment on the PR starts a sweep. So
+# the schedule's only job is to self-heal those quietly. The concurrency
+# group holds exactly one successor queued while a run loops; extra fires
+# beyond that slot show up as canceled runs, which is expected and harmless.
+#
+# Cost: free on this public repo. On a private one GitHub bills each job's
+# duration rounded UP to a minute, so idle scheduled fires are the term that
+# scales — hourly is ~720 billed minutes a month, around a third of a
+# private plan's free tier.
+#
+# Comment events too, for the round that has no push: a finding rebutted on
+# the same head plus an "@codex review" nudge changes the verdict without a
+# single pull_request event, and the reactions that follow emit nothing — so
+# without these the re-read would wait on the throttled schedule. A settled
+# repo pays one lean sweep (seconds) per comment.
+#
+# These two are NOT base-ref-pinned the way the rest are, which was assumed
+# here and is not true: a `pull_request_review_comment` on PR #520 ran this
+# file *from the PR branch*, with `statuses: write`, while the version on
+# `main` was still the old one. So a branch CAN bring its own sweep by this
+# route, and no guard written *in this file* can stop it -- an `if:` on the
+# actor, a step checking the file against `main`, a narrower `permissions:`
+# block are all supplied by the same branch they would constrain.
+#
+# Keeping both events anyway is a decision, not an oversight, and the reason
+# is NOT that the exposure is small -- it is that the trigger list was never
+# what held it back. Reaching this route needs a branch *in this repository*
+# (a fork's workflow files are not here for any of these events to run), and
+# anyone who can push such a branch can publish `codex: success` far more
+# simply, with any workflow declaring `on: push` and
+# `permissions: statuses: write`. That runs the branch's own definition with
+# the scopes it asks for, whatever this file says. So dropping these two
+# events would close one door in a room with an open wall, while costing the
+# rebuttal round its minute clock: a finding answered in a reply plus a nudge
+# changes the verdict with no push anywhere and no webhook, so it would wait
+# on the hourly schedule.
+#
+# Not to be read as "a fork PR gets a weak token" -- an earlier version of
+# this comment said exactly that and it is wrong. `pull_request_target` runs
+# in the BASE repository's context, and its token carries whatever the
+# workflow asks for, `statuses: write` included, for a fork PR as much as any
+# other. What protects us is that the definition comes from the base ref, not
+# that the token is small. The distinction matters the day someone adds a step
+# that checks out the PR's code: the base-ref protection is gone by then and
+# the writable token is still there.
+#
+# What would actually bind, the day write access goes to someone whose merges
+# should not be self-approvable, is to stop the credential being available to
+# a job running from a branch at all -- hold it in an environment whose
+# deployment-branch policy allows only `main`, so a branch's job cannot obtain
+# it. Editing the trigger list is not that, and should not be mistaken for it.
+on:
+  schedule:
+    - cron: '23 * * * *'
+  # `closed` is here for the shared-head case: two open PRs on one head both
+  # publish `failure`, and closing one is the webhook-capable transition that
+  # clears the survivor — without it the surviving PR waits on the throttled
+  # schedule for a merge-enabling change that already announced itself.
+  pull_request_target:
+    types: [opened, reopened, ready_for_review, synchronize, closed]
+  # `edited` too: a nudge can be edited into an existing comment, and the
+  # sweep dates such an ask by its edit time — without the event the re-read
+  # would wait on the throttled schedule.
+  issue_comment:
+    types: [created, edited]
+  pull_request_review_comment:
+    types: [created, edited]
+
+# Enough to read the open PRs, read check suites (they date a head whose
+# arrival the timeline does not record), and write the status; nothing else.
+# This job checks out nothing and runs none of this repo's code, so the write
+# scope never sits in the same process as anything the tree builds.
+permissions:
+  contents: read
+  pull-requests: read
+  checks: read
+  statuses: write
+
+# The group name lags the file name on purpose, and must keep doing so.
+#
+# A concurrency group is a repo-wide namespace, not a per-workflow one, which
+# is what lets it serialize the old `codex-verdict.yml` against this file
+# during the changeover -- and it has to, because a workflow file being deleted
+# does not cancel a run of it already in flight, and a run here lasts up to 65
+# minutes. Renaming the group alongside the file would let the predecessor keep
+# polling under the old name while the merge's `closed` event starts this one
+# under the new one: two writers of the `codex` status, unordered, where a
+# delayed stale `success` can land after a newer `failure` and open the gate on
+# findings nobody answered. That is the exact race that got `codex-verdict-reset`
+# deleted.
+#
+# Renaming it later reopens the same window, so it does not get renamed. A test
+# pins the name against a future tidy-up.
+concurrency:
+  group: codex-verdict
+  cancel-in-progress: false
+
+jobs:
+  sweep:
+    runs-on: ubuntu-latest
+    # A hung API call inside the loop would otherwise hold the runner to the
+    # 6-hour job default — and with it the concurrency queue, stalling the
+    # gate silently. Ten minutes past the action's loop length is enough for
+    # any real iteration to finish.
+    timeout-minutes: 65
+    steps:
+      # The action repository's default branch — not a tag, not a SHA.
+      #
+      # Pinning a SHA defends against an action author who is someone else;
+      # this one is the same account that can already push to this repo's
+      # default branch, so the pin would guard a capability an attacker has by
+      # the time it matters, while costing a PR in every consuming repo to
+      # bump — the exact cost sharing the action was meant to remove.
+      #
+      # A tag would be a second pointer, moved on purpose, so a change could
+      # land on that repo's `main` and wait. It was dropped for the step it
+      # added to every change. What that costs is staging, not testing:
+      # changes reach `main` there through a pull request like anywhere else,
+      # so the suite has run on them — there is simply nowhere for a merged
+      # change to wait, and every merge is live on the next run here.
+      #
+      # The residual is a couple of minutes: a merge makes a new commit whose
+      # exact form that repo's own `push` run tests afterwards. What keeps it
+      # boring is the failure direction — a broken sweep leaves `pending`,
+      # which blocks merges rather than letting anything through — so the bad
+      # case is a stalled gate a revert clears, not a forged one.
+      #
+      # No `with:` — the token and repository default to this workflow's own.
+      - uses: mikelward/codex-review@main

@@ -72,12 +72,12 @@ jobs:
       - name: Test the Makefile
         run: sh makefile_test.sh
 
-      # The `scripts/` suites: the verdict sweep behind the `codex` status, the
-      # unshallow script, and the shim they run on. The sweep is what branch
-      # protection consumes, so a regression there wedges the merge gate for
-      # every PR at once and nothing says so. All three are dependency-free, so
-      # this needs a runtime and nothing else. The major matches the one
-      # `codex-verdict.yml` pins; its own suite asserts they stay in step.
+      # The `scripts/` suites: the unshallow script, the shape of
+      # `codex-review.yml` (which events may start a job holding
+      # `statuses: write`, and that nothing else here writes that status), and
+      # the shim they run on. The sweep that workflow runs is tested in
+      # mikelward/codex-review, not here. All dependency-free, so this needs a
+      # runtime and nothing else.
       - uses: actions/setup-node@v6
         with:
           node-version: '24'
