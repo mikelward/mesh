@@ -37,10 +37,8 @@ group and registers it in the job table; background stdin defaults to
   rather than installing anything.
 - A Unix host (see [Supported systems](#supported-systems)).
 - `node`, for `make test` only. Nothing mesh ships is written in JavaScript;
-  the merge gate in
-  [`.github/workflows/codex-verdict.yml`](.github/workflows/codex-verdict.yml)
-  is, and `scripts/*.test.js` is its suite. There are no packages to install --
-  no `package.json`, no lockfile -- so any recent `node` runs them.
+  `scripts/*.test.js` is. There are no packages to install -- no
+  `package.json`, no lockfile -- so any recent `node` runs them.
 
 Per [`AGENTS.md`](AGENTS.md), install tools via direct binary downloads or
 `cargo install` — **not** `apt`/`apt-get`.
@@ -187,13 +185,13 @@ sh makefile_test.sh             # `make -n` dry runs; builds nothing
 
 A fourth sits outside `cargo` too, and outside `sh`: `scripts/*.test.js`, run by
 [`node`'s own test runner](https://nodejs.org/api/test.html) and needing no
-packages. It covers the two pieces of infrastructure under `scripts/` --
-[`codex-verdict.mjs`](scripts/codex-verdict.mjs), which publishes the Codex
-review verdict as the `codex` commit status branch protection requires, and
-[`unshallow.sh`](scripts/unshallow.sh), which deepens a shallow clone at session
-start -- plus `vitest-shim.mjs`, the handful of matchers those two suites need. They arrive from the sibling `gedmap` repo and
-are kept byte-identical to its copies apart from that one import, so a fix
-travels between the repos as a copy rather than a rewrite.
+packages. It covers [`unshallow.sh`](scripts/unshallow.sh), which deepens a
+shallow clone at session start, and the *shape* of
+[`codex-review.yml`](.github/workflows/codex-review.yml) -- which events may
+start a job holding `statuses: write`, and that no other workflow here can write
+the status it publishes. Those are decisions about this repository, so they are
+tested here; the sweep that workflow runs is tested in its own repository.
+`vitest-shim.mjs` carries the matchers both suites use over `node:test`.
 
 ```sh
 node --test scripts/*.test.js   # no network, no packages, no toolchain
@@ -231,12 +229,25 @@ check` against those targets — cross-compiled, Zig supplying the macOS C
 toolchain — rather than a runner of that platform, so it catches type errors but
 never executes a test there.
 
-[`.github/workflows/codex-verdict.yml`](.github/workflows/codex-verdict.yml) is
+[`.github/workflows/codex-review.yml`](.github/workflows/codex-review.yml) is
 the merge gate. Codex posts no check run, and its clean pass is only a reaction
 on the pull request body -- which emits no webhook -- so a job polls for it and
 republishes it as a `codex` commit status, which branch protection *can*
 require. It is the only workflow here holding `statuses: write`, and a test
 pins that.
+
+The sweep itself is
+[`mikelward/codex-review`](https://github.com/mikelward/codex-review), a
+dependency-free GitHub Action shared with the sibling repos and referenced at
+`@main`. There is no release tag, so a merge there is live here on the next
+run; what makes that acceptable is the failure direction rather than the
+testing -- a broken sweep leaves `pending`, blocking merges rather than opening
+them.
+
+What stays here is the trigger list, and that split is the point: several
+triggers would let a pull request branch supply its own version of the steps
+holding that token, so the events allowed to start the job are a security
+boundary and belong where a reviewer of *this* repository sees them.
 
 [`.github/workflows/release.yml`](.github/workflows/release.yml) is separate: it
 publishes the Linux x86-64 binary for every push to `main`, versioned by commit
@@ -277,12 +288,11 @@ mesh/
 ├── makefile_test.sh        # asserts those entry points match the docs and CI
 ├── rust-toolchain.toml     # pins an exact release + rustfmt + clippy
 ├── .github/workflows/ci.yml       # fmt, clippy, tests, cross-checks, MSRV, stable
-├── .github/workflows/codex-verdict.yml # publishes the Codex verdict as a commit status
+├── .github/workflows/codex-review.yml # runs the shared Codex verdict action
 ├── .github/workflows/release.yml  # the per-push Linux x86-64 binary
 ├── scripts/                # infrastructure, not shipped code
 │   ├── unshallow.sh        # deepens a shallow clone, run from the session-start hook
-│   ├── codex-verdict.mjs   # the sweep behind the `codex` commit status
-│   └── vitest-shim.mjs     # the matchers the two .test.js suites run on
+│   └── vitest-shim.mjs     # the matchers the .test.js suites run on
 ├── crates/
 │   ├── mesh/               # thin shell executable
 │   │   ├── Cargo.toml
