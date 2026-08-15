@@ -37,8 +37,10 @@ group and registers it in the job table; background stdin defaults to
   rather than installing anything.
 - A Unix host (see [Supported systems](#supported-systems)).
 - `node`, for `make test` only. Nothing mesh ships is written in JavaScript;
-  `scripts/*.test.js` is. There are no packages to install -- no `package.json`,
-  no lockfile -- so any recent `node` runs them.
+  the merge gate in
+  [`.github/workflows/codex-verdict.yml`](.github/workflows/codex-verdict.yml)
+  is, and `scripts/*.test.js` is its suite. There are no packages to install --
+  no `package.json`, no lockfile -- so any recent `node` runs them.
 
 Per [`AGENTS.md`](AGENTS.md), install tools via direct binary downloads or
 `cargo install` — **not** `apt`/`apt-get`.
@@ -185,11 +187,13 @@ sh makefile_test.sh             # `make -n` dry runs; builds nothing
 
 A fourth sits outside `cargo` too, and outside `sh`: `scripts/*.test.js`, run by
 [`node`'s own test runner](https://nodejs.org/api/test.html) and needing no
-packages. It covers [`scripts/unshallow.sh`](scripts/unshallow.sh), which
-deepens a shallow clone at session start, plus `scripts/vitest-shim.mjs`, the
-handful of matchers it needs. Both arrive from the sibling `gedmap` repo and are
-kept byte-identical to its copies apart from one import, so a fix travels
-between the repos as a copy rather than a rewrite.
+packages. It covers the two pieces of infrastructure under `scripts/` --
+[`codex-verdict.mjs`](scripts/codex-verdict.mjs), which publishes the Codex
+review verdict as the `codex` commit status branch protection requires, and
+[`unshallow.sh`](scripts/unshallow.sh), which deepens a shallow clone at session
+start -- plus `vitest-shim.mjs`, the handful of matchers those two suites need. They arrive from the sibling `gedmap` repo and
+are kept byte-identical to its copies apart from that one import, so a fix
+travels between the repos as a copy rather than a rewrite.
 
 ```sh
 node --test scripts/*.test.js   # no network, no packages, no toolchain
@@ -226,6 +230,13 @@ Every job runs on `ubuntu-latest`: the FreeBSD and macOS coverage is `cargo
 check` against those targets — cross-compiled, Zig supplying the macOS C
 toolchain — rather than a runner of that platform, so it catches type errors but
 never executes a test there.
+
+[`.github/workflows/codex-verdict.yml`](.github/workflows/codex-verdict.yml) is
+the merge gate. Codex posts no check run, and its clean pass is only a reaction
+on the pull request body -- which emits no webhook -- so a job polls for it and
+republishes it as a `codex` commit status, which branch protection *can*
+require. It is the only workflow here holding `statuses: write`, and a test
+pins that.
 
 [`.github/workflows/release.yml`](.github/workflows/release.yml) is separate: it
 publishes the Linux x86-64 binary for every push to `main`, versioned by commit
@@ -266,10 +277,12 @@ mesh/
 ├── makefile_test.sh        # asserts those entry points match the docs and CI
 ├── rust-toolchain.toml     # pins an exact release + rustfmt + clippy
 ├── .github/workflows/ci.yml       # fmt, clippy, tests, cross-checks, MSRV, stable
+├── .github/workflows/codex-verdict.yml # publishes the Codex verdict as a commit status
 ├── .github/workflows/release.yml  # the per-push Linux x86-64 binary
 ├── scripts/                # infrastructure, not shipped code
 │   ├── unshallow.sh        # deepens a shallow clone, run from the session-start hook
-│   └── vitest-shim.mjs     # the matchers the .test.js suites run on
+│   ├── codex-verdict.mjs   # the sweep behind the `codex` commit status
+│   └── vitest-shim.mjs     # the matchers the two .test.js suites run on
 ├── crates/
 │   ├── mesh/               # thin shell executable
 │   │   ├── Cargo.toml
