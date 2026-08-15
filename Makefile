@@ -31,11 +31,12 @@ install: ## Install the mesh binary into ~/.cargo/bin
 uninstall: ## Remove an installed mesh binary
 	$(CARGO) uninstall mesh
 
-test: ## Run every suite: the cargo tests and the shell-script ones
+test: ## Run every suite: the cargo tests, the shell-script ones, the JS ones
 	$(CARGO) test --workspace
 	sh toolchain_test.sh
 	sh session_start_hook_test.sh
 	sh makefile_test.sh
+	node --test scripts/*.test.js
 
 fmt: ## Reformat the tree
 	$(CARGO) fmt --all

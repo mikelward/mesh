@@ -36,6 +36,9 @@ group and registers it in the job table; background stdin defaults to
   compiler below the MSRV floor fails with cargo's `rustc … is not supported`
   rather than installing anything.
 - A Unix host (see [Supported systems](#supported-systems)).
+- `node`, for `make test` only. Nothing mesh ships is written in JavaScript;
+  `scripts/*.test.js` is. There are no packages to install -- no `package.json`,
+  no lockfile -- so any recent `node` runs them.
 
 Per [`AGENTS.md`](AGENTS.md), install tools via direct binary downloads or
 `cargo install` — **not** `apt`/`apt-get`.
@@ -163,8 +166,8 @@ A block that cannot run — one that waits on a background job, or asks about th
 host — says so in the prose above it, as `<!-- no-run: reason -->`. A test
 bounds how many may do that.
 
-Three suites sit outside `cargo`, all run by CI alongside the Rust tests and all
-by `make test`. `toolchain_test.sh` covers
+Three shell suites sit outside `cargo`, all run by CI alongside the Rust tests
+and all by `make test`. `toolchain_test.sh` covers
 [`rust-toolchain.toml`](rust-toolchain.toml): that it pins an exact release
 rather than a floating channel, that the pin has not fallen below the MSRV
 floor, and that the CI jobs which deliberately override the pin still do.
@@ -178,6 +181,18 @@ that `make check` is still the set of commands CI runs.
 sh toolchain_test.sh            # reads the manifests; installs nothing
 sh session_start_hook_test.sh   # stubs rustc/rustup; downloads nothing
 sh makefile_test.sh             # `make -n` dry runs; builds nothing
+```
+
+A fourth sits outside `cargo` too, and outside `sh`: `scripts/*.test.js`, run by
+[`node`'s own test runner](https://nodejs.org/api/test.html) and needing no
+packages. It covers [`scripts/unshallow.sh`](scripts/unshallow.sh), which
+deepens a shallow clone at session start, plus `scripts/vitest-shim.mjs`, the
+handful of matchers it needs. Both arrive from the sibling `gedmap` repo and are
+kept byte-identical to its copies apart from one import, so a fix travels
+between the repos as a copy rather than a rewrite.
+
+```sh
+node --test scripts/*.test.js   # no network, no packages, no toolchain
 ```
 
 Convention (from `AGENTS.md`): **a change isn't done until it's covered.** When
@@ -198,9 +213,9 @@ cargo clippy --all-targets -- -D warnings        # CI gate
 ## Continuous integration
 
 [`.github/workflows/ci.yml`](.github/workflows/ci.yml) has three jobs. **`check`**
-is fmt, clippy, the test suite, shellcheck, and the three shell suites below; it
-also cross-checks FreeBSD and macOS. **`msrv`** builds against the MSRV floor
-read out of `Cargo.toml`. Both run for every push to `main` and every pull
+is fmt, clippy, the test suite, shellcheck, and the four suites below -- three
+shell, one JavaScript; it also cross-checks FreeBSD and macOS. **`msrv`** builds
+against the MSRV floor read out of `Cargo.toml`. Both run for every push to `main` and every pull
 request. **`stable`** is an early warning — the same clippy and tests on the
 floating stable toolchain, so a lint or behavior change arriving in a later Rust
 is seen before the pin moves to it — and it runs on **pushes to `main` only**:
@@ -252,6 +267,9 @@ mesh/
 ├── rust-toolchain.toml     # pins an exact release + rustfmt + clippy
 ├── .github/workflows/ci.yml       # fmt, clippy, tests, cross-checks, MSRV, stable
 ├── .github/workflows/release.yml  # the per-push Linux x86-64 binary
+├── scripts/                # infrastructure, not shipped code
+│   ├── unshallow.sh        # deepens a shallow clone, run from the session-start hook
+│   └── vitest-shim.mjs     # the matchers the .test.js suites run on
 ├── crates/
 │   ├── mesh/               # thin shell executable
 │   │   ├── Cargo.toml

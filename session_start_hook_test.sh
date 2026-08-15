@@ -103,7 +103,7 @@ fi
 # therefore destroy the system binary of that name -- not the test, the actual
 # file under /usr/bin. Keep _REAL and _STUBBED disjoint; _sandbox enforces it
 # rather than trusting a reader to notice.
-_REAL='grep sed cat mkdir rm date sleep'
+_REAL='grep sed cat mkdir rm date sleep dirname'
 _STUBBED='rustc rustup timeout'
 
 # Checked once, at the top level, so a violation stops the run outright. The
@@ -175,8 +175,15 @@ _run() {
 CLAUDE_CODE_REMOTE='' "$_hook" >/dev/null 2>&1
 _check "does nothing when not in a remote container" 0 $?
 
+# The unshallow pass is the one thing that runs on a local checkout too -- a
+# shallow clone gives wrong commit counts wherever it came from -- so what is
+# asserted here is that it is the ONLY thing. Anything about rustc or rustup in
+# this output means the toolchain branch ran outside the container it is meant
+# for.
 _out=$(CLAUDE_CODE_REMOTE='' "$_hook" 2>&1)
-_check "stays silent when not in a remote container" "" "$_out"
+_contains "deepens the clone even outside a remote container" "unshallow:" "$_out"
+_lacks "touches no toolchain when not in a remote container" "rustc" "$_out"
+_lacks "never runs rustup when not in a remote container" "rustup" "$_out"
 
 # An adequate toolchain is left alone, and says which one it is: the version
 # the session actually built against belongs in the log, so a result that
@@ -190,6 +197,12 @@ _err=$(_run "$_d")
 _check "exits cleanly when the toolchain already meets the floor" 0 $?
 _contains "names the installed toolchain" "1.97.1" "$_err"
 _check "never invokes rustup when the toolchain is adequate" "" "$(cat "$_d/calls" 2>/dev/null)"
+# The remote half of the pair above: _run discards stdout, where the unshallow
+# pass reports, so this case keeps its own copy rather than reading nothing and
+# calling it a pass. Both paths pinned means neither the guard moving nor the
+# call being dropped can go unnoticed.
+_all=$(CLAUDE_CODE_REMOTE=true MESH_REPO="$_d/repo" PATH="$_d/bin" "$_hook" 2>&1)
+_contains "deepens the clone in a remote container too" "unshallow:" "$_all"
 rm -rf "$_d"
 
 # The case this hook exists for: the image's stable predates the floor.

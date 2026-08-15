@@ -18,15 +18,34 @@
 # is also not registered in a session whose project root sits above the repo.
 set -euo pipefail
 
+# Overridable so the tests can drive every branch without needing a machine
+# whose toolchain happens to be stale. `checkout` stays the real tree either
+# way -- it is where this script's siblings live, and a seam pointing the
+# manifest at a fixture must not also move where the hook finds its own files.
+checkout=$(cd "$(dirname "$0")/../.." && pwd)
+repo=${MESH_REPO:-$checkout}
+
+# Deepen the clone before anything reads history -- see scripts/unshallow.sh.
+#
+# Above the remote-only guard on purpose, unlike everything below it. A shallow
+# clone answers `git rev-list --count`, `git log` past the boundary and blame
+# with a confident wrong number and no warning, and that is true of the clone
+# rather than of the sandbox that made it -- so there is nothing to gain by
+# asking where it came from first. On a complete clone it is a no-op that says
+# so. Everything below is toolchain provisioning, which a local machine really
+# does manage itself.
+#
+# Run directly rather than through `sh` so it needs nothing on PATH, and
+# best-effort: it reports its own failures, and a clone it could not deepen is
+# never a reason to refuse to start the session.
+(cd "$repo" && "$checkout/scripts/unshallow.sh") || true
+
 # Local checkouts manage their own toolchain; only the ephemeral remote
 # container starts from a stale image.
 if test "${CLAUDE_CODE_REMOTE:-}" != "true"; then
     exit 0
 fi
 
-# Overridable so the tests can drive every branch without needing a machine
-# whose toolchain happens to be stale.
-repo=${MESH_REPO:-$(cd "$(dirname "$0")/../.." && pwd)}
 manifest="$repo/Cargo.toml"
 
 # Read the floor from the manifest rather than repeating it here, the same way
