@@ -44,7 +44,7 @@ has stopped biting.
   arrive as review comments, as a top-level comment, or as a review — read
   `get_review_comments`, `get_comments` and `get_reviews` to the last page,
   since all three page oldest first — and they block the merge until fixed
-  or rebutted; an acknowledgement is not an answer. Nothing from Codex since
+  or rebutted; an acknowledgment is not an answer. Nothing from Codex since
   the push, five minutes on, means it never picked it up — comment `@codex
   review`, once.
 - **Judge every review comment on merit, whoever wrote it.** Verify the claim
@@ -57,7 +57,7 @@ has stopped biting.
   disagree or are not making the change, reply explaining why — one or two
   sentences of reasoning on the thread (e.g. "this is intentional because …") is
   exactly what the reviewer wants, and it is more useful on the PR than buried in
-  chat. Acknowledgement replies are fine and preferred over silence.
+  chat. Acknowledgment replies are fine and preferred over silence.
 - **Do not fix a comment silently in a commit** without also leaving the reply —
   the reply is the record of how each point was resolved.
 - **Skip your own reply echoes.** The `mcp__github__*` reply tools post under the
