@@ -72,12 +72,12 @@ jobs:
       - name: Test the Makefile
         run: sh makefile_test.sh
 
-      # The `scripts/` suites. `unshallow.sh` runs before anything in a session
-      # reads history, and its failure mode is a confident wrong commit count
-      # rather than an error, so it is covered like the rest -- in JavaScript,
-      # because that suite drives the real script against real shallow clones
-      # and came from the sibling gedmap repo already written. It needs a node
-      # and nothing else: no package.json, no lockfile, no install step.
+      # The `scripts/` suites: the verdict sweep behind the `codex` status, the
+      # unshallow script, and the shim they run on. The sweep is what branch
+      # protection consumes, so a regression there wedges the merge gate for
+      # every PR at once and nothing says so. All three are dependency-free, so
+      # this needs a runtime and nothing else. The major matches the one
+      # `codex-verdict.yml` pins; its own suite asserts they stay in step.
       - uses: actions/setup-node@v6
         with:
           node-version: '24'

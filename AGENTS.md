@@ -176,6 +176,14 @@ has stopped biting.
   not installed here. If your client exposes neither, say so rather than
   guessing at the outcome of an operation you couldn't perform.
 - **Open pull requests ready for review**, not as drafts.
+- **Never open a PR on a commit that already carried one.** The `codex`
+  status belongs to the commit, not the PR, and records nothing about which
+  PR earned it — so a PR opened on the byte-identical head of a closed one
+  inherits its verdict and can merge on a review of different work. Push a
+  commit, or branch from a moving base, so the new PR has a head of its own.
+  The verdict sweep (`codex-verdict.yml`) resets the status to `pending`
+  within about a minute of the PR opening, but that is an Actions job racing
+  merge eligibility, so treat it as the backstop and this rule as the fix.
 - **Refresh the PR title and body on every push** so they describe the full,
   latest state of the branch — not the scope from when it was opened. Re-read the
   diff against `origin/main` and patch whatever no longer matches; don't wait to
