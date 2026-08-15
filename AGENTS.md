@@ -262,13 +262,14 @@ has stopped biting.
   **Autonomy**). That's expected either way — never re-author or amend
   already-merged commits to "fix" authorship or signing, and don't narrate it: no note in the
 reply, no offer to correct it. It is not a finding.
-- **Unshallow before answering anything that depends on git history depth.** The
+- **Unshallow before answering anything that depends on git history depth.**
+  Claude Code sessions get this automatically — `scripts/unshallow.sh` runs from
+  the session-start hook — but the hook is Claude-only, so in any other
+  environment run that script (or `git fetch --unshallow`) yourself first. The
   sandbox clones shallow, so `git rev-list --count`, `git log` past the shallow
-  boundary, and blame return wrong answers without warning. If
-  `git rev-parse --is-shallow-repository` says `true`, run
-  `git fetch --unshallow` first, then re-check — it exits 0 even when
-  it deepened nothing, so if `--is-shallow-repository` is still `true`, say the
-  history is truncated instead of quoting a count.
+  boundary, and blame return wrong answers without warning; where no remote is
+  reachable (Codex cloud), say the history is truncated rather than quoting a
+  count.
 
 ## CI
 

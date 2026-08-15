@@ -52,6 +52,7 @@ jobs:
       - name: Shellcheck the hook and the shell suites
         run: |
           shellcheck -s bash -S error .claude/hooks/session-start.sh
+          shellcheck -s sh -S error scripts/unshallow.sh
           shellcheck -s sh -S error session_start_hook_test.sh
           shellcheck -s sh -S error makefile_test.sh
           shellcheck -s sh -S error toolchain_test.sh
@@ -70,6 +71,19 @@ jobs:
       # too, or `make check` quietly stops meaning "what CI runs".
       - name: Test the Makefile
         run: sh makefile_test.sh
+
+      # The `scripts/` suites. `unshallow.sh` runs before anything in a session
+      # reads history, and its failure mode is a confident wrong commit count
+      # rather than an error, so it is covered like the rest -- in JavaScript,
+      # because that suite drives the real script against real shallow clones
+      # and came from the sibling gedmap repo already written. It needs a node
+      # and nothing else: no package.json, no lockfile, no install step.
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+
+      - name: Test the JavaScript suites
+        run: node --test scripts/*.test.js
 
       # FreeBSD needs no cross compiler: nothing in the tree builds C for it
       # (`rusqlite` links a system SQLite rather than bundling one), and `cargo
