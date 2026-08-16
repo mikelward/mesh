@@ -79,7 +79,11 @@ check() {
 # --- classify: the rule itself, both directions per shape
 check "markdown-only diff is docs"        0 "docs_only=true"  FILES="README.md docs/DESIGN.md"
 check "code file makes it code"           0 "docs_only=false" FILES="README.md crates/mesh/src/main.rs"
-check ".gitignore is docs by name"        0 "docs_only=true"  FILES=".gitignore README.md"
+check ".gitignore is code like any config" 0 "docs_only=false" FILES=".gitignore README.md"
+check "markdown under crates/ is a build input" 0 "docs_only=false" FILES="crates/mesh/README.md"
+check "a shared head never rides the docs lane" 0 "docs_only=false" FILES="README.md" SHARED_PRS="1 2"
+check "a lone foreign head PR never rides the lane" 0 "docs_only=false" FILES="README.md" SHARED_PRS="2"
+check "unlistable head PRs are code on a PR event" 0 "docs_only=false" FILES="README.md" PULLS_FAIL=1
 check "an unnamed dotfile is code"         0 "docs_only=false" FILES=".editorconfig"
 check ".claude contents are code"          0 "docs_only=false" FILES=".claude/hooks/session-start.sh"
 check "nested dot-directory files are code" 0 "docs_only=false" FILES=".cargo/config.toml"
@@ -91,6 +95,7 @@ check "non-PR events are code"            0 "docs_only=false" FILES="README.md" 
 # --- classify: a dispatched run judges the PR its input names, or nothing
 check "dispatch naming a PR classifies it" 0 "docs_only=true"  FILES="README.md" GITHUB_EVENT_NAME=workflow_dispatch
 check "dispatch without a PR is refused"   1 "must name the pull request" FILES="README.md" GITHUB_EVENT_NAME=workflow_dispatch PR=
+check "PR-less dispatch is refused even on main" 1 "must name the pull request" FILES="README.md" GITHUB_EVENT_NAME=workflow_dispatch PR= GITHUB_REF_NAME=main
 check "shared head is refused"             1 "cannot vouch for exactly one" FILES="README.md" GITHUB_EVENT_NAME=workflow_dispatch SHARED_PRS="1 2"
 check "unlistable head PRs are refused"    1 "refusing to report" FILES="README.md" GITHUB_EVENT_NAME=workflow_dispatch PULLS_FAIL=1
 check "dispatch for another PR's commit refused" 1 "must not label" FILES="README.md" GITHUB_EVENT_NAME=workflow_dispatch HEAD_SHA=otherhead
@@ -119,6 +124,8 @@ check "a dispatched skip still lints"     1 "lacks a housekeeping prefix" FILES=
 check "gate refuses a mis-bound dispatch"  1 "must not label" FILES="README.md" SUBJECTS="docs: x" CLASSIFY=success RESULTS="$ALLSKIP" GITHUB_EVENT_NAME=workflow_dispatch HEAD_SHA=otherhead
 check "gate refuses a shared head"         1 "cannot vouch for exactly one" FILES="README.md" SUBJECTS="docs: x" CLASSIFY=success RESULTS="$ALLSKIP" GITHUB_EVENT_NAME=workflow_dispatch SHARED_PRS="1 2"
 check "skip on a code diff is refused"    1 "refusing the skip" FILES="crates/a.rs" SUBJECTS="docs: x" CLASSIFY=success RESULTS="$ALLSKIP"
+check "skip on a shared head is refused"  1 "refusing the skip" FILES="README.md" SUBJECTS="docs: x" CLASSIFY=success RESULTS="$ALLSKIP" SHARED_PRS="1 2"
+check "skip vouched by a foreign PR is refused" 1 "refusing the skip" FILES="README.md" SUBJECTS="docs: x" CLASSIFY=success RESULTS="$ALLSKIP" SHARED_PRS="2"
 check "skip on a truncated list refused"  1 "refusing the skip" FILES="README.md" CHANGED=3000 SUBJECTS="docs: x" CLASSIFY=success RESULTS="$ALLSKIP"
 check "commits API failure fails lint"    1 "cannot be verified" FILES="README.md" COMMITS_FAIL=1 CLASSIFY=success RESULTS="$ALLSKIP"
 check "truncated commit list fails lint"  1 "Commit list incomplete" FILES="README.md" SUBJECTS="docs: x" NCOMMITS=300 CLASSIFY=success RESULTS="$ALLSKIP"

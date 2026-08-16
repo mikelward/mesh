@@ -25,21 +25,22 @@ set -euo pipefail
 
 # --- Repo policy: the only section that differs between repos. -------------
 
-# Housekeeping = markdown anywhere, or top-level dotfiles/dotdirs, with one
-# carve-out that counts as code: workflow edits (CI must validate itself).
+# The lane's test is "can this change what CI validates?". Markdown is docs
+# wherever it lives OUTSIDE the crate trees — prose cannot change a build,
+# categorically — while anything under crates/ is a build input whatever its
+# extension (cargo packages a crate's README into the published artifact,
+# and include_str! can embed any file). Beyond that nothing rides the lane
+# by pattern: "dotfile" is a naming convention, not a semantic category
+# (.npmrc changes npm's resolution, .nvmrc picks a runtime), and .gitignore
+# runs the code lane like everything else — ignore rules can hide files
+# from CI's own staging steps, and the sibling repos' lanes treat it as
+# code for exactly that reason. Everything else is code: the session hook
+# under .claude/ (CI lints and tests it), workflows, and any executable
+# configuration.
 is_housekeeping() {
   case "$1" in
-    # The lane's test is "can this change what CI validates?". Markdown is
-    # docs wherever it lives — prose cannot, categorically. Beyond that only
-    # NAMED files qualify: "dotfile" is a naming convention, not a semantic
-    # category (.npmrc changes npm's resolution, .nvmrc picks a runtime), so
-    # nothing rides the lane by pattern. .gitignore is the one named
-    # exception today: CI operates on tracked files, which ignore rules
-    # cannot touch. Everything else is code: the session hook under
-    # .claude/ (CI lints and tests it), workflows, and any executable
-    # configuration.
+    crates/*) return 1 ;;
     *.md) return 0 ;;
-    .gitignore) return 0 ;;
     *) return 1 ;;
   esac
 }
@@ -49,6 +50,13 @@ is_housekeeping() {
 # must carry one, so nothing on this lane can ever read like a bare
 # behavior-change subject.
 LANE_PREFIXES="design docs todo test build refactor"
+
+# ci.yml declares no workflow_dispatch trigger, so no dispatched run is
+# legitimate here: a PR-less dispatch is refused on every ref. (The engine
+# keeps the full binding checks so a trigger added later is born guarded.)
+dispatch_without_pr_ok() {
+  return 1
+}
 
 # --- Engine: identical across repos below this line. -----------------------
 
@@ -91,11 +99,36 @@ pr_files() {
   printf '%s\n' "$files"
 }
 
+# Every open pull request the given commit currently heads, one number per
+# line — or a hard failure when the listing cannot be completed, because a
+# per-commit check must not be minted on an association nobody verified.
+open_prs_heading() {
+  HEAD_Q="$1" gh api "repos/${GITHUB_REPOSITORY}/commits/$1/pulls" --paginate \
+    --jq '.[] | select(.state == "open" and .head.sha == env.HEAD_Q) | .number'
+}
+
 # 0 = every changed file is housekeeping; 1 = code, or an empty diff;
 # 2 = the file list could not be trusted (API failure or truncation).
 docs_only() {
   case "${GITHUB_EVENT_NAME:-}" in
-    pull_request) ;;
+    pull_request)
+      # A commit can head more than one open PR (stacked PRs: same branch,
+      # different bases), and a check run is per-commit — a gate minted for
+      # this PR's justified skip would satisfy the other PR's required
+      # check too, even where that PR's diff is code. So a shared head
+      # never rides the docs lane: classified as code, the heavy jobs run,
+      # and the gate on this SHA is backed by real validation whichever PR
+      # reads it. (On pull_request events GITHUB_SHA is the merge commit,
+      # not the head, so the PR's own head is looked up first.)
+      test -n "${PR:-}" || return 1
+      local prhead prs
+      prhead=$(gh api "repos/${GITHUB_REPOSITORY}/pulls/${PR}" --jq '.head.sha') || return 2
+      prs=$(open_prs_heading "$prhead") || return 2
+      # The sole open PR must be THIS one, not merely a count of one: the
+      # originating PR can close while its run is in flight, leaving a
+      # stacked twin as the single open PR the gate would then vouch for.
+      if [ "$(printf '%s' "$prs" | grep -c .)" -ne 1 ] || [ "$(printf '%s' "$prs" | head -n1)" != "$PR" ]; then return 1; fi
+      ;;
     # A dispatched run may stand in for a PR run, but only by naming the PR,
     # so classification still judges the PR's real diff rather than waving
     # the branch through. verify_dispatch_binding (below) has already bound
@@ -172,10 +205,12 @@ lint_prefixes() {
 # born guarded.)
 verify_dispatch_binding() {
   test "${GITHUB_EVENT_NAME:-}" = "workflow_dispatch" || return 0
-  # The workflow marks the input required, but required-ness is the UI's
-  # promise, not this script's: an unnamed PR cannot be verified, so it is
-  # refused here rather than classified around.
+  # An unnamed PR cannot be verified, so it is refused — unless the repo's
+  # config says a PR-less dispatch is legitimate here (deploy-force on the
+  # default branch), in which case docs_only classifies it as code and the
+  # full lane runs.
   if [ -z "${PR:-}" ]; then
+    if dispatch_without_pr_ok; then return 0; fi
     echo "::error::A dispatched run must name the pull request it reports for (the pr input) — refusing without one."
     return 1
   fi
@@ -194,8 +229,7 @@ verify_dispatch_binding() {
   # too. Require the named PR to be the ONLY open PR this commit heads;
   # ambiguity is refused rather than resolved, the fail-closed direction.
   local heads
-  heads=$(gh api "repos/${GITHUB_REPOSITORY}/commits/${GITHUB_SHA}/pulls" --paginate \
-            --jq '.[] | select(.state == "open" and .head.sha == env.GITHUB_SHA) | .number') || {
+  heads=$(open_prs_heading "${GITHUB_SHA}") || {
     echo "::error::Could not list the pull requests this commit heads — refusing to report for it."
     return 1
   }
