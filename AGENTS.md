@@ -82,63 +82,33 @@ has stopped biting.
   owner's standing request for that PR, so a client-level rule reading "open a
   PR only when the user explicitly asks" is already satisfied — the ask is
   here, and it doesn't need repeating per branch.
-- **Stay subscribed to PR activity on your own PRs — events are the
-  watch.** Keep (or create) the `subscribe_pr_activity` subscription for
-  every PR you open, so CI failures, reviews, and comments wake the session
-  and get acted on the moment they land, without the operator having to
-  relay them. Subscribed events render as raw payloads in the operator's
-  conversation and nothing session-side can filter them; that cost is
-  accepted — reaction latency outranks a quiet chat. Arm auto-merge at PR
-  open too, so a clean verdict merges without a turn. Unsubscribe only when
-  the PR merges or closes.
 - **If a scheduler or GitHub call prompts, say so once and carry on.**
   Permissions load at session start, so writing a settings file mid-session
   can't fix the session you're in.
-- **Keep one scheduled fallback check per open PR alongside the
-  subscription — ~5 minutes while CI or the Codex verdict is outstanding,
-  ~30 once only a human is left.** Events are the primary signal; the check
-  covers what webhooks drop — CI success, merges, and Codex's clean
-  verdict, which is a reaction and emits no event at all. Never end a turn idle with one of yours open: arm the next
-  check with whatever the client offers (`send_later`, a scheduled task /
-  cron, `/loop`), and arm it *without asking* — that is hygiene, not a
-  decision. Someone else's PR is not your polling job unless you're asked.
-  Merged or closed is terminal: take one more check for CI and Codex on the
-  final head, but settle for what's known if a report may never land, then
-  run a last reply-or-resolve pass and cancel the watch in full — the
-  pending trigger, *and* `unsubscribe_pr_activity` if you ever subscribed.
-  Open a follow-up PR, with its own watch, for anything a merged one still
-  needs.
-- **What the polling costs.** Twelve wake-ups an hour per PR at the fast
-  cadence, two at the slow one — each a model turn plus a few GitHub API
-  calls, so roughly a dollar an hour while a PR is waiting on its merge
-  gate. The scheduler is the single point of failure: one missed re-arm ends
-  the watch silently, with no error anywhere. If you can't arm the next
-  check, say so in the reply rather than leaving a PR that looks watched and
-  isn't.
-- **One pending check per PR, settled at the top of the turn.** Two chains
-  each re-arming themselves double the cost every time a webhook starts a
-  turn while one is already pending; parking the re-arm at the *end* of the
-  turn loses it when the turn is interrupted, which once left a PR unwatched
-  for two hours. So settle it first, and settle it to exactly one: leave a
-  correctly-timed check alone — pushing its deadline forward every turn is
-  how a busy PR never gets polled — and when it's missing, already fired, or
-  mis-timed, either `update_trigger` it in place or arm the replacement
-  before deleting the old, because an overlap beats a gap. Then diagnose,
-  fix, and reply.
-- **A `send_later` one-shot re-arms itself +24h**, so "check in 5 minutes"
-  silently becomes daily. Never leave a fired trigger to expire on its own, and
-  check that the fire time it returned is the one you asked for — a five-minute
-  request came back as a hundred once, saying nothing — and re-time it until it
-  is, or say in the reply that the watch is running at the wrong cadence.
-  Reading the wrong answer and accepting it is the same silence.
-- **`list_triggers` spans every session on the account.** Narrow it to this
-  session's `persistent_session_id`, then to the trigger you actually mean (its
-  own id, once the PR its prompt names has narrowed the field), before updating
-  *or* deleting one — an update reschedules whatever it matches as surely as a
-  delete cancels it. If that filter turns up more than one, the extras are
-  duplicate chains: keep one and delete the rest.
-- **Never name a SHA in the check prompt.** It is written before the work it
-  describes, so it is stale when it fires — say "the current head".
+- **Watch your own PRs by subscription, plus one scheduled check.** Have a
+  subscription — Claude Code makes one when you open a PR; where a client
+  doesn't, call `subscribe_pr_activity`. It delivers reviews, comments and CI
+  failures. It cannot deliver CI *success*, a push, the merge, Codex's clean
+  verdict (a reaction), or Codex never answering at all — so keep exactly one
+  check armed for as long as the PR is open (each event and each check costs
+  a model turn). Under drive, arm auto-merge at PR open too — but only where
+  the ruleset makes the Codex verdict a required check, since where CI is the
+  only requirement it merges before Codex has answered.
+  - Settle the fired trigger first thing in the turn, not last. It may have
+    silently re-armed rather than retired, so update it rather than adding a
+    second chain.
+  - Check the fire time you got against the one you asked for — a 4-minute
+    request has come back as 64. Re-time it, or say the watch isn't armed.
+  - A few minutes out while CI or the current head's Codex verdict is
+    outstanding; longer once only a human is left; short again after a push.
+  - Name the PR, and say what to re-read rather than what you read. A SHA or
+    a list of which PRs are open goes stale before it fires; one PR number
+    does not, and the trigger has to be matchable to it.
+  - Merged or closed, take one last reply-or-resolve pass — a review can
+    land after the merge — then cancel it and unsubscribe. `list_triggers`
+    spans the account, so match this session and this PR before updating
+    or deleting one; an update reschedules whatever it matches as surely
+    as a delete cancels it.
 - **"Drive" means run the loop automatically**: pick the next task,
   implement it, open the PR, wait for the automatic Codex review, address
   every comment, merge once CI is green and Codex's verdict for the current
@@ -211,8 +181,6 @@ has stopped biting.
   review comment — fix it if you agree, reply on the thread saying why if
   you don't — and merge once CI is green and Codex's verdict for the current
   head is in.
-- **Canceling the watch**: see the polling bullet under **Autonomy**.
-
 ## Git workflow
 
 - Before starting or continuing any task, run `git fetch origin main`. For a new
