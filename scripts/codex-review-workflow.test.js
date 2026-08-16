@@ -69,7 +69,7 @@ const yml = directives(WORKFLOW);
  * this is the one invariant in the tree whose breach is silent.
  */
 const ALLOWED_PERMISSIONS = {
-  "ci.yml": ["permissions:", "  contents: read"],
+  "ci.yml": ["permissions:", "  contents: read", "  pull-requests: read"],
   "release.yml": ["permissions:", "  contents: write"],
 };
 
