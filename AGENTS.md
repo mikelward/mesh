@@ -291,8 +291,8 @@ reply, no offer to correct it. It is not a finding.
 
 - **The required check is `gate`, and housekeeping PRs ride the docs lane.**
   CI runs on every PR; `classify` skips the heavy jobs when every changed
-  file is housekeeping (markdown anywhere, root dotfiles — workflow edits
-  count as code), and `gate` independently re-verifies the skip and lints
+  file is housekeeping (markdown outside `crates/` — anything under a crate
+  tree, `.gitignore` included, is code), and `gate` independently re-verifies the skip and lints
   that every docs-lane commit subject carries a prefix from the table above.
   Everything below the config section of `scripts/docs-lane.sh` is engine
   code shared with the sibling repos — change it everywhere or not at all.

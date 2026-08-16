@@ -28,7 +28,7 @@ env:
 
 jobs:
   # Decides whether the heavy jobs may skip: true only when every changed
-  # file in the PR is housekeeping (markdown anywhere, root dotfiles — see
+  # file in the PR is housekeeping (markdown outside crates/ — see
   # scripts/docs-lane.sh for the rule and its carve-outs). Pushes to main
   # are always classified as code, so they run everything.
   classify:
