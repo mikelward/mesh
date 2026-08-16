@@ -36,6 +36,7 @@ test: ## Run every suite: the cargo tests, the shell-script ones, the JS ones
 	sh toolchain_test.sh
 	sh session_start_hook_test.sh
 	sh makefile_test.sh
+	bash scripts/docs-lane.test.sh
 	node --test scripts/*.test.js
 
 fmt: ## Reformat the tree

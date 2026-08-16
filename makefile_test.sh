@@ -76,6 +76,8 @@ _contains "make run starts the shell" "cargo run -p mesh" "$(_dry run)"
 _contains "make test runs the cargo suites" "cargo test --workspace" "$(_dry test)"
 _contains "make test runs the shell suites too" \
     "sh session_start_hook_test.sh" "$(_dry test)"
+_contains "make test runs the docs-lane suite" \
+    "bash scripts/docs-lane.test.sh" "$(_dry test)"
 
 # check = lint then test, in that order: no point running a suite the formatter
 # is about to reject.
