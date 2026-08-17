@@ -298,6 +298,49 @@ Delete an entry once you have agreed with it or reversed it.
       passthrough. Taken under autopilot, and a few lines in `forwarded_command`
       to revisit.
 
+- [ ] **The Codex gate's fork-pull-request gap is documented upstream, not
+      fixed here.** The shared codex-review setup is taken as-is, with its
+      fork limitation recorded in `mikelward/codex-review`'s
+      `docs/CONSUMER.md`. The alternative was holding this conversion until
+      the shared action publishes its check result against
+      `pull_request.head.sha`, so a fork pull request could satisfy a required
+      `codex-review-check`. External fork pull requests are not a case these
+      repositories take today, and the head-associated check comes from the
+      `push` trigger, which same-repo pull requests always get. The three
+      workflow files are byte-identical template copies, so a local edit would
+      fail the pin; the fix belongs upstream once.
+      *Reversible:* entirely — re-copy `templates/` when the remedy lands. It
+      is written out in full there, including that it is only half the gate,
+      since a fork head also fails the `codex` status for a separate,
+      deliberate reason.
+
+- [ ] **`scripts/codex-review-workflow.test.js` was deleted rather than
+      kept alongside the shared check.** 336 lines asserting the shape of a
+      workflow file that is now pinned byte for byte upstream, where the same
+      assertions are made once for all nine consumers. Keeping both would mean
+      a local test that can only ever fail *after* the pin already has, or
+      drift into asserting something the template does not say. The
+      alternative — keep it as a second opinion — is what produced three
+      different holes in three hand-copied versions of it in one afternoon.
+      *Reversible:* the file is one `git revert` away, and the `node --test
+      scripts/*.test.js` runner globs, so nothing needs rewiring either way.
+
+- [ ] **The concurrency group is renamed `codex-verdict` → `codex-review`, and
+      draining is a rollout step rather than something the file can express.**
+      A concurrency group is a repo-wide namespace, so for as long as `main`
+      still carries the old name a run under it does not serialize against a
+      run under the new one — and a sweep polls for up to 55 minutes, so a
+      delayed writer can overwrite a newer failure with a stale success and
+      briefly open the gate. Keeping the old name is not available: the file is
+      compared byte for byte against the shared template, which says
+      `codex-review`. So the condition moves to the merge: **check that no
+      `codex-review.yml` run is in flight immediately before merging**, not
+      merely when the branch was pushed. Raised by Codex on the pull request
+      that made this change, and correct — the original check covered the wrong
+      moment.
+      *Reversible:* nothing to undo; the exposure ends the moment the merge
+      lands and both definitions name the same group.
+
 ## Build and toolchain
 
 - [ ] **Nothing nags when the pinned Rust release falls behind.**
