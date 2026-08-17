@@ -102,6 +102,18 @@ has stopped biting.
     request has come back as 64. Re-time it, or say the watch isn't armed.
   - A few minutes out while CI or the current head's Codex verdict is
     outstanding; longer once only a human is left; short again after a push.
+  - Where the ruleset requires branches up to date, a PR reading `behind`
+    needs a `git fetch origin` — the PR's own ref too, or the lease fails
+    `stale info` — a rebase onto the fetched `origin/<base>`, which is not
+    always `main` and is never the local branch a fetch leaves behind, then
+    `git push --force-with-lease --force-if-includes`; where it
+    does not, leave it. Both flags, because that fetch refreshes the ref
+    the lease compares against and only `--force-if-includes` then
+    refuses a push missing someone else's commit; a rejection means
+    integrate their tip and retry. Nothing reports a base advance, so
+    only the check catches it — and a PR reading `dirty` is the same
+    advance with a conflict on top, so it takes the same recovery
+    whatever the ruleset requires, resolving as you rebase.
   - Name the PR, and say what to re-read rather than what you read. A SHA or
     a list of which PRs are open goes stale before it fires; one PR number
     does not, and the trigger has to be matchable to it.
