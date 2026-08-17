@@ -54,9 +54,9 @@ has stopped biting.
   `updated_at` moving without a reaction usually means unread findings.
 - **Judge every review comment on merit, whoever wrote it.** Verify the claim
   before acting; if it doesn't hold up, reply saying why and decline.
-- **Never leave a review comment silently dismissed** — every thread ends in
-  either a reply or a resolve, not "left open and ignored." This holds for human
-  and automated (bot) reviewers alike.
+- **Never leave a review comment silently dismissed.** Answer every thread — a
+  disagreement is an answer, so say why — then resolve it; only work you are
+  deferring stays open. Human and automated reviewers alike.
 - **Say what you did.** If you addressed it, reply describing the change and
   reference the commit (`Narrowed the claim in <sha>; it now says …`). If you
   disagree or are not making the change, reply explaining why — one or two
