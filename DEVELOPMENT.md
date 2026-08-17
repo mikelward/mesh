@@ -187,7 +187,8 @@ A fourth sits outside `cargo` too, and outside `sh`: `scripts/*.test.js`, run by
 [`node`'s own test runner](https://nodejs.org/api/test.html) and needing no
 packages. It covers [`unshallow.sh`](scripts/unshallow.sh), which deepens a
 shallow clone at session start, and the *shape* of
-[`codex-review.yml`](.github/workflows/codex-review.yml) -- which events may
+[`codex-review.yml`](.github/workflows/codex-review.yml) and its
+[listener](.github/workflows/codex-review-listener.yml) -- which events may
 start a job holding `statuses: write`, and that no other workflow here can write
 the status it publishes. Those are decisions about this repository, so they are
 tested here; the sweep that workflow runs is tested in its own repository.
@@ -234,7 +235,20 @@ the merge gate. Codex posts no check run, and its clean pass is only a reaction
 on the pull request body -- which emits no webhook -- so a job polls for it and
 republishes it as a `codex` commit status, which branch protection *can*
 require. It is the only workflow here holding `statuses: write`, and a test
-pins that.
+pins that -- by comparing every other workflow's permissions block against the
+exact one it is known to need, since YAML has unboundedly many spellings of a
+grant and a list of forbidden ones has to know them all.
+
+[`codex-review-listener.yml`](.github/workflows/codex-review-listener.yml) is
+the other half. Codex sometimes delivers findings as a review with no inline
+comments, which emits neither comment event and no reaction, so nothing else
+hears it. That event is `pull_request_review`, and GitHub resolves its workflow
+definition against the pull request's own merge ref -- so putting it on the
+file that holds `statuses: write` would let a same-repository branch supply its
+own steps and publish `codex: success` for itself. The listener declares no
+permissions and does one no-op step; its completion starts the sweep through
+`workflow_run`, which always runs the default branch's definition. Renaming
+either end severs the relay silently, so the test pins both names.
 
 The sweep itself is
 [`mikelward/codex-review`](https://github.com/mikelward/codex-review), a
@@ -289,6 +303,7 @@ mesh/
 ├── rust-toolchain.toml     # pins an exact release + rustfmt + clippy
 ├── .github/workflows/ci.yml       # fmt, clippy, tests, cross-checks, MSRV, stable
 ├── .github/workflows/codex-review.yml # runs the shared Codex verdict action
+├── .github/workflows/codex-review-listener.yml # relays pull_request_review to it
 ├── .github/workflows/release.yml  # the per-push Linux x86-64 binary
 ├── scripts/                # infrastructure, not shipped code
 │   ├── unshallow.sh        # deepens a shallow clone, run from the session-start hook

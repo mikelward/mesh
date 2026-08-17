@@ -42,6 +42,7 @@ const WORKFLOWS = ".github/workflows";
  */
 const isWorkflow = (file) => /\.ya?ml$/.test(file);
 const WORKFLOW = "codex-review.yml";
+const LISTENER = "codex-review-listener.yml";
 
 /**
  * A workflow's YAML with its comment lines removed.
@@ -71,6 +72,10 @@ const yml = directives(WORKFLOW);
 const ALLOWED_PERMISSIONS = {
   "ci.yml": ["permissions:", "  contents: read", "  pull-requests: read"],
   "release.yml": ["permissions:", "  contents: write"],
+  // The relay holds nothing at all, which is the point of it: it hears
+  // `pull_request_review`, an event whose definition GitHub resolves against
+  // the pull request's own merge ref.
+  [LISTENER]: ["permissions: {}"],
 };
 
 /**
@@ -163,18 +168,21 @@ describe("the codex-review workflow", () => {
       "  schedule:",
       "    - cron: '23 * * * *'",
       "  pull_request_target:",
-      "    types: [opened, reopened, ready_for_review, synchronize, closed]",
+      "    types: [opened, reopened, ready_for_review, synchronize, edited, closed]",
       "  issue_comment:",
       "    types: [created, edited]",
       "  pull_request_review_comment:",
       "    types: [created, edited]",
+      "  workflow_run:",
+      "    workflows: [codex-review-listener]",
+      "    types: [completed]",
       "permissions:",
       "  contents: read",
       "  pull-requests: read",
       "  checks: read",
       "  statuses: write",
       "concurrency:",
-      "  group: codex-verdict",
+      "  group: codex-review",
       "  cancel-in-progress: false",
       "jobs:",
       "  sweep:",
@@ -183,6 +191,47 @@ describe("the codex-review workflow", () => {
       "    steps:",
       "      - uses: mikelward/codex-review@main",
     ]);
+  });
+
+  it("has a listener that is exactly this, line for line", () => {
+    // Pinned for the same reason as the sweep, and it matters more than its
+    // four directives suggest: this file is what makes it safe for the sweep
+    // to hear `pull_request_review` at all. Grant it any permissions and the
+    // relay stops being a relay.
+    const directiveLines = readFileSync(join(WORKFLOWS, LISTENER), "utf8")
+      .split("\n")
+      .filter((line) => !/^\s*#/.test(line) && line.trim() !== "")
+      .map((line) => line.trimEnd());
+
+    expect(directiveLines).toEqual([
+      "name: codex-review-listener",
+      "on:",
+      "  pull_request_review:",
+      "    types: [submitted, edited, dismissed]",
+      "permissions: {}",
+      "jobs:",
+      "  heard:",
+      "    runs-on: ubuntu-latest",
+      "    timeout-minutes: 5",
+      "    steps:",
+      "      - run: 'true'",
+    ]);
+  });
+
+  it("relays bare-review verdicts through the unprivileged listener", () => {
+    // A verdict submitted as a review with NO inline comments emits neither
+    // comment event and no reaction, so without this relay nothing hears it
+    // until the hourly schedule. It cannot be heard directly: GitHub resolves
+    // a `pull_request_review` workflow against the pull request's merge ref,
+    // so on a file holding `statuses: write` a same-repository branch could
+    // substitute its own steps and publish `codex: success` for itself.
+    // `workflow_run` always runs the default branch's definition, which is
+    // what splits the event from the privilege.
+    //
+    // The two ends are pinned as a pair on purpose -- the relay is a name
+    // match, so renaming one end alone severs it in silence.
+    expect(triggers).toMatch(/workflows: \[codex-review-listener\]/);
+    expect(directives(LISTENER)).toMatch(/^name: codex-review-listener$/m);
   });
 
   it("starts on exactly these events and no others", () => {
@@ -200,6 +249,7 @@ describe("the codex-review workflow", () => {
       "pull_request_review_comment",
       "pull_request_target",
       "schedule",
+      "workflow_run",
     ]);
   });
 
@@ -221,6 +271,14 @@ describe("the codex-review workflow", () => {
     // away -- a webhook-capable, merge-enabling transition that would
     // otherwise wait on the throttled schedule.
     expect(triggers).toMatch(/types:.*\bclosed\b/);
+    // `edited` on THIS stream is the retarget: pointing a pull request at a
+    // different base changes the reviewed diff, sometimes completely, while
+    // the head SHA and its `codex: success` stand still. GitHub emits
+    // `edited` for that rather than `synchronize`, so without it a verdict
+    // nothing computed for this diff stays mergeable until the backstop.
+    expect(triggers).toMatch(
+      /pull_request_target:\s*\n\s*types:.*\bedited\b/,
+    );
   });
 
   it("starts the loop on comment events, for the round that has no push", () => {
@@ -254,17 +312,21 @@ describe("the codex-review workflow", () => {
     expect(yml).toMatch(/cancel-in-progress:\s*false/);
   });
 
-  it("keeps the concurrency group named for the workflow it replaced", () => {
-    // Deliberately not `codex-review`, and the mismatch with the file name is
-    // what makes it look like an oversight worth tidying. A concurrency group
-    // is a repo-wide namespace, so this one name is what serializes a still-
-    // in-flight `codex-verdict` run against this file -- deleting a workflow
-    // does not cancel a run of it, and a run lasts up to 65 minutes. Rename it
-    // and the two poll concurrently: two unordered writers of one status,
-    // where a stale `success` landing after a newer `failure` opens the gate
-    // on findings nobody answered. Renaming later reopens the same window, so
-    // it never gets renamed.
-    expect(yml).toMatch(/group:\s*codex-verdict\b/);
+  it("shares one concurrency group with every sibling consumer", () => {
+    // This was `codex-verdict` for a long time, and the reason was good: a
+    // concurrency group is a repo-wide namespace, and that name is what
+    // serialized this file against a still-in-flight run of the
+    // `codex-verdict.yml` it replaced -- deleting a workflow does not cancel
+    // a run of it, and a run lasts up to 65 minutes.
+    //
+    // That predecessor is long gone from this tree, so there is nothing left
+    // for the old name to serialize against, and the mismatch had become the
+    // thing it warned about: a name that looks like an oversight, differing
+    // from the same file in every sibling repository for a reason no longer
+    // in force. The changeover has the window the old comment described --
+    // one run under each name, briefly concurrent -- so the merge is timed
+    // for when no sweep is in flight.
+    expect(yml).toMatch(/group:\s*codex-review\b/);
   });
 
   it("holds exactly the scope it needs and no more", () => {
