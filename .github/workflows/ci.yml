@@ -113,12 +113,12 @@ jobs:
       - name: Test the Makefile
         run: sh makefile_test.sh
 
-      # The `scripts/` suites: the unshallow script, the shape of
-      # `codex-review.yml` (which events may start a job holding
-      # `statuses: write`, and that nothing else here writes that status), and
-      # the shim they run on. The sweep that workflow runs is tested in
-      # mikelward/codex-review, not here. All dependency-free, so this needs a
-      # runtime and nothing else.
+      # The `scripts/` suites: the unshallow script and the shim it runs on.
+      # The codex-review workflows are checked by the `codex-review-check` job,
+      # which compares them byte for byte against mikelward/codex-review's
+      # templates and verifies nothing else here holds `statuses: write` --
+      # once for all its consumers rather than a copy per repository. All
+      # dependency-free, so this needs a runtime and nothing else.
       - uses: actions/setup-node@v6
         with:
           node-version: '24'

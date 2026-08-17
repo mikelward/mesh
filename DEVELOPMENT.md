@@ -186,12 +186,21 @@ sh makefile_test.sh             # `make -n` dry runs; builds nothing
 A fourth sits outside `cargo` too, and outside `sh`: `scripts/*.test.js`, run by
 [`node`'s own test runner](https://nodejs.org/api/test.html) and needing no
 packages. It covers [`unshallow.sh`](scripts/unshallow.sh), which deepens a
-shallow clone at session start, and the *shape* of
-[`codex-review.yml`](.github/workflows/codex-review.yml) -- which events may
-start a job holding `statuses: write`, and that no other workflow here can write
-the status it publishes. Those are decisions about this repository, so they are
-tested here; the sweep that workflow runs is tested in its own repository.
-`vitest-shim.mjs` carries the matchers both suites use over `node:test`.
+shallow clone at session start. `vitest-shim.mjs` carries the matchers over
+`node:test`.
+
+The three `codex-review*.yml` workflows are **not** checked here, and that is
+deliberate. They are byte-identical copies of the templates in
+[`mikelward/codex-review`](https://github.com/mikelward/codex-review), which
+`check_consumer.py` compares exactly — along with the rule that no other
+workflow in this repository may hold `statuses: write`. It runs as the
+`codex-review-check` job on every pull request, so the invariant is enforced
+once for all nine consumers rather than by nine hand-written copies of the same
+assertions. This repository used to carry one of those copies; review found
+three different holes in three different versions of it in a single afternoon,
+which is why they were consolidated. Do not add a local test asserting the
+shape of those files: it can only fail after the pin already has, or drift into
+asserting something the template does not say.
 
 ```sh
 node --test scripts/*.test.js   # no network, no packages, no toolchain
