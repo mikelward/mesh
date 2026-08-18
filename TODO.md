@@ -11914,3 +11914,14 @@ a one-line edit. Every claim below was checked against the built shell.
 - [x] `-c "…"` one-shot command flag — *landed*, see "Beyond M3 — Invocation".
 - [ ] Whether satellite helpers (`vcs`, prompt) are Rust workspace members or
       standalone (per-helper call; see `DEVELOPMENT.md`)
+
+## Review and merge gates
+
+- [ ] Verify the settings half of the fleet's bar — every repository works
+      the same: comprehensive automated review, required merge gates, and
+      auto-merge. The workflow files (CI and the codex-review set) are all
+      present here; what git cannot show, and the 2026-08-18 audit could
+      not verify, is the settings half: a ruleset on the default branch
+      requiring the CI gate, the `codex` status, the
+      `codex-review-check / codex-review-check` workflow pin, conversation
+      resolution, up-to-date branches, and the auto-merge setting enabled.
