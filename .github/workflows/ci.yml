@@ -10,6 +10,20 @@ on:
   # `gate` verifies the skip was justified (scripts/docs-lane.sh has the
   # full design rationale).
   pull_request:
+  # A PR opened by GITHUB_TOKEN (mikelward/rust-update's weekly batch)
+  # triggers no `on: pull_request` run of its own, so that job dispatches
+  # this workflow explicitly, naming the PR it reports for. The `pr` input
+  # is required so a bare dispatch is refused at the API level;
+  # scripts/docs-lane.sh's verify_dispatch_binding is the real guard —
+  # it also refuses an unnamed dispatch, and additionally proves the named
+  # PR actually heads the dispatched commit before classify or gate trusts
+  # it.
+  workflow_dispatch:
+    inputs:
+      pr:
+        description: Pull request number this run reports for.
+        required: true
+        type: string
 
 # CI only builds and tests -- it never writes to the repository, so it runs with
 # a read-only token whatever the repo's default workflow permissions happen to
@@ -51,7 +65,7 @@ jobs:
         id: run
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          PR: ${{ github.event.pull_request.number }}
+          PR: ${{ github.event.pull_request.number || github.event.inputs.pr }}
         run: scripts/docs-lane.sh classify >> "$GITHUB_OUTPUT"
 
   check:
@@ -239,7 +253,7 @@ jobs:
       - name: Verdict
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          PR: ${{ github.event.pull_request.number }}
+          PR: ${{ github.event.pull_request.number || github.event.inputs.pr }}
           CLASSIFY: ${{ needs.classify.result }}
           RESULTS: >-
             check=${{ needs.check.result }}

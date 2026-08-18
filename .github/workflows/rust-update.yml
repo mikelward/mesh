@@ -1,0 +1,33 @@
+name: Rust dependency update
+
+# Weekly Cargo.lock batch, as mikelward/rust-update's reusable workflow —
+# see https://github.com/mikelward/rust-update for what it does and its
+# trust model. This file just supplies the schedule, the permissions the
+# reusable workflow's jobs downscope from, and which CI to dispatch; the
+# update and publish logic all lives there.
+on:
+  schedule:
+    - cron: '26 6 * * 6'   # Saturdays, off the congested top of the hour
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: rust-update
+  cancel-in-progress: false
+
+jobs:
+  update:
+    uses: mikelward/rust-update/.github/workflows/rust-update.yml@main
+    permissions:
+      contents: write
+      pull-requests: write
+      actions: write
+    with:
+      checks: |
+        cargo test --workspace --locked
+      # A PR opened by GITHUB_TOKEN triggers no `on: pull_request` workflow,
+      # so nothing starts ci.yml's `gate` — the required check — on its own.
+      # ci.yml's workflow_dispatch trigger (added alongside this file) is
+      # what lets this job start it explicitly, naming the PR.
+      ci-workflow: ci.yml
