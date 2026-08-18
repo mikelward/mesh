@@ -51,9 +51,11 @@ is_housekeeping() {
 # behavior-change subject.
 LANE_PREFIXES="design docs todo test build refactor"
 
-# ci.yml declares no workflow_dispatch trigger, so no dispatched run is
-# legitimate here: a PR-less dispatch is refused on every ref. (The engine
-# keeps the full binding checks so a trigger added later is born guarded.)
+# ci.yml's workflow_dispatch requires the `pr` input, but that's a GitHub
+# UI/API-level constraint this engine cannot see or trust on its own — the
+# REST API accepts a dispatch that omits a "required" input regardless, and
+# this function is the guard that actually runs. No dispatch is legitimate
+# here without a named PR.
 dispatch_without_pr_ok() {
   return 1
 }
