@@ -1945,6 +1945,17 @@ the checkable list.
         poll, redrawn with nothing printed. The ask, upstream or in a fork, is
         narrow: let something other than the completer say "I have new material,
         redraw."
+  - [ ] **Re-derive this against reedline 0.50.0 — the citation above is now
+        stale.** PR #534 (the reedline 0.49.0 → 0.50.0 bump) reworked the async
+        completion path this section leans on for its precedent: `complete`
+        returns a `CompletionResult` (Fresh/Stale/Pending) instead of
+        `Vec<Suggestion>`, and `engine.rs`'s polling gate is now
+        `completer_pending = status != CompletionStatus::Idle`, not
+        `self.completer.check_pending()`. Whether the redraw-on-poll shape this
+        entry (and the matching walkthrough in `docs/PROMPT.md` §"What it takes
+        to not need starship") describes still holds needs checking against the
+        new source before either doc is trusted as a design reference — the
+        analysis was written and cited against the old shape.
   - [ ] **The polling cost recorded under "Beyond M3 — Terminal integration"
         stands** — reedline's two async paths are not treated alike, and only one
         of them is scoped. `needs_polling` is recomputed each iteration, and the
