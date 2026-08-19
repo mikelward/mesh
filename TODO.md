@@ -2035,6 +2035,18 @@ all under "Beyond M3 — External tool integration".
       `$sh.keymap` value a prompt segment can read plus a redraw when the
       keymap changes (zsh's `zle-keymap-select`), which "Cursor shape per
       mode" under "Beyond M3 — Terminal integration" is blocked on.
+- [ ] **Helix mode.** reedline 0.50.0 (the version bump in PR #534) ships a
+      third `EditMode` — `edit_mode::helix::Helix`, with its own
+      `PromptHelixMode` for a prompt-indicator hook — as a modal keymap
+      alongside `Emacs` and `Vi`, no longer gated behind the now-removed
+      `keybindings` feature/crate. `DESIGN.md` doesn't ask for it (its
+      requirement, above, is vi+emacs from the user's existing configs), so
+      whether to offer it at all — and if so, under what `$sh` setting
+      alongside the vi/emacs choice — is a product decision, not implied by
+      the vi-mode entry's shape questions. Currently compiled out:
+      `crates/mesh-core/Cargo.toml` sets `default-features = false` on
+      `reedline` specifically to keep it (and its default-on `helix`
+      feature) out of the build until there's a reason to want it.
 
 ## Beyond M3 — Navigation
 
