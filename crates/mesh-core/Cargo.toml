@@ -20,7 +20,7 @@ libc = "0.2.186"
 mesh-platform = { path = "../mesh-platform" }
 nucleo-matcher = "0.3.1"
 nu-ansi-term = "0.50.3"
-reedline = { version = "0.49.0", features = ["sqlite"] }
+reedline = { version = "0.50.0", default-features = false, features = ["sqlite"] }
 regex = "1.11.3"
 rusqlite = "0.40.1"
 unicode-segmentation = "1.12.0"
