@@ -23,12 +23,12 @@ use std::time::{Duration, Instant};
 
 use crossterm::event::Event;
 use reedline::{
-    Color, ColumnarMenu, Completer, EditCommand, EditMode, Emacs, Highlighter, History,
-    HistoryItem, HistoryItemId, HistorySessionId, KeyCode, KeyModifiers, Keybindings, MenuBuilder,
-    Osc133Markers, Osc633Markers, Prompt, PromptEditMode, PromptHistorySearch, PromptKind,
-    Reedline, ReedlineEvent, ReedlineMenu, ReedlineRawEvent, SearchDirection, SearchQuery,
-    SemanticPromptMarkers, Signal, SimpleMatchHighlighter, Span, SqliteBackedHistory, StyledText,
-    Suggestion, default_emacs_keybindings,
+    Color, ColumnarMenu, Completer, CompletionResult, EditCommand, EditMode, Emacs, Highlighter,
+    History, HistoryItem, HistoryItemId, HistorySessionId, KeyCode, KeyModifiers, Keybindings,
+    MenuBuilder, Osc133Markers, Osc633Markers, Prompt, PromptEditMode, PromptHistorySearch,
+    PromptKind, Reedline, ReedlineEvent, ReedlineMenu, ReedlineRawEvent, SearchDirection,
+    SearchQuery, SemanticPromptMarkers, Signal, SimpleMatchHighlighter, Span, SqliteBackedHistory,
+    StyledText, Suggestion, default_emacs_keybindings,
 };
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
@@ -17340,7 +17340,7 @@ struct MeshCompleter {
 }
 
 impl Completer for MeshCompleter {
-    fn complete(&mut self, line: &str, pos: usize) -> Vec<Suggestion> {
+    fn complete(&mut self, line: &str, pos: usize) -> CompletionResult {
         let line = &line[..pos];
         let start = line.rfind(char::is_whitespace).map_or(0, |at| at + 1);
         let word = &line[start..];
@@ -17354,7 +17354,7 @@ impl Completer for MeshCompleter {
         } else {
             path_completions(word)
         };
-        suggestions(values, start, pos)
+        CompletionResult::fresh(suggestions(values, start, pos))
     }
 }
 
@@ -18372,16 +18372,16 @@ impl Prompt for MeshPrompt {
         Cow::Borrowed("search: ")
     }
     fn get_prompt_color(&self) -> Color {
-        Color::Reset
+        Color::Default
     }
     fn get_prompt_multiline_color(&self) -> nu_ansi_term::Color {
         nu_ansi_term::Color::Default
     }
     fn get_indicator_color(&self) -> Color {
-        Color::Reset
+        Color::Default
     }
     fn get_prompt_right_color(&self) -> Color {
-        Color::Reset
+        Color::Default
     }
 }
 
@@ -21343,13 +21343,13 @@ mod tests {
             custom: None,
         };
 
-        assert_eq!(prompt.get_prompt_color(), reedline::Color::Reset);
+        assert_eq!(prompt.get_prompt_color(), reedline::Color::Default);
         assert_eq!(
             prompt.get_prompt_multiline_color(),
             nu_ansi_term::Color::Default
         );
-        assert_eq!(prompt.get_indicator_color(), reedline::Color::Reset);
-        assert_eq!(prompt.get_prompt_right_color(), reedline::Color::Reset);
+        assert_eq!(prompt.get_indicator_color(), reedline::Color::Default);
+        assert_eq!(prompt.get_prompt_right_color(), reedline::Color::Default);
     }
 
     #[test]
