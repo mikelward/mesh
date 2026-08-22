@@ -27,6 +27,11 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          # This job has contents: write and publishes a release; don't
+          # leave the token in .git/config, where anything later in the
+          # job (a build script, a dependency's proc macro) could read it
+          # back out and use it to push or modify the repository.
+          persist-credentials: false
 
       - name: Install stable toolchain
         run: rustup toolchain install stable --profile minimal
