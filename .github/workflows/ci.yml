@@ -164,7 +164,7 @@ jobs:
         run: rustup target add x86_64-apple-darwin
 
       - name: Install cross compiler
-        uses: mlugg/setup-zig@v2
+        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29  # v2.2.1
 
       # Zig compiles bundled C dependencies; `cargo check` then type-checks all
       # macOS Rust code without needing an Apple linker or a macOS runner.
@@ -202,11 +202,15 @@ jobs:
           echo "version=$version" >> "$GITHUB_OUTPUT"
 
       - name: Install MSRV toolchain
-        run: rustup toolchain install ${{ steps.msrv.outputs.version }} --profile minimal
+        run: rustup toolchain install ${STEPS_MSRV_OUTPUTS_VERSION} --profile minimal
+        env:
+          STEPS_MSRV_OUTPUTS_VERSION: ${{ steps.msrv.outputs.version }}
 
       # `+toolchain` overrides the exact release rust-toolchain.toml pins.
       - name: Check
-        run: cargo +${{ steps.msrv.outputs.version }} check --workspace --locked
+        run: cargo +${STEPS_MSRV_OUTPUTS_VERSION} check --workspace --locked
+        env:
+          STEPS_MSRV_OUTPUTS_VERSION: ${{ steps.msrv.outputs.version }}
 
   # rust-toolchain.toml pins an exact release, which buys reproducibility at the
   # cost of never noticing that a new compiler broke something. This job is that

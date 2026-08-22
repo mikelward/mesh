@@ -18,10 +18,33 @@ access can do:
 - [ ] Once the ruleset requires `lanes`, delete the now-redundant `gate`
       job in a follow-up PR.
 
+## Require zizmor in the ruleset
+
+- [ ] **Add `zizmor` to the ruleset's required set** once it has reported
+      on a `pull_request` run here: the zizmor workflow runs unfiltered on
+      every PR precisely so it can be required (a paths-filtered workflow
+      creates no check run at all on a non-matching PR, which a ruleset
+      waits on forever) — the posture piloted in mikelward/lanes and
+      mikelward/ci-commit-artifact, rolled out fleet-wide. `repo-rules
+      mikelward/mesh` with no arguments applies the standard `lanes codex
+      zizmor` set (once the rename above has also landed).
+
 ## Decisions needing review
 
 Calls autopilot made without asking, each one chosen for being cheap to undo.
 Delete an entry once you have agreed with it or reversed it.
+
+- [ ] **`release.yml`'s `softprops/action-gh-release` stays as the action,
+      silenced with `# zizmor: ignore[superfluous-actions]`, rather than
+      switching to `gh release create` in a script step.** zizmor's
+      suggestion is real, but replacing the action means re-deriving its
+      `tag_name`/`target_commitish`/`generate_release_notes`/`files`
+      inputs as `gh` flags — a genuine behavior change to the release
+      pipeline, out of scope for a lanes/zizmor migration. The
+      alternative was leaving the scan with one informational finding the
+      rest of the fleet doesn't carry.
+      *Reversible:* delete the ignore comment and do the `gh release
+      create` rewrite whenever someone wants to take it on.
 
 - [ ] **The batch contract applies under `-i` too.** `mesh -i -c '…'` and
       `printf … | mesh -i` now exit nonzero on a refused statement, like their

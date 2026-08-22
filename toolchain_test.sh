@@ -129,9 +129,11 @@ if test -f "$_ci"; then
 
     # The msrv job has to override the pin for the same reason in reverse:
     # inheriting it would build against the pinned release and report the floor
-    # as fine whatever the floor actually is.
+    # as fine whatever the floor actually is. The version is passed through an
+    # env var rather than interpolated directly into the run block (zizmor's
+    # template-injection audit), so this checks for the env-var form.
     _check "the msrv job overrides the pin rather than inheriting it" \
-        "yes" "$(_has_gate 'cargo +${{ steps.msrv.outputs.version }}')"
+        "yes" "$(_has_gate 'cargo +${STEPS_MSRV_OUTPUTS_VERSION}')"
 else
     echo "SKIP: no CI workflow to compare against"
 fi
