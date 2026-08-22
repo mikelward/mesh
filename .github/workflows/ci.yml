@@ -1,23 +1,36 @@
 name: CI
 
+# The real test gate this repository's ruleset requires: `fmt · clippy ·
+# test` (the `check` job) plus `msrv`. `classify`/`gate`/`lanes` use the
+# shared engine at mikelward/lanes — see .github/lanes.conf for the
+# docs/code classification that lets a housekeeping-only diff skip the
+# heavy jobs without weakening the gate.
+#
+# TEMPORARY: both `gate` and `lanes` run below. mikelward/lanes renamed its
+# consumer-facing check from `gate` to `lanes` (mikelward/lanes#9); this
+# repo's ruleset still requires `gate`. Per that project's staged-rename
+# procedure, the duplicate keeps `gate` reporting until the ruleset is
+# flipped to require `lanes` instead — see TODO.md.
 on:
   push:
     branches: [main]
-  # No paths filter, deliberately: the main ruleset requires the `gate`
-  # check, and a required check that never reports blocks the PR forever —
-  # which is exactly what a path-filtered-out workflow produces.
-  # Housekeeping-only PRs skip the heavy jobs via `classify` instead, and
-  # `gate` verifies the skip was justified (scripts/docs-lane.sh has the
-  # full design rationale).
   pull_request:
+    # `edited` is here because a retarget changes what the PR's diff is
+    # measured against while the head — and any `gate`/`lanes` check run
+    # already minted on it — stays put, so a base change must start a fresh
+    # run. Title and body edits re-run the lane too, deliberately: a
+    # skipped job would be worse, because GitHub counts a skipped required
+    # check as satisfied, so skipping the gate on a "harmless" edit would
+    # let a newer skipped run replace a red verdict on the same head.
+    types: [opened, synchronize, reopened, edited]
   # A PR opened by GITHUB_TOKEN (mikelward/rust-update's weekly batch)
   # triggers no `on: pull_request` run of its own, so that job dispatches
   # this workflow explicitly, naming the PR it reports for. The `pr` input
   # is required so a bare dispatch is refused at the API level;
-  # scripts/docs-lane.sh's verify_dispatch_binding is the real guard —
-  # it also refuses an unnamed dispatch, and additionally proves the named
-  # PR actually heads the dispatched commit before classify or gate trusts
-  # it.
+  # mikelward/lanes's own dispatch-binding guard is the real check — it
+  # also refuses an unnamed dispatch, and additionally proves the named PR
+  # actually heads the dispatched commit before classify or gate trusts it
+  # (.github/lanes.conf: dispatch-without-pr refuse).
   workflow_dispatch:
     inputs:
       pr:
@@ -43,30 +56,24 @@ env:
 jobs:
   # Decides whether the heavy jobs may skip: true only when every changed
   # file in the PR is housekeeping (markdown outside crates/ — see
-  # scripts/docs-lane.sh for the rule and its carve-outs). Pushes to main
-  # are always classified as code, so they run everything.
+  # .github/lanes.conf for the rule; the engine is mikelward/lanes). Pushes
+  # to main are always classified as code, so they run everything.
   classify:
     name: Classify the diff
     runs-on: ubuntu-latest
     timeout-minutes: 5
     outputs:
-      docs_only: ${{ steps.run.outputs.docs_only }}
+      docs_only: ${{ steps.lane.outputs.docs_only }}
+      base_sha: ${{ steps.lane.outputs.base_sha }}
     steps:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
-      - name: Self-test the lane rules
-        # Before trusting the classification, prove the rule engine against
-        # its fixture matrix (stubbed gh, both directions per behavior). A
-        # broken rule fails here, the heavy jobs skip on the failed
-        # dependency, and the gate goes red — fail closed, never green.
-        run: bash scripts/docs-lane.test.sh
-      - name: Classify
-        id: run
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          PR: ${{ github.event.pull_request.number || github.event.inputs.pr }}
-        run: scripts/docs-lane.sh classify >> "$GITHUB_OUTPUT"
+      - uses: mikelward/lanes@main
+        id: lane
+        with:
+          mode: classify
+          pr: ${{ github.event.pull_request.number || inputs.pr }}
 
   check:
     name: fmt · clippy · test
@@ -106,7 +113,6 @@ jobs:
       - name: Shellcheck the hook and the shell suites
         run: |
           shellcheck -s bash -S error .claude/hooks/session-start.sh
-          shellcheck -s bash -S error scripts/docs-lane.sh scripts/docs-lane.test.sh
           shellcheck -s sh -S error scripts/unshallow.sh
           shellcheck -s sh -S error session_start_hook_test.sh
           shellcheck -s sh -S error makefile_test.sh
@@ -231,15 +237,18 @@ jobs:
       - name: Test
         run: cargo +stable test --workspace
 
-  # The one check the main ruleset requires. Always runs, always reports —
-  # green only when every heavy job succeeded, or when they were skipped and
-  # the skip is INDEPENDENTLY verified as justified: the diff re-derived as
-  # housekeeping-only and every commit subject carrying a housekeeping
-  # prefix. Any other combination — a failure anywhere, a skip on a code
-  # diff, classify itself failing — is an explicit red, never a silent pass.
-  # `stable` is not in the needs list on purpose: it is a push-only
-  # early-warning job that never reports on a PR, so including it would read
-  # as a permanent skip and wedge every code-lane verdict.
+  # The one check the main ruleset requires today. Always runs, always
+  # reports — green only when every heavy job succeeded, or when they were
+  # skipped and the skip is INDEPENDENTLY verified as justified: the diff
+  # re-derived as housekeeping-only and every commit subject carrying a
+  # housekeeping prefix. Any other combination — a failure anywhere, a skip
+  # on a code diff, classify itself failing — is an explicit red, never a
+  # silent pass. `stable` is not in the needs list on purpose: it is a
+  # push-only early-warning job that never reports on a PR, so including it
+  # would read as a permanent skip and wedge every code-lane verdict.
+  #
+  # TEMPORARY, alongside `lanes` below: see the top-of-file comment for the
+  # staged-rename this repeats mikelward/lanes#9 for.
   gate:
     name: gate
     runs-on: ubuntu-latest
@@ -250,12 +259,39 @@ jobs:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
-      - name: Verdict
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          PR: ${{ github.event.pull_request.number || github.event.inputs.pr }}
-          CLASSIFY: ${{ needs.classify.result }}
-          RESULTS: >-
+      - uses: mikelward/lanes@main
+        with:
+          mode: gate
+          pr: ${{ github.event.pull_request.number || inputs.pr }}
+          classify-result: ${{ needs.classify.result }}
+          # Only read on a dispatched run, and harmless on a pull_request
+          # one, which takes the same commit from its own event payload.
+          base-sha: ${{ needs.classify.outputs.base_sha }}
+          results: >-
             check=${{ needs.check.result }}
             msrv=${{ needs.msrv.result }}
-        run: scripts/docs-lane.sh gate
+
+  # The renamed check (mikelward/lanes#9) — this is what the ruleset should
+  # require once it has reported on a pull_request run here (TODO.md).
+  # Identical to `gate` above; see that job's comment for why both exist.
+  lanes:
+    name: lanes
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    needs: [classify, check, msrv]
+    if: always()
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: mikelward/lanes@main
+        with:
+          mode: gate
+          pr: ${{ github.event.pull_request.number || inputs.pr }}
+          classify-result: ${{ needs.classify.result }}
+          # Only read on a dispatched run, and harmless on a pull_request
+          # one, which takes the same commit from its own event payload.
+          base-sha: ${{ needs.classify.outputs.base_sha }}
+          results: >-
+            check=${{ needs.check.result }}
+            msrv=${{ needs.msrv.result }}

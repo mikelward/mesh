@@ -4,6 +4,20 @@ The working front — concrete, checkable tasks for the current and next
 milestone. The stable milestone arc is in [`ROADMAP.md`](ROADMAP.md); update this
 file as tasks land.
 
+## Finish the gate → lanes check rename
+
+The consumer-facing required check was renamed from `gate` to `lanes`
+(mikelward/lanes#9). `lanes` now runs alongside `gate` in ci.yml (both
+green), but two steps remain, outside what a session without ruleset API
+access can do:
+
+- [ ] Flip the ruleset to require `lanes` instead of `gate`, now that
+      `lanes` has reported on a `pull_request` run here: `repo-rules
+      mikelward/mesh lanes ...` (naming every check the ruleset should
+      require — `mikelward/scripts`' tool).
+- [ ] Once the ruleset requires `lanes`, delete the now-redundant `gate`
+      job in a follow-up PR.
+
 ## Decisions needing review
 
 Calls autopilot made without asking, each one chosen for being cheap to undo.

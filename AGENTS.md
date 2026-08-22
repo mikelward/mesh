@@ -269,13 +269,16 @@ reply, no offer to correct it. It is not a finding.
 
 ## CI
 
-- **The required check is `gate`, and housekeeping PRs ride the docs lane.**
-  CI runs on every PR; `classify` skips the heavy jobs when every changed
-  file is housekeeping (markdown outside `crates/` — anything under a crate
-  tree, `.gitignore` included, is code), and `gate` independently re-verifies the skip and lints
-  that every docs-lane commit subject carries a prefix from the table above.
-  Everything below the config section of `scripts/docs-lane.sh` is engine
-  code shared with the sibling repos — change it everywhere or not at all.
+- **The required check is `gate` (moving to `lanes`), and housekeeping PRs
+  ride the docs lane.** CI runs on every PR; `classify` skips the heavy jobs
+  when every changed file is housekeeping (markdown outside `crates/` —
+  anything under a crate tree, `.gitignore` included, is code), and
+  `gate`/`lanes` independently re-verify the skip and lint that every
+  docs-lane commit subject carries a prefix from the table above. The
+  engine is `mikelward/lanes@main`, shared with the sibling repos; policy
+  lives in `.github/lanes.conf`. `zizmor` scans the workflows themselves
+  (`.github/zizmor.yml` for exceptions) — see TODO.md for both checks'
+  remaining ruleset steps.
 - **Report significant CI timing regressions.** After CI finishes on a push,
   compare against recent runs of the same job on the same kind of ref. Only
   call out significant slowdowns (rule of thumb: >25% or >30s on a job under
