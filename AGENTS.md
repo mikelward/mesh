@@ -53,7 +53,14 @@ has stopped biting.
   check runs) — because the reaction is only the clean channel, and
   `updated_at` moving without a reaction usually means unread findings.
 - **Judge every review comment on merit, whoever wrote it.** Verify the claim
-  before acting; if it doesn't hold up, reply saying why and decline.
+  before acting; if it doesn't hold up, reply saying why and decline. A comment
+  citing a rule is a *reading* of that rule, not the rule — check what the rule
+  actually says. Codex misreads the privacy rules especially, and in one
+  direction: stricter always feels safer, so an over-strict finding quietly
+  costs capability the product needs. Quote the rule and decline rather than
+  narrowing the code to satisfy it; where the rule really does forbid what the
+  product needs, that conflict is the maintainer's call, not one to settle
+  either way yourself.
 - **Never leave a review comment silently dismissed.** Answer every thread — a
   disagreement is an answer, so say why — then resolve it; only work you are
   deferring stays open. Human and automated reviewers alike.
