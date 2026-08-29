@@ -183,10 +183,10 @@ has stopped biting.
   The verdict sweep (`codex-review.yml`) resets the status to `pending`
   within about a minute of the PR opening, but that is an Actions job racing
   merge eligibility, so treat it as the backstop and this rule as the fix.
-- **Refresh the PR title and body on every push** so they describe the full,
-  latest state of the branch — not the scope from when it was opened. Re-read the
-  diff against `origin/main` and patch whatever no longer matches; don't wait to
-  be told it drifted.
+- **Refresh the PR title and body with the push, not after it** — same step, so
+  they describe the full, latest state of the branch — not the scope from when
+  it was opened. Re-read the diff against `origin/main` and patch whatever no
+  longer matches; don't wait to be told it drifted.
 - **The PR title carries the same prefix as a commit subject** (see *Commit
   messages*), judged over the whole branch rather than any one commit. A branch
   that adds a `design:` commit and a bare one is a behavior change overall, so
