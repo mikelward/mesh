@@ -187,13 +187,16 @@ has stopped biting.
   they describe the full, latest state of the branch — not the scope from when
   it was opened. Re-read the diff against `origin/main` and patch whatever no
   longer matches; don't wait to be told it drifted.
-- **The PR title carries the same prefix as a commit subject** (see *Commit
-  messages*), judged over the whole branch rather than any one commit. A branch
-  that adds a `design:` commit and a bare one is a behavior change overall, so
-  its title goes bare. Re-judge it on every push: a branch can start
-  documentation-only and stop being so with the next commit. The title is there
-  to be read — it is what the PR list shows the repo owner — so the prefix says
-  at a glance whether a PR changes what mesh does.
+- **Give the PR title the same prefix a commit subject would carry** (see
+  *Commit messages*), judged over the whole branch rather than any one commit. A
+  branch that adds a `design:` commit and a bare one is a behavior change
+  overall, so its title goes bare. Re-judge it on every push: a branch can start
+  documentation-only and stop being so with the next commit. This is a
+  convention for reading, not a gate — the title is what the PR list shows the
+  repo owner, so the prefix says at a glance whether a PR changes what mesh
+  does. Only commit subjects are enforced (`lint-title no` in
+  `.github/lanes.conf`): squash merging is disabled on every repository in this
+  fleet, so a title never becomes a commit subject.
 - **Link every open PR** in a stack when you push, summarize CI, or invite review
   — one URL per line — since the "View PR" chip sticks to the first link and
   hides the rest (anthropics/claude-code#46625).
@@ -280,8 +283,9 @@ reply, no offer to correct it. It is not a finding.
 
 - **The required check is `gate` (moving to `lanes`), and housekeeping PRs
   ride the docs lane.** CI runs on every PR; `classify` skips the heavy jobs
-  when every changed file is housekeeping (markdown outside `crates/` —
-  anything under a crate tree, `.gitignore` included, is code), and
+  when every changed file is housekeeping (root-level markdown and the
+  `docs/` tree — markdown anywhere else, anything under a crate tree, and
+  `.gitignore` are all code), and
   `gate`/`lanes` independently re-verify the skip and lint that every
   docs-lane commit subject carries a prefix from the table above. The
   engine is `mikelward/lanes@main`, shared with the sibling repos; policy
