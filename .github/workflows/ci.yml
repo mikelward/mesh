@@ -55,8 +55,10 @@ env:
 
 jobs:
   # Decides whether the heavy jobs may skip: true only when every changed
-  # file in the PR is housekeeping (markdown outside crates/ — see
-  # .github/lanes.conf for the rule; the engine is mikelward/lanes). Pushes
+  # file in the PR is housekeeping (root-level markdown and the docs/ tree —
+  # see .github/lanes.conf for the rule; the engine is mikelward/lanes).
+  # Markdown elsewhere is code: being documentation is a matter of where a
+  # file lives, since markdown inside a tree can be a build input. Pushes
   # to main are always classified as code, so they run everything.
   classify:
     name: Classify the diff
