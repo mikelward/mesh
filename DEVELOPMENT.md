@@ -125,7 +125,7 @@ types; it is now a direct dependency pinned to the version `reedline` itself
 builds against, so the two see one set of types.
 
 Add a dependency only when a milestone calls for it; prefer a small, focused
-crate over a framework. The repo is licensed `MIT OR Apache-2.0`; keep the
+crate over a framework. The repo is licensed `Apache-2.0`; keep the
 license column permissive-compatible. Everything here is permissive except
 `nucleo-matcher`, which is MPL-2.0 (weak, file-level copyleft — compatible with a
 permissive project).
