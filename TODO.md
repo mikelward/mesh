@@ -10542,9 +10542,14 @@ a one-line edit. Every claim below was checked against the built shell.
   chosen over a Rust-style `r#"…"#` delimiter. Its value-producing spelling (vs
   command-redirection) is still open below. Implementation lands with the quoting
   task (task 5).
-- **Repo license = `MIT OR Apache-2.0`** (the Rust-ecosystem norm, as used by Rust
-  itself). `LICENSE-APACHE` and `LICENSE-MIT` live at the repo root and every crate
-  declares `license = "MIT OR Apache-2.0"`.
+- **Repo license = `Apache-2.0` only** (maintainer, 2026-08-31), reversing the
+  earlier `MIT OR Apache-2.0` dual license. The dual license was taken as the
+  Rust-ecosystem norm rather than for anything mesh needs, and it costs a reader
+  a choice to make and this repo two files to keep in step; Apache-2.0 alone
+  carries the patent grant and the contribution terms, which MIT does not, so
+  dropping MIT loses nothing the project was relying on. `LICENSE` (the Apache
+  text) is at the repo root and every crate inherits
+  `license = "Apache-2.0"` from the workspace.
 - **Glob no-match → empty** (nullglob-style: the pattern expands to zero words).
   This is *principled*, not a compromise, and fully consistent with "absence is
   loud": specific-element access (`xs[99]`, `$map.key`) errors because you asked
@@ -11442,11 +11447,6 @@ a one-line edit. Every claim below was checked against the built shell.
       away a status that is sitting right there. `wait` was implemented on the
       same rule, so waiting after the fact reports what waiting through it would
       have.
-- [x] **Choose a repo license** — *decided: `MIT OR Apache-2.0`* (the
-      Rust-ecosystem norm, as used by Rust itself). Nothing constrained the choice:
-      all current/planned deps are permissive (`reedline`/`nix`/`crossterm` MIT)
-      except `nucleo` **MPL-2.0** (weak, file-level copyleft — compatible with a
-      permissive project). `LICENSE-APACHE`/`LICENSE-MIT` are at the repo root.
 - [ ] **Is refusing a flag-valued argument the right ergonomics for `puts`?**
       Shipped in #425: `puts` declares no options, so `x = --force; puts $x`
       reports `unknown flag` rather than printing, the same answer a `func` with
