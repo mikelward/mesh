@@ -55,11 +55,15 @@ env:
 
 jobs:
   # Decides whether the heavy jobs may skip: true only when every changed
-  # file in the PR is housekeeping (root-level markdown and the docs/ tree —
-  # see .github/lanes.conf for the rule; the engine is mikelward/lanes).
-  # Markdown elsewhere is code: being documentation is a matter of where a
-  # file lives, since markdown inside a tree can be a build input. Pushes
-  # to main are always classified as code, so they run everything.
+  # file in the PR is housekeeping — root-level markdown that nothing reads
+  # (see .github/lanes.conf for the rule; the engine is mikelward/lanes).
+  # README.md and the whole docs/ tree are code: docs.rs parses every
+  # example in them, transcripts.rs runs the prompted ones, and mesh-core
+  # embeds docs/REFERENCE.md with include_str!, so a skip there would skip
+  # the very sweeps that read the change. Markdown elsewhere is code for the
+  # same reason — being documentation is a matter of where a file lives, and
+  # markdown inside a tree can be a build input. Pushes to main are always
+  # classified as code, so they run everything.
   classify:
     name: Classify the diff
     runs-on: ubuntu-latest

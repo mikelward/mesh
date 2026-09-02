@@ -283,9 +283,11 @@ reply, no offer to correct it. It is not a finding.
 
 - **The required check is `gate` (moving to `lanes`), and housekeeping PRs
   ride the docs lane.** CI runs on every PR; `classify` skips the heavy jobs
-  when every changed file is housekeeping (root-level markdown and the
-  `docs/` tree — markdown anywhere else, anything under a crate tree, and
-  `.gitignore` are all code), and
+  when every changed file is housekeeping (root-level markdown that nothing
+  reads — `README.md`, the whole `docs/` tree, markdown anywhere else,
+  anything under a crate tree, and `.gitignore` are all code; the doc sweeps
+  in `docs.rs` and `transcripts.rs` read the first two, and `mesh-core`
+  embeds `docs/REFERENCE.md`), and
   `gate`/`lanes` independently re-verify the skip and lint that every
   docs-lane commit subject carries a prefix from the table above. The
   engine is `mikelward/lanes@main`, shared with the sibling repos; policy

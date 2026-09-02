@@ -461,4 +461,100 @@ mod extraction {
             );
         }
     }
+
+    /// Every file the sweeps read rides the CODE lane, and root markdown that
+    /// nothing reads rides the docs lane.
+    ///
+    /// The policy in `.github/lanes.conf` decides whether CI runs this suite
+    /// at all, and its failure mode is the quiet one: classify and gate derive
+    /// the same wrong `docs` verdict, the sweeps skip, and a `docs:` pull
+    /// request merges green over an example that stopped working — leaving the
+    /// next code pull request red on prose it never touched. Nothing outside
+    /// this file knows which files the sweeps read, so the assertion belongs
+    /// beside the function that enumerates them.
+    #[test]
+    fn every_swept_document_is_code() {
+        let root = repo_root();
+        for file in documentation_files(&root) {
+            let path = file
+                .strip_prefix(&root)
+                .expect("a swept file lives under the repo root")
+                .to_str()
+                .expect("a documentation path is UTF-8");
+            assert_eq!(
+                lane(path),
+                "code",
+                "{path} is read by this suite, so a docs-only skip would skip the read"
+            );
+        }
+        // `include_str!` in `mesh-core`'s builtin table makes this one a
+        // compile input too, and it is swept by name above — asserted
+        // separately so the reason survives a change to what is swept.
+        assert_eq!(lane("docs/REFERENCE.md"), "code");
+        // The design documents are exempt from the sweep but not from the
+        // tree rule, and a file that does not exist yet is code before anyone
+        // remembers to add it.
+        for path in ["docs/DESIGN.md", "docs/TYPES.md", "docs/NEW.md"] {
+            assert_eq!(lane(path), "code", "{path}");
+        }
+        // The other direction, which is what keeps the lane worth having:
+        // root markdown nothing reads still skips the suite.
+        for path in ["AGENTS.md", "TODO.md", "ROADMAP.md", "DEVELOPMENT.md"] {
+            assert_eq!(lane(path), "docs", "{path}");
+        }
+        // And nothing that builds is ever documentation.
+        for path in ["crates/mesh/tests/docs.rs", "crates/mesh-core/src/lib.rs"] {
+            assert_eq!(lane(path), "code", "{path}");
+        }
+    }
+
+    /// The lane `.github/lanes.conf` gives a repo-relative path: ordered
+    /// rules, first match wins, no rule means code — the engine's own
+    /// contract (mikelward/lanes).
+    fn lane(path: &str) -> &'static str {
+        let policy = std::fs::read_to_string(repo_root().join(".github/lanes.conf"))
+            .expect("read .github/lanes.conf");
+        for line in policy.lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let Some((verdict, pattern)) = line.split_once(char::is_whitespace) else {
+                continue;
+            };
+            if verdict != "code" && verdict != "docs" {
+                continue;
+            }
+            if glob_matches(pattern.trim(), path) {
+                return if verdict == "docs" { "docs" } else { "code" };
+            }
+        }
+        "code"
+    }
+
+    /// Whether a policy pattern matches a path, for the pattern shapes this
+    /// policy uses.
+    ///
+    /// The engine matches with Node's `path.matchesGlob`; this understands the
+    /// three shapes `.github/lanes.conf` actually writes and **panics** on any
+    /// other. Returning `false` for a shape it did not understand would report
+    /// every path as code and make every assertion above vacuously true, which
+    /// is exactly the false pass this test exists to prevent.
+    fn glob_matches(pattern: &str, path: &str) -> bool {
+        if let Some(prefix) = pattern.strip_suffix("/**") {
+            // `**` crosses `/`; `docs/**` matches at any depth below `docs/`
+            // and does not match `docs` itself.
+            return path.starts_with(&format!("{prefix}/"));
+        }
+        if let Some(extension) = pattern.strip_prefix("*.") {
+            // `*` does not cross `/`, so this reaches the root and no further.
+            return !path.contains('/') && path.ends_with(&format!(".{extension}"));
+        }
+        assert!(
+            !pattern.contains('*'),
+            "the lane assertions do not understand the pattern {pattern:?} — \
+             teach glob_matches its shape rather than letting it match nothing"
+        );
+        pattern == path
+    }
 }
