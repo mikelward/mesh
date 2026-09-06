@@ -191,7 +191,7 @@ has stopped biting.
   The verdict sweep (`codex-review.yml`) resets the status to `pending`
   within about a minute of the PR opening, but that is an Actions job racing
   merge eligibility, so treat it as the backstop and this rule as the fix.
-- **Refresh the PR title and body with the push, not after it** — same step, so
+- **Refresh the PR title and body with the push — body first, then push** — so
   they describe the full, latest state of the branch — not the scope from when
   it was opened. Re-read the diff against `origin/main` and patch whatever no
   longer matches; don't wait to be told it drifted.
