@@ -1,4 +1,4 @@
-name: CI
+name: ci
 
 # The real test gate this repository's ruleset requires: `fmt · clippy ·
 # test` (the `check` job) plus `msrv`. `classify`/`gate`/`lanes` use the
