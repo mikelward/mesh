@@ -24,7 +24,9 @@ has stopped biting.
   nothing has come back five minutes after a push — that means it never
   picked the push up. Address its comments without being asked, folding each
   fix into the commit it belongs to (rebase / `--fixup`) rather than tacking
-  on an "address review" commit.
+  on an "address review" commit — the one exception being a real finding
+  that's genuinely out of scope for this PR, which you defer instead (see
+  *Deferring a finding* below).
 - **`resolve_review_thread` works — pass the `PRRT_*` thread node ID** from
   `pull_request_read` / `get_review_comments` (`review_threads[].id`) as
   `threadId`. A comment's `PRRC_*` node ID fails; they're different objects.
@@ -46,8 +48,9 @@ has stopped biting.
   a review is the attributable form, naming the commit it read. Findings
   arrive as review comments, as a top-level comment, or as a review — read
   `get_review_comments`, `get_comments` and `get_reviews` to the last page,
-  since all three page oldest first — and they block the merge until fixed
-  or rebutted; an acknowledgment is not an answer. Nothing from Codex since
+  since all three page oldest first — and they block the merge until fixed,
+  rebutted, or deferred (see *Deferring a finding* below); an acknowledgment
+  is not an answer. Nothing from Codex since
   the push, five minutes on, means it never picked it up — comment `@codex
   review`, once. Reading the verdict is a protocol, not a glance: a state
   report draws on ALL the sources — the PR-body reactions, the reviews, the
@@ -70,8 +73,16 @@ has stopped biting.
   than the instance. Say what you chose on the thread; a design change is the
   maintainer's call, autopilot included.
 - **Never leave a review comment silently dismissed.** Answer every thread — a
-  disagreement is an answer, so say why — then resolve it; only work you are
-  deferring stays open. Human and automated reviewers alike.
+  disagreement is an answer, so say why — then resolve it; anything still to do
+  stays open. Human and automated reviewers alike.
+- **Deferring a real-but-out-of-scope finding.** Don't ask the maintainer to
+  merge past it: note the follow-up in `TODO.md`, commit and push that first,
+  reply on the thread citing the sha, and resolve — resolving a deferred thread
+  is the exception to "anything still to do stays open" above. A finding with
+  no thread (top-level comment or review body) still gets the `TODO.md` record,
+  the push, and the reply — only the resolve is skipped. The push re-triggers
+  Codex; `@codex review` only for the five-minute-silence case. Escalate only
+  if the re-review re-raises it.
 - **Say what you did.** If you addressed it, reply describing the change and
   reference the commit (`Narrowed the claim in <sha>; it now says …`). If you
   disagree or are not making the change, reply explaining why — one or two
