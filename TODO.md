@@ -34,6 +34,18 @@ access can do:
 Calls autopilot made without asking, each one chosen for being cheap to undo.
 Delete an entry once you have agreed with it or reversed it.
 
+- [ ] **The history list's walk direction follows the key that opened it.**
+      `Up` opens the list and keeps walking it (older matches), `Down` walks
+      back; opened with `Down`, the roles swap. Chosen because `Up` `Up`
+      `Enter` (readline's second-most-recent) and `Down` `Down` `Enter` (a
+      browser's second suggestion) both have to keep working, and no fixed
+      assignment does both: with `Up` always meaning older, a second `Down`
+      from the first row leaves the list instead of reaching the second row;
+      with the list's own top-to-bottom order ruling, a second `Up` does. The
+      alternatives are exactly those two fixed rules. *Reversible:* one match
+      arm in `EscapePrefix::parse_event` (`repl.rs`) picks the walk event; the
+      list itself is direction-agnostic.
+
 - [ ] **`release.yml`'s `softprops/action-gh-release` stays as the action,
       silenced with `# zizmor: ignore[superfluous-actions]`, rather than
       switching to `gh release create` in a script step.** zizmor's

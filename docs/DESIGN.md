@@ -6360,10 +6360,9 @@ readline is avoided as GPL.
 `Ctrl-U`/`Ctrl-K` line-kill, `Ctrl-Y` yank, `Alt-.` (Esc + `.`) to insert the
 **last argument** of the previous command (repeat to walk earlier commands' last
 args; it obeys the same [session selection rule](#interactive-history) as the other
-recall motions), `Ctrl-R` reverse history search, up/down for **prefix** history search (a
-typed prefix filters the walk; see [Interactive history](#interactive-history)),
-`Tab` to complete, `Ctrl-L` to
-clear. **Multi-line
+recall motions), `Ctrl-R` reverse history search, up/down for the **history list** — the recent
+commands matching what is typed, shown beneath the line (see [Interactive
+history](#interactive-history)), `Tab` to complete, `Ctrl-L` to clear. **Multi-line
 continuation** is driven by **parser incompleteness** — the editor asks the
 parser whether the buffer is a complete command and, if not, reads a continuation
 line — so *every* unfinished form is covered uniformly rather than by an
@@ -6581,10 +6580,41 @@ UI yet.
 | `status` | `postexec` | the [exit status](#variables-and-assignment) |
 
 **Recall** is the [line editor](#line-editing)'s, reading from this store, with two
-motions: **`Ctrl-R`** does reverse *substring* search, and **up/down do prefix
-search** — with a prefix already typed, `Up` walks the most recent commands that
-*start with* it (an empty buffer just steps chronologically). So typing `git ` then
-`Up` cycles your recent `git …` lines — the friendly default.
+motions. **`Ctrl-R`** does reverse *substring* search, readline-style. **`Up` and
+`Down` open the history list** — the dropdown a browser's address bar has, rather
+than atuin's full-screen search or readline's blind one-at-a-time walk. What is
+typed is the query, and the list shows beneath the line the **five most recent
+distinct commands that contain it**, newest first — so `git ` then `Up` shows
+your last five `git …` lines, `push` shows the last five that pushed, and an
+empty line shows the last five commands. **Once those run out the match goes
+fuzzy**: the commands whose text has the query's characters *in order*, anything
+between, newest first again — `gst` finds `git status` — so a few letters
+reach a command without spelling it, and a literal match always outranks a
+loose one. Recency is the only rank within each: a command that *starts with*
+the query is not lifted above one that merely contains it, because the list is
+a walk back through what was run and a rank the eye cannot predict makes the
+walk stutter. (Held open: whether prefix matches should come first after all —
+the first cut did that — and whether the fuzzy rows want a score, `fzf`-style,
+rather than recency; only use will say.) The fuzzy match is a `GLOB` the store
+answers itself, `*g*s*t*`, so a long history is scanned in C rather than read
+out. Opening the list selects its first row and puts that command on the
+line, so `Up`, `Enter` still runs the most recent match with nothing new to
+learn: the list is the walk made visible, not a mode. **The key that opened the
+list walks it** (toward older matches) **and the other key walks back** — `Up`
+`Up` `Enter` and `Down` `Down` `Enter` both run the second match, so a readline
+hand and a browser hand each keep their habit. The line follows the selection,
+walking back past the first row restores what was typed, and walking back once
+more closes the list. `Enter` runs the line; `Tab`, `Esc`, a cursor motion, or
+a deletion close the list and leave the line to edit — it is yours again the
+moment you change it rather than add to it; typing more narrows the list to the
+new text with nothing selected, and a query with no matches shows no list at all.
+Matching is a plain case-sensitive text match — the query is a command being
+retyped, not a search — and what the list shows is never written back: only what
+runs is history. The list draws **below** the line because that is where a
+terminal has room: the prompt sits at the bottom of the screen, and a list above
+it would cover what the last command printed. Five rows because that is a glance,
+not a page — the list is for the command you ran a moment ago, and `Ctrl-R` stays
+for the one you ran last month.
 
 **Recall and expansion draw from your session plus finished history.** `Up`,
 `Ctrl-R`, `Alt-.`, and the `!!` / `!$` / `!string` expansions all select from one
@@ -7249,7 +7279,9 @@ to avoid" rather than promising the latter as done.
   ([Interactive history](#interactive-history)): a **SQLite** store at
   `$XDG_STATE_HOME/mesh/history.sqlite3` with rich per-entry columns
   (command / cwd / tty / session / start / duration / status) populated by
-  `preexec` / `postexec`; recall via up/down and `Ctrl-R`; a `history` built-in
+  `preexec` / `postexec`; recall via the up/down **history list** — the five
+  most recent commands containing the line, beneath it, the opening key walking it —
+  and `Ctrl-R`; a `history` built-in
   plus `history | grep` as the MVP search. Remaining: fuzzy search, a
   `$sh.history` accessor, cross-session sync, dedup policy, and secret redaction.
 - **Interactive signals — decided** ([Signals](#signals)): interactive defaults
