@@ -37,7 +37,9 @@ use crate::builtins::{self, Builtin, Multiplexer, NOTIFY_LIMIT};
 use crate::completion::{CompletionCache, CompletionSpec, ValueHint, man_pages, rank_candidates};
 use crate::expand::{Piece, VarRef, Word};
 use crate::funcs::{self, FuncDef, Funcs};
-use crate::history_list::{HISTORY_LIST, HistoryMenu, Reader, SharedHistory, match_ranges};
+use crate::history_list::{
+    HISTORY_LIST, HistoryMenu, MeshHistory, Reader, SharedHistory, match_ranges,
+};
 #[cfg(test)]
 use crate::hooks::Hook;
 use crate::hooks::HookEvent;
@@ -836,6 +838,12 @@ impl<H: History> History for TimestampedHistory<H> {
 
     fn session(&self) -> Option<HistorySessionId> {
         self.0.session()
+    }
+}
+
+impl<H: MeshHistory> MeshHistory for TimestampedHistory<H> {
+    fn mark_command(&mut self, id: HistoryItemId) {
+        self.0.mark_command(id);
     }
 }
 
@@ -16007,28 +16015,62 @@ struct ArgumentRecall {
 }
 
 impl ArgumentRecall {
-    fn load(&mut self, history: &dyn History, session: Option<HistorySessionId>) {
-        let Ok(entries) =
-            history.search(SearchQuery::everything(SearchDirection::Backward, session))
-        else {
-            return;
-        };
-        let mut pending_by_session: Vec<(Option<HistorySessionId>, String)> = Vec::new();
-        for entry in entries.into_iter().rev() {
-            let index = pending_by_session
-                .iter()
-                .position(|(session, _)| *session == entry.session_id)
-                .unwrap_or_else(|| {
-                    pending_by_session.push((entry.session_id, String::new()));
-                    pending_by_session.len() - 1
-                });
-            let pending = &mut pending_by_session[index].1;
-            pending.push_str(&entry.command_line);
-            pending.push('\n');
-            if !needs_more_input(pending) {
-                self.remember(pending.trim_end_matches('\n'));
-                pending.clear();
+    /// How many recent commands last-argument recall keeps. `!$` wants the
+    /// newest, `Alt-.` walks back a handful, so a small cap is plenty and one
+    /// indexed query fills it however large the store — where scanning and
+    /// parsing every row once cost a debug build tens of seconds to the first
+    /// prompt on a 100k-row history.
+    const RECENT: usize = 256;
+
+    /// Load the newest finalized commands from a SQLite history store.
+    ///
+    /// Each finalized command is one row with a non-null `more_info` mark (see
+    /// [`SharedHistory::mark_command`]): a single-line command is reedline's own
+    /// row, a multi-line command the one row `persist_logical_history` collapses
+    /// it to. Recall reads only marked rows, so a command is never reassembled
+    /// from raw per-line rows and an in-flight or crashed fragment (unmarked) is
+    /// simply not recalled. The `more_info IS NOT NULL` test reads the mark's
+    /// presence alone, so a row with malformed `more_info` cannot break the read.
+    ///
+    /// The filter is the reader's: this session's rows plus every row from
+    /// before it began, so a peer session's later commands stay out of recall.
+    /// A read failure warns and leaves recall empty rather than aborting
+    /// startup.
+    fn load(
+        &mut self,
+        conn: &rusqlite::Connection,
+        session: Option<HistorySessionId>,
+        started: Option<chrono::DateTime<chrono::Utc>>,
+    ) {
+        let (session_id, started) = session
+            .zip(started)
+            .map(|(session, started)| (i64::from(session), started.timestamp_millis()))
+            .unzip();
+        let commands = conn
+            .prepare(
+                "SELECT command_line FROM history \
+                 WHERE more_info IS NOT NULL \
+                   AND (?1 IS NULL OR session_id = ?1 OR start_timestamp < ?2) \
+                 ORDER BY id DESC LIMIT ?3",
+            )
+            .and_then(|mut statement| {
+                statement
+                    .query_map(
+                        rusqlite::params![session_id, started, Self::RECENT as i64],
+                        |row| row.get::<_, String>(0),
+                    )?
+                    .collect::<rusqlite::Result<Vec<String>>>()
+            });
+        match commands {
+            // The query returns newest first; `remember` them oldest first so
+            // `previous` ends up the newest and `arguments` in the order
+            // `Alt-.` walks them.
+            Ok(commands) => {
+                for command in commands.into_iter().rev() {
+                    self.remember(&command);
+                }
             }
+            Err(err) => note!("mesh: could not read history for recall: {err}"),
         }
     }
 
@@ -16078,6 +16120,10 @@ impl ArgumentRecall {
     }
 }
 
+/// Bring the history store into line with a completed command and, when one
+/// completed, return the id of its single row so the caller can mark it a
+/// finalized command (on the store's own connection — see
+/// [`SharedHistory::mark_command`]). `None` means nothing to mark.
 fn persist_logical_history(
     history: &mut dyn History,
     session: Option<HistorySessionId>,
@@ -16086,12 +16132,20 @@ fn persist_logical_history(
     gate: &HeredocGate,
     saved_submissions: usize,
     rewritten: bool,
-) -> reedline::Result<()> {
+) -> reedline::Result<Option<HistoryItemId>> {
     // A single physical line reedline already stored verbatim needs no work
     // unless history expansion rewrote it, in which case the stored raw row is
-    // replaced below with the expanded command the shell actually ran.
+    // replaced below with the expanded command the shell actually ran. When the
+    // line completed a nonempty command, return its row — reedline's newest — to
+    // mark. An incomplete first line (`func f() {`) is a fragment a later line
+    // finishes, so marking waits for that; an empty Enter saved no row at all,
+    // and marking then would land on the previous row — perhaps an unmarked
+    // fragment from a crashed session — so it too is left alone.
     if pending.is_empty() && !rewritten {
-        return Ok(());
+        return match completed_command(signal, pending, gate) {
+            Some(command) if !command.trim().is_empty() => newest_row(history, session),
+            _ => Ok(None),
+        };
     }
     let completed = completed_command(signal, pending, gate);
     // `Ctrl-C` is the only abandonment: it drops the buffer, so the raw rows
@@ -16105,7 +16159,7 @@ fn persist_logical_history(
     // it. `Ctrl-D` on an empty buffer exits and never reaches this line: it
     // returns above, where `pending` is empty.
     if completed.is_none() && !matches!(signal, Signal::CtrlC) {
-        return Ok(());
+        return Ok(None);
     }
 
     remove_recent_history_rows(history, session, saved_submissions)?;
@@ -16116,9 +16170,29 @@ fn persist_logical_history(
     if let Some(command) = completed.filter(|command| !command.trim().is_empty()) {
         let mut item = HistoryItem::from_command_line(command);
         item.session_id = session;
-        history.save(item)?;
+        // The collapsed multi-line (or expanded) command is one row now; return
+        // it to mark, so recall reads it without seeing the raw lines it replaced.
+        return Ok(history.save(item)?.id);
     }
-    Ok(())
+    Ok(None)
+}
+
+/// The id of the newest row, the one reedline saved for the command just
+/// submitted — it has the largest id, so it leads a backward search. Read on
+/// the store's own connection, so the just-written row is always in view. A
+/// read that fails is reported through [`persist_logical_history`]'s `Result`,
+/// not swallowed, so the caller can warn rather than silently drop the mark.
+fn newest_row(
+    history: &dyn History,
+    session: Option<HistorySessionId>,
+) -> reedline::Result<Option<HistoryItemId>> {
+    let mut query = SearchQuery::everything(SearchDirection::Backward, session);
+    query.limit = Some(1);
+    Ok(history
+        .search(query)?
+        .into_iter()
+        .next()
+        .and_then(|entry| entry.id))
 }
 
 /// Delete the `count` most recent rows for `session`, newest first. Reassembly
@@ -16524,7 +16598,21 @@ fn run_interactive(options: &StartupOptions) -> ExitCode {
             .and_then(|()| open_history(path.clone(), session, session_started));
         match opened {
             Ok(opened) => {
-                argument_recall.load(&opened, session);
+                // Seed recall over a short read-only connection: it reads only
+                // finalized commands committed by earlier sessions, which are
+                // durable by now, so the WAL visibility gap that stops a second
+                // connection from seeing *this* session's fresh writes cannot
+                // bite. This session's own commands reach recall in memory as
+                // they run, and its marks (written on the shared connection)
+                // are for the next session.
+                match rusqlite::Connection::open_with_flags(
+                    &path,
+                    rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
+                        | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+                ) {
+                    Ok(seed) => argument_recall.load(&seed, session, session_started),
+                    Err(err) => note!("mesh: could not open history for recall: {err}"),
+                }
                 history_session = session;
                 history = Some(SharedHistory::new(opened));
                 reader = Reader::open(&path, session, session_started);
@@ -16534,6 +16622,9 @@ fn run_interactive(options: &StartupOptions) -> ExitCode {
     }
     let history =
         history.unwrap_or_else(|| SharedHistory::new(reedline::FileBackedHistory::default()));
+    // A handle on the shared store for marking each finalized command, on the
+    // store's own connection (see `SharedHistory::mark_command`).
+    let command_marks = history.clone();
     let history_menu = HistoryMenu::new(history.clone(), reader);
     let edit_mode = EscapePrefix::new(interactive_keybindings(), history_menu.active_flag());
     let search_state = edit_mode.search_state();
@@ -16710,8 +16801,8 @@ fn run_interactive(options: &StartupOptions) -> ExitCode {
                     pending_history_rows += 1;
                 }
                 let completed_command = completed_command(&signal, &pending, &gate);
-                if let Some(session) = history_session
-                    && let Err(err) = persist_logical_history(
+                if let Some(session) = history_session {
+                    match persist_logical_history(
                         editor.history_mut(),
                         Some(session),
                         &signal,
@@ -16719,9 +16810,13 @@ fn run_interactive(options: &StartupOptions) -> ExitCode {
                         &gate,
                         pending_history_rows,
                         rewritten,
-                    )
-                {
-                    note!("mesh: could not update history database: {err}");
+                    ) {
+                        // Mark the finalized command's row on the shared store's
+                        // own connection, so the next session's recall reads it.
+                        Ok(Some(id)) => command_marks.mark_command(id),
+                        Ok(None) => {}
+                        Err(err) => note!("mesh: could not update history database: {err}"),
+                    }
                 }
                 match handle_signal(signal, last, &mut shell, &mut pending, &mut gate) {
                     None => continue, // an unfinished `func` body: read the next line
@@ -18695,8 +18790,8 @@ mod tests {
 
     use super::{
         ArgumentRecall, CommandLine, CompletionState, EscapePrefix, HISTORY_LIST, HeredocGate,
-        Hook, HookEvent, Integration, Invocation, Lookup, MeshPrompt, NOTIFY_LIMIT, PromptMarkers,
-        SemanticMark, Shell, StartupOptions, Step, TITLE_LIMIT, TYPE_MARKER_WORDS,
+        Hook, HookEvent, Integration, Invocation, Lookup, MeshHistory, MeshPrompt, NOTIFY_LIMIT,
+        PromptMarkers, SemanticMark, Shell, StartupOptions, Step, TITLE_LIMIT, TYPE_MARKER_WORDS,
         TimestampedHistory, argument_completions, body_awaits_close, command_line,
         command_notification, command_position, command_segment_words, command_words,
         completed_command, deferred_words, duration_words, escape_stripped_width, eval_binary,
@@ -18775,14 +18870,15 @@ mod tests {
     use crate::vars::Value;
     use crossterm::event::{Event, KeyEvent};
     use reedline::{
-        EditCommand, EditMode, Highlighter, History, HistoryItem, KeyCode, KeyModifiers, Prompt,
-        PromptEditMode, PromptKind, Reedline, ReedlineEvent, ReedlineRawEvent, SearchDirection,
-        SearchQuery, SemanticPromptMarkers, Signal, SqliteBackedHistory,
+        EditCommand, EditMode, Highlighter, History, HistoryItem, HistorySessionId, KeyCode,
+        KeyModifiers, Prompt, PromptEditMode, PromptKind, Reedline, ReedlineEvent,
+        ReedlineRawEvent, SearchDirection, SearchQuery, SemanticPromptMarkers, Signal,
+        SqliteBackedHistory,
     };
     use std::ffi::OsStr;
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use std::sync::Arc;
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -19240,6 +19336,65 @@ mod tests {
         fs::remove_dir_all(path.ancestors().nth(3).unwrap()).unwrap();
     }
 
+    /// A connection to the store for marking finalized commands and seeding
+    /// recall, the way `run_interactive` keeps one beside reedline's writer.
+    fn open_marks(path: &Path) -> rusqlite::Connection {
+        rusqlite::Connection::open(path).unwrap()
+    }
+
+    /// Save `command` as the one finalized, marked row a completed command
+    /// leaves behind, so recall reads it — marking on the store's own
+    /// connection, as the shell does.
+    fn save_finalized(
+        saved: &mut TimestampedHistory<SqliteBackedHistory>,
+        session: Option<HistorySessionId>,
+        command: &str,
+    ) {
+        let mut item = HistoryItem::from_command_line(command);
+        item.session_id = session;
+        let id = saved.save(item).unwrap().id;
+        if let Some(id) = id {
+            saved.mark_command(id);
+        }
+    }
+
+    /// Persist a submitted line and mark the finalized command it leaves, the
+    /// way the read loop does.
+    #[allow(clippy::too_many_arguments)]
+    fn persist_and_mark(
+        saved: &mut TimestampedHistory<SqliteBackedHistory>,
+        session: Option<HistorySessionId>,
+        signal: &Signal,
+        pending: &str,
+        gate: &HeredocGate,
+        saved_submissions: usize,
+        rewritten: bool,
+    ) -> reedline::Result<()> {
+        if let Some(id) = persist_logical_history(
+            saved,
+            session,
+            signal,
+            pending,
+            gate,
+            saved_submissions,
+            rewritten,
+        )? {
+            saved.mark_command(id);
+        }
+        Ok(())
+    }
+
+    /// A load time fixed well after any row these tests save, so recall's
+    /// `start_timestamp < started` filter includes them without depending on
+    /// wall-clock ordering (an equal-millisecond save and load used to drop
+    /// rows). `before_all` is fixed well before, for the peer-exclusion test.
+    fn after_all() -> SystemTime {
+        UNIX_EPOCH + Duration::from_secs(32_000_000_000)
+    }
+    fn before_all() -> SystemTime {
+        UNIX_EPOCH + Duration::from_secs(1_000_000)
+    }
+
     #[test]
     fn history_recall_excludes_commands_started_by_newer_peer_sessions() {
         let path = temporary_history_path("history.sqlite3");
@@ -19253,85 +19408,39 @@ mod tests {
             )
             .unwrap(),
         );
-        std::thread::sleep(Duration::from_millis(2));
         let current_session = Reedline::create_history_session_id();
-        let current = SqliteBackedHistory::with_file(
-            path.clone(),
-            current_session,
-            Some(SystemTime::now().into()),
-        )
-        .unwrap();
-
-        let mut item = HistoryItem::from_command_line("peer secret");
-        item.session_id = peer_session;
-        peer.save(item).unwrap();
+        // A finalized peer command whose row is stamped now — after
+        // `before_all` — so the session/time filter keeps it out of recall;
+        // it is a real marked row, excluded on the relationship, not for
+        // being unmarked.
+        save_finalized(&mut peer, peer_session, "peer secret");
 
         let mut recall = ArgumentRecall::default();
-        recall.load(&current, current_session);
+        recall.load(
+            &open_marks(&path),
+            current_session,
+            Some(before_all().into()),
+        );
         assert!(recall.arguments.is_empty());
 
-        drop(current);
         drop(peer);
         fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
 
     #[test]
-    fn history_recall_reassembles_persisted_multiline_commands() {
+    fn history_recall_reads_finalized_commands_not_raw_fragments() {
         let path = temporary_history_path("history.sqlite3");
         prepare_history_path(&path).unwrap();
-        let saved_session = Reedline::create_history_session_id();
+        let session = Reedline::create_history_session_id();
         let mut saved = TimestampedHistory(
-            SqliteBackedHistory::with_file(
-                path.clone(),
-                saved_session,
-                Some(SystemTime::now().into()),
-            )
-            .unwrap(),
+            SqliteBackedHistory::with_file(path.clone(), session, Some(SystemTime::now().into()))
+                .unwrap(),
         );
-        for line in ["puts public", "func f() {", "puts secret", "}"] {
-            let mut item = HistoryItem::from_command_line(line);
-            item.session_id = saved_session;
-            saved.save(item).unwrap();
-        }
-        drop(saved);
-
-        std::thread::sleep(Duration::from_millis(2));
-        let current_session = Reedline::create_history_session_id();
-        let current = SqliteBackedHistory::with_file(
-            path.clone(),
-            current_session,
-            Some(SystemTime::now().into()),
-        )
-        .unwrap();
-        let mut recall = ArgumentRecall::default();
-        recall.load(&current, current_session);
-
-        assert_eq!(recall.arguments, ["public"]);
-
-        drop(current);
-        fs::remove_dir_all(path.parent().unwrap()).unwrap();
-    }
-
-    #[test]
-    fn history_recall_reassembles_interleaved_sessions_independently() {
-        let path = temporary_history_path("history.sqlite3");
-        prepare_history_path(&path).unwrap();
-        let first_session = Reedline::create_history_session_id();
-        let second_session = Reedline::create_history_session_id();
-        let mut saved = TimestampedHistory(
-            SqliteBackedHistory::with_file(
-                path.clone(),
-                first_session,
-                Some(SystemTime::now().into()),
-            )
-            .unwrap(),
-        );
-        for (session, line) in [
-            (first_session, "func f() {"),
-            (second_session, "puts public"),
-            (first_session, "puts secret"),
-            (first_session, "}"),
-        ] {
+        // A finished command is one marked row and is recalled. Raw per-line
+        // rows left by a session still typing (or gone) are unmarked and are
+        // not, so a body line never reaches recall as a command of its own.
+        save_finalized(&mut saved, session, "puts public");
+        for line in ["func f() {", "puts secret", "}"] {
             let mut item = HistoryItem::from_command_line(line);
             item.session_id = session;
             saved.save(item).unwrap();
@@ -19339,17 +19448,101 @@ mod tests {
         drop(saved);
 
         let current_session = Reedline::create_history_session_id();
-        let current = SqliteBackedHistory::with_file(
-            path.clone(),
-            current_session,
-            Some(SystemTime::now().into()),
-        )
-        .unwrap();
         let mut recall = ArgumentRecall::default();
-        recall.load(&current, current_session);
+        recall.load(
+            &open_marks(&path),
+            current_session,
+            Some(after_all().into()),
+        );
 
         assert_eq!(recall.arguments, ["public"]);
-        drop(current);
+        assert!(
+            !recall.arguments.iter().any(|argument| argument == "secret"),
+            "a raw body line is not recalled as a command"
+        );
+        fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn history_recall_ignores_an_empty_submission() {
+        let path = temporary_history_path("history.sqlite3");
+        prepare_history_path(&path).unwrap();
+        let session = Reedline::create_history_session_id();
+        let mut saved = TimestampedHistory(
+            SqliteBackedHistory::with_file(path.clone(), session, Some(SystemTime::now().into()))
+                .unwrap(),
+        );
+        // A raw, unmarked fragment left by an earlier crashed session.
+        let mut item = HistoryItem::from_command_line("puts leaked");
+        item.session_id = session;
+        saved.save(item).unwrap();
+        // Enter on an empty prompt: reedline saves no row, so marking must not
+        // fall back to the previous (fragment) row.
+        persist_and_mark(
+            &mut saved,
+            session,
+            &Signal::Success(String::new()),
+            "",
+            &HeredocGate::default(),
+            0,
+            false,
+        )
+        .unwrap();
+        drop(saved);
+
+        let current_session = Reedline::create_history_session_id();
+        let mut recall = ArgumentRecall::default();
+        recall.load(
+            &open_marks(&path),
+            current_session,
+            Some(after_all().into()),
+        );
+
+        assert!(
+            recall.arguments.is_empty(),
+            "an empty submission marks nothing, so the fragment stays out of recall"
+        );
+        fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn history_recall_reads_only_the_newest_commands_of_a_long_history() {
+        let path = temporary_history_path("history.sqlite3");
+        prepare_history_path(&path).unwrap();
+        let session = Reedline::create_history_session_id();
+        let mut saved = TimestampedHistory(
+            SqliteBackedHistory::with_file(path.clone(), session, Some(SystemTime::now().into()))
+                .unwrap(),
+        );
+        let total = ArgumentRecall::RECENT + 50;
+        for n in 0..total {
+            save_finalized(&mut saved, session, &format!("echo arg{n}"));
+        }
+        drop(saved);
+
+        let current_session = Reedline::create_history_session_id();
+        let mut recall = ArgumentRecall::default();
+        recall.load(
+            &open_marks(&path),
+            current_session,
+            Some(after_all().into()),
+        );
+
+        // Bounded to the newest RECENT, newest last, so `!$` is the last
+        // command and older ones fall off the front.
+        assert_eq!(recall.arguments.len(), ArgumentRecall::RECENT);
+        assert_eq!(
+            recall.previous(),
+            Some(format!("echo arg{}", total - 1)).as_deref()
+        );
+        assert_eq!(
+            recall.arguments.first().unwrap(),
+            &format!("arg{}", total - ArgumentRecall::RECENT)
+        );
+        assert_eq!(
+            recall.arguments.last().unwrap(),
+            &format!("arg{}", total - 1)
+        );
         fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
 
@@ -19357,29 +19550,25 @@ mod tests {
     fn history_recall_reloads_persisted_logical_multiline_commands() {
         let path = temporary_history_path("history.sqlite3");
         prepare_history_path(&path).unwrap();
-        let saved_session = Reedline::create_history_session_id();
+        let session = Reedline::create_history_session_id();
         let mut saved = TimestampedHistory(
-            SqliteBackedHistory::with_file(
-                path.clone(),
-                saved_session,
-                Some(SystemTime::now().into()),
-            )
-            .unwrap(),
+            SqliteBackedHistory::with_file(path.clone(), session, Some(SystemTime::now().into()))
+                .unwrap(),
         );
         let mut pending = String::new();
         for line in ["func f() {", "puts secret"] {
             let mut item = HistoryItem::from_command_line(line);
-            item.session_id = saved_session;
+            item.session_id = session;
             saved.save(item).unwrap();
             pending.push_str(line);
             pending.push('\n');
         }
         let mut item = HistoryItem::from_command_line("}");
-        item.session_id = saved_session;
+        item.session_id = session;
         saved.save(item).unwrap();
-        persist_logical_history(
+        persist_and_mark(
             &mut saved,
-            saved_session,
+            session,
             &Signal::Success("}".into()),
             &pending,
             &HeredocGate::default(),
@@ -19390,17 +19579,18 @@ mod tests {
         drop(saved);
 
         let current_session = Reedline::create_history_session_id();
-        let current = SqliteBackedHistory::with_file(
-            path.clone(),
-            current_session,
-            Some(SystemTime::now().into()),
-        )
-        .unwrap();
         let mut recall = ArgumentRecall::default();
-        recall.load(&current, current_session);
+        recall.load(
+            &open_marks(&path),
+            current_session,
+            Some(after_all().into()),
+        );
 
+        // The command is `func f() {\nputs secret\n}`; a function header has no
+        // trailing argument, so it recalls as a command with none — never the
+        // body line `secret`.
         assert!(recall.arguments.is_empty());
-        drop(current);
+        assert_eq!(recall.previous(), Some("func f() {\nputs secret\n}"));
         fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
 
@@ -19408,23 +19598,19 @@ mod tests {
     fn history_recall_reloads_multiline_command_arguments() {
         let path = temporary_history_path("history.sqlite3");
         prepare_history_path(&path).unwrap();
-        let saved_session = Reedline::create_history_session_id();
+        let session = Reedline::create_history_session_id();
         let mut saved = TimestampedHistory(
-            SqliteBackedHistory::with_file(
-                path.clone(),
-                saved_session,
-                Some(SystemTime::now().into()),
-            )
-            .unwrap(),
+            SqliteBackedHistory::with_file(path.clone(), session, Some(SystemTime::now().into()))
+                .unwrap(),
         );
         for line in ["puts \"first", "followed by last\""] {
             let mut item = HistoryItem::from_command_line(line);
-            item.session_id = saved_session;
+            item.session_id = session;
             saved.save(item).unwrap();
         }
-        persist_logical_history(
+        persist_and_mark(
             &mut saved,
-            saved_session,
+            session,
             &Signal::Success("followed by last\"".into()),
             "puts \"first\n",
             &HeredocGate::default(),
@@ -19435,17 +19621,14 @@ mod tests {
         drop(saved);
 
         let current_session = Reedline::create_history_session_id();
-        let current = SqliteBackedHistory::with_file(
-            path.clone(),
-            current_session,
-            Some(SystemTime::now().into()),
-        )
-        .unwrap();
         let mut recall = ArgumentRecall::default();
-        recall.load(&current, current_session);
+        recall.load(
+            &open_marks(&path),
+            current_session,
+            Some(after_all().into()),
+        );
 
         assert_eq!(recall.arguments, ["\"first\nfollowed by last\""]);
-        drop(current);
         fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
 
@@ -19453,21 +19636,19 @@ mod tests {
     fn history_recall_preserves_boundary_after_cancel_and_reload() {
         let path = temporary_history_path("history.sqlite3");
         prepare_history_path(&path).unwrap();
-        let saved_session = Reedline::create_history_session_id();
+        let session = Reedline::create_history_session_id();
         let mut saved = TimestampedHistory(
-            SqliteBackedHistory::with_file(
-                path.clone(),
-                saved_session,
-                Some(SystemTime::now().into()),
-            )
-            .unwrap(),
+            SqliteBackedHistory::with_file(path.clone(), session, Some(SystemTime::now().into()))
+                .unwrap(),
         );
+        // A multi-line command abandoned with Ctrl-C: reedline's raw line is
+        // dropped and nothing is marked.
         let mut item = HistoryItem::from_command_line("func f() {");
-        item.session_id = saved_session;
+        item.session_id = session;
         saved.save(item).unwrap();
-        persist_logical_history(
+        persist_and_mark(
             &mut saved,
-            saved_session,
+            session,
             &Signal::CtrlC,
             "func f() {\n",
             &HeredocGate::default(),
@@ -19475,23 +19656,19 @@ mod tests {
             false,
         )
         .unwrap();
-        let mut item = HistoryItem::from_command_line("puts public");
-        item.session_id = saved_session;
-        saved.save(item).unwrap();
+        // Then a finished single-line command, whose row is marked.
+        save_finalized(&mut saved, session, "puts public");
         drop(saved);
 
         let current_session = Reedline::create_history_session_id();
-        let current = SqliteBackedHistory::with_file(
-            path.clone(),
-            current_session,
-            Some(SystemTime::now().into()),
-        )
-        .unwrap();
         let mut recall = ArgumentRecall::default();
-        recall.load(&current, current_session);
+        recall.load(
+            &open_marks(&path),
+            current_session,
+            Some(after_all().into()),
+        );
 
         assert_eq!(recall.arguments, ["public"]);
-        drop(current);
         fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
 
@@ -19499,23 +19676,23 @@ mod tests {
     fn logical_history_counts_saved_submissions_not_pending_lines() {
         let path = temporary_history_path("history.sqlite3");
         prepare_history_path(&path).unwrap();
-        let saved_session = Reedline::create_history_session_id();
+        let session = Reedline::create_history_session_id();
         let mut saved = TimestampedHistory(
-            SqliteBackedHistory::with_file(
-                path.clone(),
-                saved_session,
-                Some(SystemTime::now().into()),
-            )
-            .unwrap(),
+            SqliteBackedHistory::with_file(path.clone(), session, Some(SystemTime::now().into()))
+                .unwrap(),
         );
-        for line in ["puts public", "func f() {", "}"] {
+        // An earlier finished command, then a multi-line command: only the
+        // multi-line command's two raw rows are removed and replaced, not the
+        // finished command before them.
+        save_finalized(&mut saved, session, "puts public");
+        for line in ["func f() {", "}"] {
             let mut item = HistoryItem::from_command_line(line);
-            item.session_id = saved_session;
+            item.session_id = session;
             saved.save(item).unwrap();
         }
-        persist_logical_history(
+        persist_and_mark(
             &mut saved,
-            saved_session,
+            session,
             &Signal::Success("}".into()),
             "func f() {\n\n",
             &HeredocGate::default(),
@@ -19526,17 +19703,16 @@ mod tests {
         drop(saved);
 
         let current_session = Reedline::create_history_session_id();
-        let current = SqliteBackedHistory::with_file(
-            path.clone(),
-            current_session,
-            Some(SystemTime::now().into()),
-        )
-        .unwrap();
         let mut recall = ArgumentRecall::default();
-        recall.load(&current, current_session);
+        recall.load(
+            &open_marks(&path),
+            current_session,
+            Some(after_all().into()),
+        );
 
+        // `func f() {\n}` has no trailing argument; `public` survived the
+        // collapse, so recall still has it.
         assert_eq!(recall.arguments, ["public"]);
-        drop(current);
         fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
 
@@ -19563,7 +19739,7 @@ mod tests {
         }
         // Ctrl-D at the continuation prompt: no-op, and the count of raw rows
         // carries across it because the loop `continue`s without resetting it.
-        persist_logical_history(
+        persist_and_mark(
             &mut saved,
             session,
             &Signal::CtrlD,
@@ -19585,7 +19761,7 @@ mod tests {
         let mut item = HistoryItem::from_command_line("}");
         item.session_id = session;
         saved.save(item).unwrap();
-        persist_logical_history(
+        persist_and_mark(
             &mut saved,
             session,
             &Signal::Success("}".into()),
@@ -19621,7 +19797,7 @@ mod tests {
         item.session_id = session;
         saved.save(item).unwrap();
         // History expansion ran `cd foo`, so the stored row must become that.
-        persist_logical_history(
+        persist_and_mark(
             &mut saved,
             session,
             &Signal::Success("cd foo".into()),
@@ -19657,7 +19833,7 @@ mod tests {
         let mut item = HistoryItem::from_command_line(" !* ");
         item.session_id = session;
         saved.save(item).unwrap();
-        persist_logical_history(
+        persist_and_mark(
             &mut saved,
             session,
             &Signal::Success("  ".to_owned()),
@@ -19689,7 +19865,7 @@ mod tests {
         item.session_id = session;
         let id = saved.save(item).unwrap().id;
         // A command with no expansion keeps reedline's original row (and its id).
-        persist_logical_history(
+        persist_and_mark(
             &mut saved,
             session,
             &Signal::Success("ls -l".into()),

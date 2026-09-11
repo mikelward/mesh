@@ -2132,13 +2132,6 @@ all under "Beyond M3 — External tool integration".
         (Codex). Fix: cap the window to that budget in both `menu_string` and
         `menu_required_lines` — they have to agree, so the cap is a field set
         at paint, not a parameter one of them reads.
-- [ ] **Startup reads the whole history.** `ArgumentRecall::load` (`repl.rs`)
-      fetches every row and runs `needs_more_input` over each to reassemble
-      multi-line commands, so a 100k-row store takes a debug build about 20
-      seconds to reach the first prompt (found padding a store to time the
-      history list's `GLOB`, which itself answers in about 10 ms). It wants
-      the last few *complete* commands, not all of them: read backward a page
-      at a time and stop once one has been assembled per live session.
 - [ ] **The `history` built-in.** `DESIGN.md` §"Interactive history" calls a
       listing built-in *the MVP surface* — entries newest last, and
       `history | grep foo` as the search — and it does not exist: nothing
