@@ -2120,6 +2120,13 @@ all under "Beyond M3 — External tool integration".
         row. Deferred from #554 (Codex). Fix: replace control characters with
         a visible placeholder before measuring, as the title code already
         does for `title`.
+      - **A terminal shorter than the list gets every row anyway.** reedline
+        hands `menu_string` the rows left on the screen (`available_lines`)
+        and the list ignores it, so after a resize to a very short terminal
+        the five rows can scroll or overwrite the prompt. Deferred from #554
+        (Codex). Fix: cap the window to that budget in both `menu_string` and
+        `menu_required_lines` — they have to agree, so the cap is a field set
+        at paint, not a parameter one of them reads.
 - [ ] **Startup reads the whole history.** `ArgumentRecall::load` (`repl.rs`)
       fetches every row and runs `needs_more_input` over each to reassemble
       multi-line commands, so a 100k-row store takes a debug build about 20
