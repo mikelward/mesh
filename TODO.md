@@ -2524,7 +2524,10 @@ designed, and the cross-references say where the fuller note lives.
       dodge it; it now uses `_cmd_elapsed`, the name the convention asks for.
 - [ ] **Hint and highlighter hooks.** Not external tools, but the
       zsh-autosuggestions / syntax-highlighting experience users arrive
-      expecting. reedline supports both and mesh exposes neither.
+      expecting. reedline supports both and mesh exposes neither. The
+      maintainer's rule for the ghost text when it comes: what was typed
+      is bold, the ghost is normal weight — the history list already draws a
+      recalled line that way (`InputHighlighter`, `repl.rs`).
 - [ ] **The history question atuin forces.** mesh's SQLite store already carries
       most of atuin's schema, so "integrate atuin" splits in two: *atuin's UI
       over mesh's store* (needs `$sh.history` or a documented on-disk contract;

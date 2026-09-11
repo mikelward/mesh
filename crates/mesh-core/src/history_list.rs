@@ -607,7 +607,7 @@ fn truncate(text: &str, width: usize) -> String {
 /// occurrence when `text` contains it, else each of its characters at the
 /// first place it can stand, runs of neighbors merged. Nothing for an empty
 /// query, or for a match the row's truncation cut away.
-fn match_ranges(text: &str, query: &str) -> Vec<(usize, usize)> {
+pub(crate) fn match_ranges(text: &str, query: &str) -> Vec<(usize, usize)> {
     if query.is_empty() {
         return Vec::new();
     }
@@ -648,6 +648,10 @@ pub(crate) struct HistoryMenu {
     width: u16,
     /// The visible rows as reedline's own type, for `get_values`.
     values: Vec<Suggestion>,
+    /// What was typed, while a selected row stands on the line — for the
+    /// highlighter, which draws that part bold and the rest of the recalled
+    /// command in normal weight. `None` whenever the line is the user's own.
+    recalled_from: Arc<Mutex<Option<String>>>,
 }
 
 impl HistoryMenu {
@@ -659,6 +663,7 @@ impl HistoryMenu {
             synced: None,
             width: 80,
             values: Vec::new(),
+            recalled_from: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -667,12 +672,34 @@ impl HistoryMenu {
         Arc::clone(&self.active)
     }
 
+    /// The typed text behind a recalled line, for the highlighter; see
+    /// [`Self::recalled_from`].
+    pub(crate) fn recalled_from(&self) -> Arc<Mutex<Option<String>>> {
+        Arc::clone(&self.recalled_from)
+    }
+
+    fn publish_recalled_from(&self) {
+        let typed = self
+            .is_active()
+            .then(|| {
+                self.list
+                    .selected_line()
+                    .map(|_| self.list.typed().to_owned())
+            })
+            .flatten();
+        *self
+            .recalled_from
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = typed;
+    }
+
     fn deactivate(&mut self) {
         self.active.store(false, Ordering::Relaxed);
         self.list.close();
         self.values.clear();
         self.events.clear();
         self.synced = None;
+        self.publish_recalled_from();
     }
 
     /// Put `line` on the line, cursor at its end, as recalling does.
@@ -697,6 +724,7 @@ impl HistoryMenu {
             // line the walk wrote rather than taking it for typing.
             self.sync(editor);
         }
+        self.publish_recalled_from();
     }
 
     fn sync(&mut self, editor: &Editor) {
@@ -1443,6 +1471,29 @@ mod tests {
             "git",
             "nothing selected: nothing to do"
         );
+    }
+
+    #[test]
+    fn the_typed_text_behind_a_recalled_line_is_published_for_the_highlighter() {
+        let (mut menu, mut editor) = menu(&["git push", "git status"], "git");
+        let recalled = menu.recalled_from();
+        let read = |recalled: &Arc<Mutex<Option<String>>>| recalled.lock().unwrap().clone();
+        assert_eq!(read(&recalled), None);
+        menu.menu_event(MenuEvent::Activate(false));
+        menu.apply(&mut editor);
+        assert_eq!(
+            read(&recalled),
+            Some("git".to_owned()),
+            "a row is on the line"
+        );
+        menu.menu_event(MenuEvent::MoveLeft);
+        menu.apply(&mut editor);
+        assert_eq!(read(&recalled), None, "the line is the user's own again");
+        menu.menu_event(MenuEvent::MoveDown);
+        menu.apply(&mut editor);
+        assert_eq!(read(&recalled), Some("git".to_owned()));
+        menu.menu_event(MenuEvent::Deactivate);
+        assert_eq!(read(&recalled), None);
     }
 
     #[test]

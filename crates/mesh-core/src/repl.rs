@@ -17,7 +17,7 @@ use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, OnceLock, RwLock, mpsc};
+use std::sync::{Arc, Mutex, OnceLock, RwLock, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -37,7 +37,7 @@ use crate::builtins::{self, Builtin, Multiplexer, NOTIFY_LIMIT};
 use crate::completion::{CompletionCache, CompletionSpec, ValueHint, man_pages, rank_candidates};
 use crate::expand::{Piece, VarRef, Word};
 use crate::funcs::{self, FuncDef, Funcs};
-use crate::history_list::{HISTORY_LIST, HistoryMenu, Reader, SharedHistory};
+use crate::history_list::{HISTORY_LIST, HistoryMenu, Reader, SharedHistory, match_ranges};
 #[cfg(test)]
 use crate::hooks::Hook;
 use crate::hooks::HookEvent;
@@ -16562,9 +16562,10 @@ fn run_interactive(options: &StartupOptions) -> ExitCode {
         .use_bracketed_paste(true)
         .with_edit_mode(Box::new(edit_mode))
         .with_quick_completions(true)
-        .with_highlighter(Box::new(input_highlighter(Arc::clone(
-            shell.vars.options(),
-        ))))
+        .with_highlighter(Box::new(input_highlighter(
+            Arc::clone(shell.vars.options()),
+            history_menu.recalled_from(),
+        )))
         .with_visual_selection_style(nu_ansi_term::Style::default())
         .with_menu(ReedlineMenu::EngineCompleter(Box::new(completion_menu)))
         // `HistoryMenu` rather than `WithCompleter`: the list reads the shared
@@ -17141,19 +17142,53 @@ impl EditMode for EscapePrefix {
 /// next keystroke rather than the next session: reedline is handed the
 /// highlighter when the editor is built, and there is no later chance to swap it.
 /// That is what the settings live behind an `Arc` for — see [`crate::options`].
+///
+/// While the history list has put a recalled command on the line, only what
+/// the user typed is drawn bold and the rest of the command in normal weight,
+/// so the line reads as typed text plus a suggestion — the way a ghost
+/// completion will read once there is one.
 struct InputHighlighter {
     options: Arc<Options>,
     bold: SimpleMatchHighlighter,
     plain: SimpleMatchHighlighter,
+    /// The history list's typed text while a recalled row stands on the line.
+    recalled_from: Arc<Mutex<Option<String>>>,
 }
 
 impl Highlighter for InputHighlighter {
     fn highlight(&self, line: &str, cursor: usize) -> StyledText {
-        if self.options.get(Opt::BoldInput) {
-            self.bold.highlight(line, cursor)
-        } else {
-            self.plain.highlight(line, cursor)
+        if !self.options.get(Opt::BoldInput) {
+            return self.plain.highlight(line, cursor);
         }
+        let recalled_from = self
+            .recalled_from
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        let Some(typed) = recalled_from else {
+            return self.bold.highlight(line, cursor);
+        };
+        // A row that matched nothing typed is all suggestion; a row that
+        // somehow stopped matching is drawn as the user's own.
+        let ranges = match_ranges(line, &typed);
+        if ranges.is_empty() && !typed.is_empty() {
+            return self.bold.highlight(line, cursor);
+        }
+        let bold = nu_ansi_term::Style::new().bold();
+        let plain = nu_ansi_term::Style::new();
+        let mut text = StyledText::new();
+        let mut at = 0;
+        for (start, end) in ranges {
+            if at < start {
+                text.push((plain, line[at..start].to_owned()));
+            }
+            text.push((bold, line[start..end].to_owned()));
+            at = end;
+        }
+        if at < line.len() {
+            text.push((plain, line[at..].to_owned()));
+        }
+        text
     }
 }
 
@@ -17204,9 +17239,13 @@ impl SemanticPromptMarkers for PromptMarkers {
     }
 }
 
-fn input_highlighter(options: Arc<Options>) -> InputHighlighter {
+fn input_highlighter(
+    options: Arc<Options>,
+    recalled_from: Arc<Mutex<Option<String>>>,
+) -> InputHighlighter {
     InputHighlighter {
         options,
+        recalled_from,
         // Bold and nothing else: weight, not color, so the line stays readable on
         // any theme and carries no syntax claim the shell would have to keep true.
         bold: SimpleMatchHighlighter::default()
@@ -18651,6 +18690,7 @@ impl Prompt for MeshPrompt {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Mutex;
     use std::sync::atomic::{AtomicBool, Ordering};
 
     use super::{
@@ -21827,11 +21867,55 @@ mod tests {
     #[test]
     fn interactive_input_is_bold_without_a_foreground_color() {
         let options = Arc::new(Options::default());
-        let highlighted = input_highlighter(options).highlight("puts hello", 10);
+        let highlighted =
+            input_highlighter(options, Arc::new(Mutex::new(None))).highlight("puts hello", 10);
 
         assert_eq!(highlighted.buffer.len(), 1);
         assert_eq!(highlighted.buffer[0].0, nu_ansi_term::Style::new().bold());
         assert_eq!(highlighted.buffer[0].1, "puts hello");
+    }
+
+    /// While the history list has a recalled command on the line, what was
+    /// typed stays bold and the rest of the command is drawn in normal weight.
+    #[test]
+    fn a_recalled_line_is_bold_only_where_it_was_typed() {
+        let bold = nu_ansi_term::Style::new().bold();
+        let plain = nu_ansi_term::Style::new();
+        let recalled_from = Arc::new(Mutex::new(Some("st".to_owned())));
+        let highlighter =
+            input_highlighter(Arc::new(Options::default()), Arc::clone(&recalled_from));
+        assert_eq!(
+            highlighter.highlight("git status", 10).buffer,
+            vec![
+                (plain, "git ".to_owned()),
+                (bold, "st".to_owned()),
+                (plain, "atus".to_owned())
+            ]
+        );
+        // A fuzzy match bolds each character where it stood.
+        *recalled_from.lock().unwrap() = Some("gs".to_owned());
+        assert_eq!(
+            highlighter.highlight("git status", 10).buffer,
+            vec![
+                (bold, "g".to_owned()),
+                (plain, "it ".to_owned()),
+                (bold, "s".to_owned()),
+                (plain, "tatus".to_owned())
+            ]
+        );
+        // Recalled from an empty line, nothing was typed: the whole command
+        // is the suggestion, in normal weight.
+        *recalled_from.lock().unwrap() = Some(String::new());
+        assert_eq!(
+            highlighter.highlight("git status", 10).buffer,
+            vec![(plain, "git status".to_owned())]
+        );
+        // Nothing recalled: the line is the user's own and all of it is bold.
+        *recalled_from.lock().unwrap() = None;
+        assert_eq!(
+            highlighter.highlight("git status", 10).buffer,
+            vec![(bold, "git status".to_owned())]
+        );
     }
 
     /// `A` and `B` go with `C` and `D`. A terminal handed the prompt's marks but
@@ -21870,7 +21954,7 @@ mod tests {
     #[test]
     fn turning_off_bold_input_reaches_the_highlighter_already_built() {
         let options = Arc::new(Options::default());
-        let highlighter = input_highlighter(Arc::clone(&options));
+        let highlighter = input_highlighter(Arc::clone(&options), Arc::new(Mutex::new(None)));
 
         options
             .assign(
