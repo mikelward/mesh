@@ -6379,10 +6379,33 @@ zsh solves this with a `zle-keymap-select` widget that redraws a mode indicator
 reactively. Decide how to surface the active keymap (e.g. a `$sh.keymap` a segment
 can read) plus the on-mode-change **redraw** a reactive indicator needs.)*
 
-*(deferred: exposing the **keybinding config** from `rc.mesh` — the whole reason
-for the library choice — plus a vi mode, custom widgets, fish-style
-autosuggestions, and syntax highlighting.)* Completion runs *through* the editor's
-menu; its model is the next section.
+**Ghost text** is the fish-style autosuggestion: as the line is typed, the rest
+of the most recent history command that **starts with** it is drawn ahead of the
+cursor with the terminal's **dim** attribute, so it reads as the typed text plus
+a suggestion — the dim is a *relative* reduction that stays legible on any
+background, where a fixed gray would vanish on the theme it matches. It is a
+**prefix** match, deliberately *not* the history list's fuzzy one — the ghost
+offers only to finish the exact line, so accepting it can never rewrite what is
+already there — and it is accepted by Right/`Ctrl-F`/End (the whole) or `Alt-F`
+(a word), never by **Enter**, which runs the typed line and leaves the ghost
+behind. That last point is the north star's one concession: Chrome fills its
+address bar on Enter, but a shell line that runs what it merely suggested is a
+footgun, so the two gestures stay separate. It shows only with the cursor at the
+buffer end, matching where reedline draws and accepts it. The match is against an
+**in-memory cache** of recent finalized commands — seeded once at startup from
+the store and appended to as commands run, the same commands last-argument recall
+reads — so a keystroke never queries the store: no per-repaint scan to stall
+typing, and a damaged history file (which fails the one startup read) just leaves
+the cache empty rather than being able to abort the shell. The cache is also the
+substrate the deferred fuzzy/frequency ranking will grow on. It is on by default
+and `$sh.options.history-inline` turns it off.
+
+*(deferred: the north star for the ghost — **fuzzy** matching and better motion
+commands, so it can finish more than a literal prefix; exposing the **keybinding
+config** from `rc.mesh` — the whole reason for the library choice — plus a vi
+mode, custom widgets, a **user-supplied** hinter/highlighter, and syntax
+highlighting.)* Completion runs *through* the editor's menu; its model is the next
+section.
 
 ### Completion
 

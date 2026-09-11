@@ -46,6 +46,11 @@ pub enum Opt {
     /// opens where the shell is. Quiet in a terminal that ignores it, but it is
     /// one more sequence on the wire.
     CwdReport,
+    /// `history-inline` — the inline suggestion drawn ahead of the cursor: the
+    /// most recent command that starts with what is typed (the "ghost"). Off is
+    /// for anyone who finds the trailing text distracting, or whose terminal
+    /// renders it indistinguishably from real input.
+    HistoryInline,
     /// `osc-title` — the window and tab title: where the shell is at the prompt,
     /// what it is running while a command runs. Off is for anyone whose terminal,
     /// multiplexer, or window manager sets the title itself and does not want it
@@ -65,10 +70,11 @@ impl Opt {
     /// [`Options`] indexes its flags by an `Opt`'s position *here*, which is the
     /// enum's declaration order; `all_options_index_themselves` holds the two
     /// together.
-    pub const ALL: [Opt; 5] = [
+    pub const ALL: [Opt; 6] = [
         Opt::BoldInput,
         Opt::CommandNotify,
         Opt::CwdReport,
+        Opt::HistoryInline,
         Opt::OscTitle,
         Opt::ShellIntegration,
     ];
@@ -80,6 +86,7 @@ impl Opt {
             Opt::BoldInput => "bold-input",
             Opt::CommandNotify => "command-notify",
             Opt::CwdReport => "cwd-report",
+            Opt::HistoryInline => "history-inline",
             Opt::OscTitle => "osc-title",
             Opt::ShellIntegration => "shell-integration",
         }
@@ -253,6 +260,7 @@ mod tests {
                 ("bold-input".to_owned(), Value::Boolean(true)),
                 ("command-notify".to_owned(), Value::Boolean(true)),
                 ("cwd-report".to_owned(), Value::Boolean(false)),
+                ("history-inline".to_owned(), Value::Boolean(true)),
                 ("osc-title".to_owned(), Value::Boolean(true)),
                 ("shell-integration".to_owned(), Value::Boolean(true)),
             ]

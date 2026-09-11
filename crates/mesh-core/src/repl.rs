@@ -6,7 +6,7 @@
 //! follow its command line and the integration tests need no terminal.
 
 use std::borrow::Cow;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::env;
 use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
@@ -17,18 +17,18 @@ use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, OnceLock, RwLock, mpsc};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, RwLock, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use crossterm::event::Event;
 use reedline::{
     Color, ColumnarMenu, Completer, CompletionResult, EditCommand, EditMode, Emacs, Highlighter,
-    History, HistoryItem, HistoryItemId, HistorySessionId, KeyCode, KeyModifiers, Keybindings,
-    MenuBuilder, Osc133Markers, Osc633Markers, Prompt, PromptEditMode, PromptHistorySearch,
-    PromptKind, Reedline, ReedlineEvent, ReedlineMenu, ReedlineRawEvent, SearchDirection,
-    SearchQuery, SemanticPromptMarkers, Signal, SimpleMatchHighlighter, Span, SqliteBackedHistory,
-    StyledText, Suggestion, default_emacs_keybindings,
+    Hinter, History, HistoryItem, HistoryItemId, HistorySessionId, KeyCode, KeyModifiers,
+    Keybindings, MenuBuilder, Osc133Markers, Osc633Markers, Prompt, PromptEditMode,
+    PromptHistorySearch, PromptKind, Reedline, ReedlineEvent, ReedlineMenu, ReedlineRawEvent,
+    SearchDirection, SearchQuery, SemanticPromptMarkers, Signal, SimpleMatchHighlighter, Span,
+    SqliteBackedHistory, StyledText, Suggestion, default_emacs_keybindings,
 };
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
@@ -16007,6 +16007,183 @@ impl HeredocGate {
     }
 }
 
+/// The filter both reads share: a non-null `more_info` mark (a finalized
+/// command — testing the mark's presence alone means a row with malformed
+/// `more_info` cannot break the read), and the reader's own rows plus every row
+/// from before this session began, so a peer session's later commands stay out.
+const FINALIZED_COMMAND_FILTER: &str =
+    "more_info IS NOT NULL AND (?1 IS NULL OR session_id = ?1 OR start_timestamp < ?2)";
+
+/// The newest finalized command lines from a SQLite history store, newest
+/// first. Seeds last-argument recall, which wants the whole line (`!$`) and
+/// every occurrence, so this reads raw — no dedup, no length or newline filter.
+fn read_recent_finalized_commands(
+    conn: &rusqlite::Connection,
+    session: Option<HistorySessionId>,
+    started: Option<chrono::DateTime<chrono::Utc>>,
+    limit: usize,
+) -> rusqlite::Result<Vec<String>> {
+    let (session_id, started) = session
+        .zip(started)
+        .map(|(session, started)| (i64::from(session), started.timestamp_millis()))
+        .unzip();
+    let mut statement = conn.prepare(&format!(
+        "SELECT command_line FROM history WHERE {FINALIZED_COMMAND_FILTER} \
+         ORDER BY id DESC LIMIT ?3",
+    ))?;
+    statement
+        .query_map(
+            rusqlite::params![session_id, started, limit as i64],
+            |row| row.get::<_, String>(0),
+        )?
+        .collect()
+}
+
+/// The newest finalized rows the ghost might draw inline, newest first, with the
+/// oversized ones dropped in SQL — any over `max_len` **bytes**, so a
+/// multi-megabyte `command_line` is never materialized. The size is read from
+/// the record header (`octet_length`, not `length`, which would decode the whole
+/// UTF-8 value), the inner query carries only that byte length and the finality
+/// columns rather than the text itself, and only the surviving small rows' text
+/// is fetched — by primary key, one lookup each. Multi-line rows are *not*
+/// filtered here: testing for a newline (`instr`) would read the whole value and
+/// so reintroduce the materialization this avoids, so [`RecentCommands::seed`]'s
+/// Rust predicate drops them (it must run anyway, and only touches short rows).
+///
+/// The `scan` bound is on rows *examined*, not rows returned: the inner query
+/// materializes the newest `scan` rows by id (an early-terminating primary-key
+/// walk), and only then are the filters applied. So startup costs `O(scan)` even
+/// when few of those rows survive the filters — a large history of unmarked (a
+/// pre-marking migration), multi-line, or peer-session rows can't turn this into
+/// a full scan the way filtering *before* the limit would. `scan` is a few times
+/// the cache size, not the cache size itself, because [`RecentCommands::seed`]
+/// then dedupes and applies the exact candidate predicate in Rust and keeps only
+/// [`RecentCommands::LIMIT`]; leaving the dedup and final filter to `seed` also
+/// keeps the SQL and cache predicates from drifting (whitespace, newlines, bytes
+/// vs characters). (Recall's own read has the same examined-vs-returned shape and
+/// a smaller limit; bounding it too is a separate, pre-existing follow-up.)
+fn read_recent_ghost_candidates(
+    conn: &rusqlite::Connection,
+    session: Option<HistorySessionId>,
+    started: Option<chrono::DateTime<chrono::Utc>>,
+    scan: usize,
+    max_len: usize,
+) -> rusqlite::Result<Vec<String>> {
+    let (session_id, started) = session
+        .zip(started)
+        .map(|(session, started)| (i64::from(session), started.timestamp_millis()))
+        .unzip();
+    let mut statement = conn.prepare(&format!(
+        "SELECT (SELECT command_line FROM history WHERE id = recent.id) \
+           FROM (SELECT id, more_info, session_id, start_timestamp, \
+                        octet_length(command_line) AS byte_len \
+                 FROM history ORDER BY id DESC LIMIT ?3) AS recent \
+          WHERE {FINALIZED_COMMAND_FILTER} \
+            AND byte_len <= ?4 \
+          ORDER BY id DESC",
+    ))?;
+    statement
+        .query_map(
+            rusqlite::params![session_id, started, scan as i64, max_len as i64],
+            |row| row.get::<_, String>(0),
+        )?
+        .collect()
+}
+
+/// The ghost's source: recent finalized command lines, newest first, matched by
+/// prefix in memory so a keystroke never touches the store. Seeded once from
+/// earlier sessions and appended to as this session runs commands — the same
+/// finalized commands recall reads, so the ghost and `!$`/`Alt-.` agree on what
+/// "recent" means. Shared (`Arc<Mutex<…>>`) because the line editor holds the
+/// reading hinter while the read loop does the appending.
+#[derive(Clone)]
+struct RecentCommands(Arc<Mutex<VecDeque<String>>>);
+
+impl RecentCommands {
+    /// How many recent commands the ghost matches against. Generous — an
+    /// in-memory prefix scan of a few thousand short strings is microseconds —
+    /// while still bounding both the one startup read and the memory held.
+    const LIMIT: usize = 2000;
+
+    /// How many recent rows the startup read scans to fill the cache. A few
+    /// times [`Self::LIMIT`], because repeats and rejected rows among the newest
+    /// don't count toward the cap — the headroom lets `seed` still reach `LIMIT`
+    /// distinct candidates past a healthy amount of duplication, while keeping
+    /// the read a bounded indexed scan (a command distinct only further back than
+    /// this simply isn't ghosted until it is re-run — benign for a decoration).
+    const SEED_SCAN: usize = Self::LIMIT * 4;
+
+    /// The longest command the cache holds, so `LIMIT * MAX_BYTES` bounds its
+    /// memory and each hint's clone. A command past this — or one with a
+    /// newline — is not a candidate: an inline ghost draws on one line, so a
+    /// multi-line heredoc or a multi-megabyte paste could never be a usable
+    /// suggestion, and holding one would let `hint` clone megabytes on the
+    /// keystroke that first matches it. Recall still reaches such commands; only
+    /// the ghost skips them.
+    const MAX_BYTES: usize = 4096;
+
+    /// Is `command` a candidate the ghost could draw inline — non-empty, single
+    /// line, and within the byte cap?
+    fn is_candidate(command: &str) -> bool {
+        !command.trim().is_empty() && command.len() <= Self::MAX_BYTES && !command.contains('\n')
+    }
+
+    fn new() -> Self {
+        RecentCommands(Arc::new(Mutex::new(VecDeque::new())))
+    }
+
+    fn lock(&self) -> MutexGuard<'_, VecDeque<String>> {
+        self.0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Fill from the store's newest-first read, holding the cap, skipping any
+    /// command the ghost could not draw inline, and keeping only the newest of
+    /// each — so a command repeated across sessions can't fill every slot and
+    /// evict older distinct commands (the store keeps every occurrence; `record`
+    /// dedupes the live cache, and this dedupes the seed to match). One-shot, at
+    /// startup, before any [`record`](Self::record).
+    fn seed(&self, newest_first: Vec<String>) {
+        let mut recent = self.lock();
+        let mut seen = HashSet::new();
+        for command in newest_first {
+            if recent.len() >= Self::LIMIT {
+                break;
+            }
+            if Self::is_candidate(&command) && seen.insert(command.clone()) {
+                recent.push_back(command);
+            }
+        }
+    }
+
+    /// Record a just-finalized command as the newest match, moving an earlier
+    /// occurrence to the front rather than repeating it, and holding the cap. A
+    /// command the ghost could not draw inline is skipped.
+    fn record(&self, command: String) {
+        if !Self::is_candidate(&command) {
+            return;
+        }
+        let mut recent = self.lock();
+        if let Some(index) = recent.iter().position(|existing| *existing == command) {
+            recent.remove(index);
+        }
+        recent.push_front(command);
+        while recent.len() > Self::LIMIT {
+            recent.pop_back();
+        }
+    }
+
+    /// The tail of the newest command that starts with `line` — the ghost,
+    /// matched by prefix in memory. `None` when nothing recent extends the line.
+    fn hint(&self, line: &str) -> Option<String> {
+        self.lock()
+            .iter()
+            .find(|command| command.len() > line.len() && command.starts_with(line))
+            .map(|command| command[line.len()..].to_string())
+    }
+}
+
 #[derive(Default)]
 struct ArgumentRecall {
     arguments: Vec<String>,
@@ -16042,27 +16219,8 @@ impl ArgumentRecall {
         session: Option<HistorySessionId>,
         started: Option<chrono::DateTime<chrono::Utc>>,
     ) {
-        let (session_id, started) = session
-            .zip(started)
-            .map(|(session, started)| (i64::from(session), started.timestamp_millis()))
-            .unzip();
-        let commands = conn
-            .prepare(
-                "SELECT command_line FROM history \
-                 WHERE more_info IS NOT NULL \
-                   AND (?1 IS NULL OR session_id = ?1 OR start_timestamp < ?2) \
-                 ORDER BY id DESC LIMIT ?3",
-            )
-            .and_then(|mut statement| {
-                statement
-                    .query_map(
-                        rusqlite::params![session_id, started, Self::RECENT as i64],
-                        |row| row.get::<_, String>(0),
-                    )?
-                    .collect::<rusqlite::Result<Vec<String>>>()
-            });
-        match commands {
-            // The query returns newest first; `remember` them oldest first so
+        match read_recent_finalized_commands(conn, session, started, Self::RECENT) {
+            // The read returns newest first; `remember` them oldest first so
             // `previous` ends up the newest and `arguments` in the order
             // `Alt-.` walks them.
             Ok(commands) => {
@@ -16585,6 +16743,8 @@ fn run_interactive(options: &StartupOptions) -> ExitCode {
     // in memory until `--no-save-history` or a database that will not open
     // says that is all there is.
     let mut argument_recall = ArgumentRecall::default();
+    // The ghost's suggestion source, seeded below and appended to as commands run.
+    let ghost_recent = RecentCommands::new();
     let mut history_session = None;
     let mut history = None;
     let mut reader = Reader::Memory;
@@ -16610,7 +16770,23 @@ fn run_interactive(options: &StartupOptions) -> ExitCode {
                     rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
                         | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
                 ) {
-                    Ok(seed) => argument_recall.load(&seed, session, session_started),
+                    Ok(seed) => {
+                        argument_recall.load(&seed, session, session_started);
+                        // Seed the ghost from the same finalized commands, so it
+                        // and recall reach back over the same history.
+                        match read_recent_ghost_candidates(
+                            &seed,
+                            session,
+                            session_started,
+                            RecentCommands::SEED_SCAN,
+                            RecentCommands::MAX_BYTES,
+                        ) {
+                            Ok(commands) => ghost_recent.seed(commands),
+                            Err(err) => {
+                                note!("mesh: could not read history for autosuggestion: {err}");
+                            }
+                        }
+                    }
                     Err(err) => note!("mesh: could not open history for recall: {err}"),
                 }
                 history_session = session;
@@ -16666,6 +16842,14 @@ fn run_interactive(options: &StartupOptions) -> ExitCode {
         .with_completer(Box::new(MeshCompleter {
             state: Arc::clone(&completion),
         }))
+        // The inline history suggestion, sharing the options the highlighter reads
+        // so `$sh.options.history-inline = false` takes effect on the next keystroke,
+        // and the recent-command cache the loop appends to.
+        .with_hinter(Box::new(GhostHinter::new(
+            Arc::clone(shell.vars.options()),
+            ghost_recent.clone(),
+            Arc::clone(&list_state),
+        )))
         .with_history(Box::new(history))
         .with_history_session_id(history_session);
     shell
@@ -16834,6 +17018,9 @@ fn run_interactive(options: &StartupOptions) -> ExitCode {
                 pending_history_rows = 0;
                 if let Some(command) = completed_command {
                     argument_recall.remember(&command);
+                    // The ghost suggests this session's commands as they run, not
+                    // only the next session's — the same command recall remembers.
+                    ghost_recent.record(command);
                 }
             }
             Err(err) => {
@@ -16870,6 +17057,24 @@ fn interactive_keybindings() -> Keybindings {
             ReedlineEvent::MenuNext,
         ]),
     );
+    // reedline's default emacs bindings also fold the hint into Ctrl-E,
+    // Ctrl-Right and Alt-Right (an `UntilFound` that tries `HistoryHint*`
+    // first), so with the ghost installed those keys would accept it instead
+    // of moving the cursor. The documented accept set is Right / Ctrl-F / End
+    // (whole line) and Alt-F (word); restore these three to the pure motions
+    // their names promise so the ghost never rides a motion key.
+    keybindings.add_binding(
+        KeyModifiers::CONTROL,
+        KeyCode::Char('e'),
+        ReedlineEvent::Edit(vec![EditCommand::MoveToLineEnd { select: false }]),
+    );
+    for modifiers in [KeyModifiers::CONTROL, KeyModifiers::ALT] {
+        keybindings.add_binding(
+            modifiers,
+            KeyCode::Right,
+            ReedlineEvent::Edit(vec![EditCommand::MoveWordRight { select: false }]),
+        );
+    }
     keybindings
 }
 
@@ -17346,6 +17551,104 @@ fn input_highlighter(
         bold: SimpleMatchHighlighter::default()
             .with_neutral_style(nu_ansi_term::Style::new().bold()),
         plain: SimpleMatchHighlighter::default(),
+    }
+}
+
+/// The inline suggestion drawn ahead of the cursor: the most recent command
+/// that starts with what has been typed, shown from the cursor on. It is a
+/// *prefix* match, not the fuzzy filter the history list uses — the ghost only
+/// ever offers to finish the exact line, so accepting it can never rewrite what
+/// is already there. Right/`Ctrl-F`/End take the whole of it and `Alt-F` a word;
+/// Enter is not one of them, so pressing it runs the typed line, not the
+/// suggestion.
+///
+/// The match is against an in-memory [`RecentCommands`] cache, not the store, so
+/// a keystroke never runs a query: no per-repaint scan to stall typing, and a
+/// damaged history file (which fails the one startup read) simply leaves the
+/// cache empty rather than being able to abort the shell — where reedline's own
+/// `DefaultHinter` `.expect`s on a store error.
+struct GhostHinter {
+    options: Arc<Options>,
+    style: nu_ansi_term::Style,
+    recent: RecentCommands,
+    /// The history list's active flag. While the list is open a recalled command
+    /// sits on the buffer, and its accept keys (Right/End/Ctrl-F/Alt-F) overlap
+    /// the ghost's — so a ghost drawn over the selection would be appended to it
+    /// when the list closes, turning `git status` into `git status --short`. The
+    /// ghost stands down whenever the list is up; the list is the suggester then.
+    list_active: Arc<AtomicBool>,
+    current_hint: String,
+}
+
+impl GhostHinter {
+    fn new(options: Arc<Options>, recent: RecentCommands, list_active: Arc<AtomicBool>) -> Self {
+        GhostHinter {
+            options,
+            // The terminal's dim (faint) attribute, not a color: the tail reads
+            // as a suggestion against the typed part's weight on any background,
+            // where a fixed color would vanish on the theme it matches — a bright
+            // gray on a light terminal, a dark one on a dark terminal.
+            style: nu_ansi_term::Style::new().dimmed(),
+            recent,
+            list_active,
+            current_hint: String::new(),
+        }
+    }
+}
+
+impl Hinter for GhostHinter {
+    fn handle(
+        &mut self,
+        line: &str,
+        pos: usize,
+        _history: &dyn History,
+        use_ansi_coloring: bool,
+        _cwd: &str,
+    ) -> String {
+        // Only with the cursor at the end of the line (reedline appends the hint
+        // after the whole buffer and accepts it only from there — its
+        // `is_cursor_at_buffer_end` gate — so a mid-line hint would sit past the
+        // cursor, unacceptable and misplaced), and never while the history list
+        // is up (see `list_active`).
+        self.current_hint = if self.options.get(Opt::HistoryInline)
+            && !line.is_empty()
+            && pos == line.len()
+            && !self.list_active.load(Ordering::Relaxed)
+        {
+            self.recent.hint(line).unwrap_or_default()
+        } else {
+            String::new()
+        };
+        if use_ansi_coloring && !self.current_hint.is_empty() {
+            self.style.paint(&self.current_hint).to_string()
+        } else {
+            self.current_hint.clone()
+        }
+    }
+
+    fn complete_hint(&self) -> String {
+        self.current_hint.clone()
+    }
+
+    fn next_hint_token(&self) -> String {
+        // The leading whitespace plus the first content word, so `Alt-F` accepts
+        // one word of the suggestion — reedline keeps `get_first_token` private,
+        // so mesh spells the same walk over Unicode word bounds.
+        let mut reached_content = false;
+        self.current_hint
+            .split_word_bounds()
+            .take_while(|word| {
+                let blank = word.chars().all(char::is_whitespace);
+                match (blank, reached_content) {
+                    (_, true) => false,
+                    (true, false) => true,
+                    (false, false) => {
+                        reached_content = true;
+                        true
+                    }
+                }
+            })
+            .collect()
     }
 }
 
@@ -18789,19 +19092,19 @@ mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
 
     use super::{
-        ArgumentRecall, CommandLine, CompletionState, EscapePrefix, HISTORY_LIST, HeredocGate,
-        Hook, HookEvent, Integration, Invocation, Lookup, MeshHistory, MeshPrompt, NOTIFY_LIMIT,
-        PromptMarkers, SemanticMark, Shell, StartupOptions, Step, TITLE_LIMIT, TYPE_MARKER_WORDS,
-        TimestampedHistory, argument_completions, body_awaits_close, command_line,
-        command_notification, command_position, command_segment_words, command_words,
-        completed_command, deferred_words, duration_words, escape_stripped_width, eval_binary,
-        expand_history_designators, expansion_word, external_stage, func_definition_is_open,
-        handle_signal, help_completions, history_designators, history_path_from, input_highlighter,
-        interactive_keybindings, interruptible_task, last_argument, list_down, list_up,
-        mark_sequence, needs_more_input, open_history, path_completions_sync,
-        persist_logical_history, prepare_history_path, run_hooks, run_line, run_source,
-        segment_completions, strip_type_marker, title_sequence, title_text, variable_completions,
-        vscode_escaped, walk,
+        ArgumentRecall, CommandLine, CompletionState, EscapePrefix, GhostHinter, HISTORY_LIST,
+        HeredocGate, Hook, HookEvent, Integration, Invocation, Lookup, MeshHistory, MeshPrompt,
+        NOTIFY_LIMIT, PromptMarkers, RecentCommands, SemanticMark, Shell, StartupOptions, Step,
+        TITLE_LIMIT, TYPE_MARKER_WORDS, TimestampedHistory, argument_completions,
+        body_awaits_close, command_line, command_notification, command_position,
+        command_segment_words, command_words, completed_command, deferred_words, duration_words,
+        escape_stripped_width, eval_binary, expand_history_designators, expansion_word,
+        external_stage, func_definition_is_open, handle_signal, help_completions,
+        history_designators, history_path_from, input_highlighter, interactive_keybindings,
+        interruptible_task, last_argument, list_down, list_up, mark_sequence, needs_more_input,
+        open_history, path_completions_sync, persist_logical_history, prepare_history_path,
+        read_recent_ghost_candidates, run_hooks, run_line, run_source, segment_completions,
+        strip_type_marker, title_sequence, title_text, variable_completions, vscode_escaped, walk,
     };
 
     /// One debt per dialect, however many titles were written.
@@ -18870,10 +19173,10 @@ mod tests {
     use crate::vars::Value;
     use crossterm::event::{Event, KeyEvent};
     use reedline::{
-        EditCommand, EditMode, Highlighter, History, HistoryItem, HistorySessionId, KeyCode,
-        KeyModifiers, Prompt, PromptEditMode, PromptKind, Reedline, ReedlineEvent,
-        ReedlineRawEvent, SearchDirection, SearchQuery, SemanticPromptMarkers, Signal,
-        SqliteBackedHistory,
+        EditCommand, EditMode, FileBackedHistory, Highlighter, Hinter, History, HistoryItem,
+        HistorySessionId, KeyCode, KeyModifiers, Prompt, PromptEditMode, PromptKind, Reedline,
+        ReedlineEvent, ReedlineRawEvent, SearchDirection, SearchQuery, SemanticPromptMarkers,
+        Signal, SqliteBackedHistory,
     };
     use std::ffi::OsStr;
     use std::fs;
@@ -20920,6 +21223,65 @@ mod tests {
         );
     }
 
+    #[test]
+    fn the_ghost_never_rides_a_motion_key() {
+        let keys = interactive_keybindings();
+        // Ctrl-E, Ctrl-Right and Alt-Right stay the motions their names
+        // promise; reedline's defaults would have them accept the hint.
+        for (modifiers, code, event) in [
+            (
+                KeyModifiers::CONTROL,
+                KeyCode::Char('e'),
+                ReedlineEvent::Edit(vec![EditCommand::MoveToLineEnd { select: false }]),
+            ),
+            (
+                KeyModifiers::CONTROL,
+                KeyCode::Right,
+                ReedlineEvent::Edit(vec![EditCommand::MoveWordRight { select: false }]),
+            ),
+            (
+                KeyModifiers::ALT,
+                KeyCode::Right,
+                ReedlineEvent::Edit(vec![EditCommand::MoveWordRight { select: false }]),
+            ),
+        ] {
+            assert_eq!(keys.find_binding(modifiers, code), Some(event), "{code:?}");
+        }
+        // The documented accept keys still finish the ghost: Right / Ctrl-F /
+        // End (whole line) and Alt-F (word).
+        for (modifiers, code) in [
+            (KeyModifiers::NONE, KeyCode::Right),
+            (KeyModifiers::CONTROL, KeyCode::Char('f')),
+            (KeyModifiers::NONE, KeyCode::End),
+        ] {
+            let binding = keys.find_binding(modifiers, code).unwrap();
+            assert!(
+                contains_history_hint(&binding, false),
+                "{code:?} should still accept the whole ghost"
+            );
+        }
+        let alt_f = keys
+            .find_binding(KeyModifiers::ALT, KeyCode::Char('f'))
+            .unwrap();
+        assert!(
+            contains_history_hint(&alt_f, true),
+            "Alt-F should still accept a ghost word"
+        );
+    }
+
+    /// Whether `event` reaches a hint-accept event — the word variant when
+    /// `word`, else the whole-line one.
+    fn contains_history_hint(event: &ReedlineEvent, word: bool) -> bool {
+        match event {
+            ReedlineEvent::HistoryHintComplete => !word,
+            ReedlineEvent::HistoryHintWordComplete => word,
+            ReedlineEvent::UntilFound(events) | ReedlineEvent::Multiple(events) => events
+                .iter()
+                .any(|event| contains_history_hint(event, word)),
+            _ => false,
+        }
+    }
+
     fn escape_prefix() -> EscapePrefix {
         EscapePrefix::new(interactive_keybindings(), Arc::new(AtomicBool::new(false)))
     }
@@ -22155,6 +22517,347 @@ mod tests {
             .expect("bold-input is a setting");
         let bold = highlighter.highlight("puts hello", 10);
         assert_eq!(bold.buffer[0].0, nu_ansi_term::Style::new().bold());
+    }
+
+    /// A throwaway history for the argument `GhostHinter::handle` ignores — it
+    /// matches against its in-memory cache, not the store.
+    fn ignored_history() -> FileBackedHistory {
+        FileBackedHistory::new(1).expect("a throwaway history")
+    }
+
+    /// A recent-command cache holding `commands` recorded oldest first, so the
+    /// last is the newest match.
+    fn recent_with(commands: &[&str]) -> RecentCommands {
+        let recent = RecentCommands::new();
+        for command in commands {
+            recent.record((*command).to_string());
+        }
+        recent
+    }
+
+    /// A ghost hinter with the history list inactive — the ordinary typing case.
+    fn ghost_hinter(options: Arc<Options>, recent: RecentCommands) -> GhostHinter {
+        GhostHinter::new(options, recent, Arc::new(AtomicBool::new(false)))
+    }
+
+    /// The ghost finishes the most recent command that starts with what was
+    /// typed, and offers the whole tail (Right/End) or one word (`Alt-F`).
+    #[test]
+    fn the_ghost_finishes_the_most_recent_matching_command() {
+        let recent = recent_with(&["git status", "git commit --amend", "cargo build"]);
+        let mut hinter = ghost_hinter(Arc::new(Options::default()), recent);
+        let history = ignored_history();
+
+        assert_eq!(
+            hinter.handle("git c", 5, &history, false, ""),
+            "ommit --amend"
+        );
+        assert_eq!(hinter.complete_hint(), "ommit --amend");
+        assert_eq!(hinter.next_hint_token(), "ommit");
+    }
+
+    /// A prefix match and nothing fuzzy: the ghost only ever offers to finish
+    /// the exact line, so accepting it cannot rewrite what is already there.
+    #[test]
+    fn the_ghost_matches_a_prefix_and_not_a_substring() {
+        let recent = recent_with(&["git status"]);
+        let mut hinter = ghost_hinter(Arc::new(Options::default()), recent);
+        let history = ignored_history();
+
+        // An empty line is not pre-filled.
+        assert_eq!(hinter.handle("", 0, &history, false, ""), "");
+        // "status" appears mid-command but the line does not start with it.
+        assert_eq!(hinter.handle("status", 6, &history, false, ""), "");
+        // Once the prefix matches, the rest of the command is the suggestion.
+        assert_eq!(hinter.handle("git ", 4, &history, false, ""), "status");
+    }
+
+    /// The setting is read on the built hinter every keystroke, so
+    /// `$sh.options.history-inline = false` silences it at once and back on
+    /// restores it — a live read, not a one-way latch.
+    #[test]
+    fn turning_off_history_inline_silences_the_ghost() {
+        let options = Arc::new(Options::default());
+        let mut hinter = ghost_hinter(Arc::clone(&options), recent_with(&["git status"]));
+        let history = ignored_history();
+
+        assert_eq!(hinter.handle("git", 3, &history, false, ""), " status");
+
+        options
+            .assign(
+                "$sh.options.history-inline",
+                "history-inline",
+                &Value::Boolean(false),
+            )
+            .expect("history-inline is a setting");
+        assert_eq!(hinter.handle("git", 3, &history, false, ""), "");
+        assert_eq!(
+            hinter.complete_hint(),
+            "",
+            "an off suggestion accepts nothing"
+        );
+
+        options
+            .assign(
+                "$sh.options.history-inline",
+                "history-inline",
+                &Value::Boolean(true),
+            )
+            .expect("history-inline is a setting");
+        assert_eq!(hinter.handle("git", 3, &history, false, ""), " status");
+    }
+
+    /// The tail is drawn with the terminal's dim attribute (never bold), so it
+    /// reads as a suggestion against the typed part's weight on any background.
+    #[test]
+    fn the_ghost_is_drawn_dim_and_not_bold() {
+        let mut hinter = ghost_hinter(Arc::new(Options::default()), recent_with(&["git status"]));
+        let history = ignored_history();
+
+        let painted = hinter.handle("git", 3, &history, true, "");
+        let dim = nu_ansi_term::Style::new().dimmed();
+        assert_eq!(painted, dim.paint(" status").to_string());
+    }
+
+    /// Only with the cursor at the end of the line: reedline draws and accepts
+    /// the hint from the buffer end, so a mid-line hint would be misplaced and
+    /// unacceptable.
+    #[test]
+    fn the_ghost_is_hidden_while_editing_mid_line() {
+        let mut hinter = ghost_hinter(Arc::new(Options::default()), recent_with(&["git status"]));
+        let history = ignored_history();
+
+        // Cursor at the end: the suggestion shows.
+        assert_eq!(hinter.handle("git", 3, &history, false, ""), " status");
+        // Cursor moved left within the same line: no suggestion.
+        assert_eq!(hinter.handle("git", 1, &history, false, ""), "");
+        assert_eq!(hinter.complete_hint(), "");
+    }
+
+    /// The ghost stands down while the history list is up: a recalled row sits
+    /// on the buffer then, and its accept keys overlap the ghost's, so a stale
+    /// ghost would be appended to a selection taken for editing.
+    #[test]
+    fn the_ghost_is_hidden_while_the_history_list_is_active() {
+        let list_active = Arc::new(AtomicBool::new(false));
+        let mut hinter = GhostHinter::new(
+            Arc::new(Options::default()),
+            recent_with(&["git status --short"]),
+            Arc::clone(&list_active),
+        );
+        let history = ignored_history();
+
+        // List closed: the ghost shows.
+        assert_eq!(
+            hinter.handle("git s", 5, &history, false, ""),
+            "tatus --short"
+        );
+        // List open (a recalled row is on the buffer): no ghost to append.
+        list_active.store(true, Ordering::Relaxed);
+        assert_eq!(hinter.handle("git s", 5, &history, false, ""), "");
+        assert_eq!(hinter.complete_hint(), "");
+    }
+
+    /// The seed path end to end: the SQL read drops the oversized rows by their
+    /// header byte length (never materializing the multi-megabyte one) but leaves
+    /// the small multi-line row for the cache to reject — testing for a newline in
+    /// SQL would read the whole value and undo that. The read returns the rest
+    /// newest-first, repeats and all; `seed` then applies the exact cache
+    /// predicate (dropping the multi-line row), dedupes, and keeps the older
+    /// distinct command, so neither a repeat nor a reject among the newest can
+    /// crowd it out.
+    #[test]
+    fn the_ghost_seed_path_filters_in_sql_and_dedupes_in_the_cache() {
+        let conn = rusqlite::Connection::open_in_memory().expect("an in-memory db");
+        conn.execute_batch(
+            "CREATE TABLE history (id INTEGER PRIMARY KEY, start_timestamp INTEGER, \
+             command_line TEXT NOT NULL, session_id INTEGER, more_info TEXT);",
+        )
+        .expect("schema");
+        // A genuinely large row (multiple MiB), to exercise the header-only size
+        // read: if the query decoded `command_line` to filter it, this row alone
+        // would materialize megabytes.
+        let big = format!("cat {}", "x".repeat(4 * 1024 * 1024));
+        // Newest-first by id: two `git status`, a multi-line row, an oversized
+        // row, and the oldest distinct `cargo build`.
+        conn.execute(
+            "INSERT INTO history (id, start_timestamp, command_line, session_id, more_info) VALUES \
+             (1, 0, 'cargo build', NULL, 'x'), \
+             (2, 0, ?1, NULL, 'x'), \
+             (3, 0, 'run <<EOF' || char(10) || 'body', NULL, 'x'), \
+             (4, 0, 'git status', NULL, 'x'), \
+             (5, 0, 'git status', NULL, 'x')",
+            rusqlite::params![big],
+        )
+        .expect("rows");
+
+        // The read drops only the oversized row (by byte length) and returns the
+        // rest newest-first, the small multi-line row and repeats intact — the
+        // newline and dedup are the cache's job.
+        let rows = read_recent_ghost_candidates(&conn, None, None, 10, RecentCommands::MAX_BYTES)
+            .expect("ghost read");
+        assert_eq!(
+            rows,
+            vec![
+                "git status".to_string(),
+                "git status".to_string(),
+                "run <<EOF\nbody".to_string(),
+                "cargo build".to_string()
+            ]
+        );
+
+        // Seeding drops the multi-line row, dedupes, and keeps the older distinct.
+        let recent = RecentCommands::new();
+        recent.seed(rows);
+        assert_eq!(
+            recent.lock().iter().cloned().collect::<Vec<_>>(),
+            vec!["git status".to_string(), "cargo build".to_string()]
+        );
+    }
+
+    /// `scan` bounds rows *examined*, not rows returned: a large run of unmarked
+    /// (or otherwise rejected) rows can't force a full-history scan looking for
+    /// survivors. An older marked candidate beyond the scan window is not read;
+    /// a wider scan reaches it.
+    #[test]
+    fn the_ghost_read_bounds_rows_examined_not_returned() {
+        let conn = rusqlite::Connection::open_in_memory().expect("an in-memory db");
+        conn.execute_batch(
+            "CREATE TABLE history (id INTEGER PRIMARY KEY, start_timestamp INTEGER, \
+             command_line TEXT NOT NULL, session_id INTEGER, more_info TEXT);",
+        )
+        .expect("schema");
+        // The only marked (finalized) row is the oldest; the newer rows are
+        // unmarked (`more_info` NULL), as a pre-marking history would be.
+        conn.execute(
+            "INSERT INTO history (id, start_timestamp, command_line, session_id, more_info) VALUES \
+             (1, 0, 'deploy production', NULL, 'x'), \
+             (2, 0, 'noise one', NULL, NULL), \
+             (3, 0, 'noise two', NULL, NULL)",
+            [],
+        )
+        .expect("rows");
+
+        // Examining only the newest two rows finds no candidate — both are
+        // unmarked — and does not scan on to the older marked row.
+        let bounded = read_recent_ghost_candidates(&conn, None, None, 2, RecentCommands::MAX_BYTES)
+            .expect("bounded read");
+        assert!(
+            bounded.is_empty(),
+            "the older marked row is beyond the scan window"
+        );
+        // A wider scan reaches it.
+        let wider = read_recent_ghost_candidates(&conn, None, None, 10, RecentCommands::MAX_BYTES)
+            .expect("wider read");
+        assert_eq!(wider, vec!["deploy production".to_string()]);
+    }
+
+    /// The cache seeds newest first (as the store read returns rows), so the
+    /// ghost's most-recent match is the store's.
+    #[test]
+    fn the_ghost_seeds_from_the_store_newest_first() {
+        let recent = RecentCommands::new();
+        recent.seed(vec!["git commit".to_string(), "git status".to_string()]);
+        let mut hinter = ghost_hinter(Arc::new(Options::default()), recent);
+        let history = ignored_history();
+
+        assert_eq!(hinter.handle("git ", 4, &history, false, ""), "commit");
+    }
+
+    /// With no store to seed from (`--no-save-history`, or a store that will not
+    /// open), the ghost still suggests this session's own commands as they run.
+    #[test]
+    fn the_ghost_suggests_this_sessions_commands_without_a_seed() {
+        let recent = RecentCommands::new();
+        let mut hinter = ghost_hinter(Arc::new(Options::default()), recent.clone());
+        let history = ignored_history();
+
+        assert_eq!(hinter.handle("gi", 2, &history, false, ""), "");
+        recent.record("git push".to_string());
+        assert_eq!(hinter.handle("gi", 2, &history, false, ""), "t push");
+    }
+
+    /// The cache keeps the newest commands, deduped and capped, so the ghost is
+    /// always a bounded in-memory scan and a repeat does not crowd it out.
+    #[test]
+    fn the_recent_cache_dedupes_and_caps() {
+        let recent = RecentCommands::new();
+        recent.record("git status".to_string());
+        recent.record("cargo build".to_string());
+        recent.record("git status".to_string());
+        {
+            let held = recent.lock();
+            assert_eq!(
+                held.len(),
+                2,
+                "the repeat moved to the front, not duplicated"
+            );
+            assert_eq!(held.front().map(String::as_str), Some("git status"));
+        }
+
+        // Beyond the cap, the oldest fall off.
+        for i in 0..RecentCommands::LIMIT + 10 {
+            recent.record(format!("echo {i}"));
+        }
+        assert_eq!(recent.lock().len(), RecentCommands::LIMIT);
+
+        let mut hinter = ghost_hinter(Arc::new(Options::default()), recent);
+        let history = ignored_history();
+        let newest = format!(" {}", RecentCommands::LIMIT + 9);
+        assert_eq!(hinter.handle("echo", 4, &history, false, ""), newest);
+    }
+
+    /// Seeding dedupes too, not just `record`: a command repeated across
+    /// sessions collapses to its newest occurrence, so it can't fill every slot
+    /// on restart and evict an older distinct command.
+    #[test]
+    fn the_cache_dedupes_the_seed() {
+        let recent = RecentCommands::new();
+        // Newest-first, as the store returns: one command repeated to the cap,
+        // then an older distinct one.
+        let mut rows = vec!["git status".to_string(); RecentCommands::LIMIT];
+        rows.push("cargo build".to_string());
+        recent.seed(rows);
+        {
+            let held = recent.lock();
+            assert_eq!(held.len(), 2, "repeats collapse to one entry");
+            assert_eq!(held.front().map(String::as_str), Some("git status"));
+        }
+
+        // The older distinct command survived the seed, so it still ghosts.
+        let mut hinter = ghost_hinter(Arc::new(Options::default()), recent);
+        let history = ignored_history();
+        assert_eq!(hinter.handle("cargo b", 7, &history, false, ""), "uild");
+    }
+
+    /// A command the ghost could never draw inline — past the byte cap, or
+    /// multi-line — is not cached, seeded or recorded, so a giant saved heredoc
+    /// cannot freeze the prompt by cloning megabytes on the keystroke it matches.
+    #[test]
+    fn the_cache_skips_commands_it_cannot_draw_inline() {
+        let recent = RecentCommands::new();
+        // A multi-megabyte one-liner (recorded) and a multi-line command...
+        recent.record(format!("cat {}", "x".repeat(RecentCommands::MAX_BYTES)));
+        recent.record("run <<EOF\nbody\nEOF".to_string());
+        // ...and an oversized command from the store (seeded) are all skipped.
+        recent.seed(vec![format!(
+            "echo {}",
+            "y".repeat(RecentCommands::MAX_BYTES)
+        )]);
+        assert_eq!(
+            recent.lock().len(),
+            0,
+            "oversized and multi-line commands are never cached"
+        );
+
+        // A normal command is still cached and ghosted.
+        recent.record("cargo build --release".to_string());
+        let mut hinter = ghost_hinter(Arc::new(Options::default()), recent);
+        let history = ignored_history();
+        assert_eq!(
+            hinter.handle("cargo b", 7, &history, false, ""),
+            "uild --release"
+        );
     }
 
     #[test]
