@@ -18,9 +18,9 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 use nu_ansi_term::Style;
 use reedline::{
-    CommandLineSearch, Completer, Editor, History, HistoryItem, HistoryItemId, HistorySessionId,
-    Menu, MenuEvent, Painter, SearchDirection, SearchFilter, SearchQuery, Span, Suggestion,
-    UndoBehavior,
+    CommandLineSearch, Completer, Editor, FileBackedHistory, History, HistoryItem, HistoryItemId,
+    HistorySessionId, IgnoreAllExtraInfo, Menu, MenuEvent, Painter, SearchDirection, SearchFilter,
+    SearchQuery, Span, SqliteBackedHistory, Suggestion, UndoBehavior,
 };
 use rusqlite::OpenFlags;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
@@ -36,24 +36,61 @@ const ROWS: usize = 5;
 /// until enough distinct ones have turned up.
 const PAGE: i64 = 64;
 
+/// A [`History`] that can also mark a row a finalized logical command, so
+/// last-argument recall reads whole commands without reassembling raw per-line
+/// rows (see `ArgumentRecall` in `repl.rs`). Marking must run on the store's own
+/// connection — a separate connection cannot reliably see a row reedline has
+/// just written to the WAL — which is why it rides the shared history rather
+/// than a second connection. The default is a no-op, for a store that keeps no
+/// marks (the in-memory fallback).
+pub(crate) trait MeshHistory: History {
+    fn mark_command(&mut self, _id: HistoryItemId) {}
+}
+
+impl MeshHistory for FileBackedHistory {}
+
+impl MeshHistory for SqliteBackedHistory {
+    fn mark_command(&mut self, id: HistoryItemId) {
+        // A non-null `more_info` is the mark; the value is reedline's own
+        // "no extra info" serialization (`null` as text, still not SQL NULL),
+        // so recall's `more_info IS NOT NULL` sees it and no marker type is
+        // needed. `save_with_extra` rewrites the row on this same connection,
+        // so the row is present; a failure only costs recall this one command.
+        match self.load(id) {
+            Ok(mut item) => {
+                item.more_info = Some(IgnoreAllExtraInfo);
+                if let Err(err) = self.save_with_extra(item) {
+                    note!("mesh: could not record history command: {err}");
+                }
+            }
+            Err(err) => note!("mesh: could not record history command: {err}"),
+        }
+    }
+}
+
 /// The one history, shared between reedline and the list.
 ///
 /// A `Mutex` rather than `RwLock` because a history *writes* on every submit,
 /// and nothing here holds the lock across a call back into reedline.
 #[derive(Clone)]
-pub(crate) struct SharedHistory(Arc<Mutex<Box<dyn History>>>);
+pub(crate) struct SharedHistory(Arc<Mutex<Box<dyn MeshHistory>>>);
 
 impl SharedHistory {
-    pub(crate) fn new(history: impl History + 'static) -> Self {
+    pub(crate) fn new(history: impl MeshHistory + 'static) -> Self {
         Self(Arc::new(Mutex::new(Box::new(history))))
     }
 
     /// A poisoned lock means another thread panicked mid-call; the store is
     /// still the store, and losing the shell over it would lose more.
-    fn lock(&self) -> MutexGuard<'_, Box<dyn History>> {
+    fn lock(&self) -> MutexGuard<'_, Box<dyn MeshHistory>> {
         self.0
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Mark a row a finalized logical command, on the store's own connection.
+    pub(crate) fn mark_command(&self, id: HistoryItemId) {
+        self.lock().mark_command(id);
     }
 }
 
@@ -1247,6 +1284,8 @@ mod tests {
             None
         }
     }
+
+    impl MeshHistory for Broken {}
 
     #[test]
     fn a_store_that_cannot_be_read_is_said_so_in_the_list() {
