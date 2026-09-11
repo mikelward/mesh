@@ -1021,10 +1021,11 @@ literal match is always listed before a loose one. The key that opened the list
 walks it toward older commands and the other key walks back, so Up, Up, Enter
 and Down, Down, Enter both run the second one; the line follows the selection,
 and walking back
-past the first row restores what you typed. Enter runs the line. Tab, Esc, a
-cursor key, or Backspace closes the list and leaves the line to edit, and
-typing more narrows the list to the new text. Nothing matching, no list. Ctrl-R
-is still the search for a command from further back.
+past the first row restores what you typed. Enter runs the line. Typing and
+Backspace edit what you typed, not the selected command, and the list narrows
+to the new text. Tab or a cursor key takes the selected command onto the line
+to edit; Esc closes the list and gives your text back. Nothing matching, no
+list. Ctrl-R is still the search for a command from further back.
 
 ```text
 mesh$ git
