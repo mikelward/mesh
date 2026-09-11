@@ -2074,6 +2074,11 @@ all under "Beyond M3 — External tool integration".
       - **Case-insensitive matching.** Both passes are exact — the store's
         `instr` and `GLOB` are. A lowercase query matching `Git` needs `LIKE`
         for the fuzzy pass (ASCII-insensitive) and a Rust sift for the rest.
+      - **The selected row in bold.** The user's ask after the first look:
+        the selection today is reversed *and* bold with color on, and `>`
+        without; make bold the selection's mark (whether alongside the
+        reverse or instead of it is the thing to try) — `HistoryList::render`,
+        one style.
       - **A right-hand column** — how long ago, or the directory — once the
         rich rows below exist. Dim, so the command stays the row.
       - **Deleting narrows rather than closes.** `Backspace` closes the list
@@ -2097,6 +2102,24 @@ all under "Beyond M3 — External tool integration".
         the steering moves into reedline as a menu that answers its own keys,
         the honest fix. Not reachable from a single keystroke, so it waits on
         one of those rather than a third mirror.
+      - **`Up` and `Down` no longer move between the lines of a multi-line
+        buffer.** reedline's plain `Up` moves the cursor a line up unless it
+        is already on the first line, and only then walks history; the list's
+        bindings try `Menu(history_list)` first, which the engine counts as
+        handled whether or not the list found anything, so a pasted block
+        cannot be walked with the arrows any more. Deferred from #554 (Codex).
+        The edit mode does not know which line the cursor is on, so the gate
+        belongs in the engine: an event that opens a menu only when the cursor
+        is on the boundary line, or the list opened from `up_command`'s
+        history branch rather than from the binding.
+      - **A tab in a saved command widens its row past the width.** `row_text`
+        measures with `UnicodeWidthStr::width`, which counts a tab (any
+        control character) as zero columns, while the terminal expands it to
+        the next stop — so a pasted command with a literal tab can wrap the
+        one line `lines()` books and leave the painter's clearing off by a
+        row. Deferred from #554 (Codex). Fix: replace control characters with
+        a visible placeholder before measuring, as the title code already
+        does for `title`.
 - [ ] **Startup reads the whole history.** `ArgumentRecall::load` (`repl.rs`)
       fetches every row and runs `needs_more_input` over each to reassemble
       multi-line commands, so a 100k-row store takes a debug build about 20
