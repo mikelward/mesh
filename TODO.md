@@ -2052,11 +2052,32 @@ the checkable list.
 The reedline surface `DESIGN.md` promises beyond what is wired up today. The
 MVP bindings themselves are done — the emacs defaults, `Alt-.` / `Esc` `.`
 last-argument recall (`EscapePrefix`, `repl.rs`), `Ctrl-R`, Tab's menu, and
-up/down prefix search (reedline's default when a prefix is typed). Already
+the up/down history list (`history_list.rs`, steered from `EscapePrefix`). Already
 tracked elsewhere and not repeated here: keybindings from `rc.mesh` plus the
 line-buffer/widget API, and the hint (autosuggestion) / highlighter hooks —
 all under "Beyond M3 — External tool integration".
 
+- [ ] **The history list, second round.** What landed is the five-row list
+      of the commands containing the line, newest first, over the shared
+      store. Candidates, each a small change to `history_list.rs`:
+      - **Prefix matches first?** The first cut ranked commands *starting
+        with* the line ahead of those merely containing it; the lean was
+        that recency alone reads better, and only use will say. Reversible
+        by adding a `Prefix` pass ahead of the substring one in `Matches`.
+      - **A fuzzy third tier** — after the substring matches, rows a `nucleo`
+        pattern matches (`gst` → `git status`), ranked by score. The matcher is
+        already a dependency, so the cost is the scan: the store answers the
+        substring match in SQL, but a fuzzy pass reads every row in pages, on
+        each keystroke that leaves the window short. A second pass in `Matches`.
+      - **Case-insensitive matching.** The match is exact: the store's `instr`
+        is. A lowercase query matching `Git` needs the Rust-side filter the
+        fuzzy tier would bring anyway.
+      - **A right-hand column** — how long ago, or the directory — once the
+        rich rows below exist. Dim, so the command stays the row.
+      - **Deleting narrows rather than closes.** `Backspace` closes the list
+        because the engine closes any quick menu on it (`can_quick_complete`,
+        with the reason in its doc comment); re-filtering on delete needs
+        either an engine option or a no-op-first edit the mode can rewrite to.
 - [ ] **The `history` built-in.** `DESIGN.md` §"Interactive history" calls a
       listing built-in *the MVP surface* — entries newest last, and
       `history | grep foo` as the search — and it does not exist: nothing
@@ -2445,7 +2466,8 @@ designed, and the cross-references say where the fuller note lives.
       expecting. reedline supports both and mesh exposes neither.
 - [ ] **The history question atuin forces.** mesh's SQLite store already carries
       most of atuin's schema, so "integrate atuin" splits in two: *atuin's UI
-      over mesh's store* (needs `$sh.history` or a documented on-disk contract)
+      over mesh's store* (needs `$sh.history` or a documented on-disk contract;
+      the native answer to that half is now the history list)
       versus *atuin as the store* (needs the recall motions — Up, Ctrl-R, `!$` —
       to read a pluggable backend, a much deeper change nobody has asked for).
       Decide before either is built: the answer determines whether

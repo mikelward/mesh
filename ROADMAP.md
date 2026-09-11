@@ -135,6 +135,9 @@ far, each documented in [`docs/REFERENCE.md`](docs/REFERENCE.md):
 - **Fuzzy, smart-case completion** (`nucleo`), and a four-layer source for
   what it offers: a curated spec file, else the command's manual page, else a
   bounded `--help` probe, else files and directories.
+- **The history list** — Up or Down shows the five most recent commands
+  matching the typed line beneath it, the way a browser's address bar does,
+  with the first already on the line so Up, Enter still runs the last one.
 - **The status-sensitive prompt** with composable lifecycle hooks, registered
   through `on` or the `$sh` event maps: `preprompt`, `preexec`, `postexec`, the
   **directory pair** `precd` / `postcd` that brackets every actual `cd`,

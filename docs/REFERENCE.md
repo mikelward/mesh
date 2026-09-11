@@ -973,7 +973,7 @@ have:
 | Ctrl-A / Ctrl-E | Start / end of the line |
 | Ctrl-B / Ctrl-F, arrows | Back / forward one character |
 | Alt-B / Alt-F | Back / forward one word |
-| Ctrl-P / Ctrl-N, up / down | Previous / next history entry |
+| Up / Down, Ctrl-P / Ctrl-N | Open the **history list** — see [History and recall](#history-and-recall) |
 | Ctrl-R | Search history backwards |
 | Ctrl-W / Alt-D | Cut the word before / after the cursor |
 | Ctrl-U / Ctrl-K | Cut to the start / end of the line |
@@ -1010,6 +1010,27 @@ command is stored and recalled as the **one logical command** it was typed as.
 Recall reaches back through earlier sessions but not sideways into a peer session
 that started later, so two shells open at once do not interleave each other's
 lines. `--no-save-history` keeps a session's history in memory instead.
+
+**Up or Down opens the history list**: beneath the line, the five most recent
+distinct commands that contain what you have typed, newest first, with the
+first selected and already on the line, so Up, Enter runs the last matching
+command as it always has. An empty
+line lists the last five commands. The key that opened the list walks it toward
+older commands and the other key walks back, so Up, Up, Enter and Down, Down,
+Enter both run the second one; the line follows the selection, and walking back
+past the first row restores what you typed. Enter runs the line. Tab, Esc, a
+cursor key, or Backspace closes the list and leaves the line to edit, and
+typing more narrows the list to the new text. Nothing matching, no list. Ctrl-R
+is still the search for a command from further back.
+
+```text
+mesh$ git
+| git status
+> git status
+  git push origin main
+  git log --oneline -5
+  echo git
+```
 
 Three **word designators** expand against the previous command line before it is
 parsed:
