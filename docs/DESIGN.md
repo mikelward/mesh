@@ -6604,10 +6604,13 @@ list walks it** (toward older matches) **and the other key walks back** — `Up`
 `Up` `Enter` and `Down` `Down` `Enter` both run the second match, so a readline
 hand and a browser hand each keep their habit. The line follows the selection,
 walking back past the first row restores what was typed, and walking back once
-more closes the list. `Enter` runs the line; `Tab`, `Esc`, a cursor motion, or
-a deletion close the list and leave the line to edit — it is yours again the
-moment you change it rather than add to it; typing more narrows the list to the
-new text with nothing selected, and a query with no matches shows no list at all.
+more closes the list. `Enter` runs the line. **Typing and deleting edit what
+was typed, not the selection**: the list re-filters to the new text with nothing
+selected, so a wrong row is corrected by typing on, not by walking back first —
+what a browser's address bar does. `Tab` or a cursor motion takes the selected
+command onto the line to edit and closes the list; `Esc` closes it and gives
+back what was typed; `Ctrl-C` abandons the line as ever. A query with no matches
+shows no list at all.
 Matching is a plain case-sensitive text match — the query is a command being
 retyped, not a search — and what the list shows is never written back: only what
 runs is history. The list draws **below** the line because that is where a
