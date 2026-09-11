@@ -12,6 +12,7 @@
 
 use std::collections::HashSet;
 use std::io;
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
@@ -21,6 +22,7 @@ use reedline::{
     Menu, MenuEvent, Painter, SearchDirection, SearchFilter, SearchQuery, Span, Suggestion,
     UndoBehavior,
 };
+use rusqlite::OpenFlags;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 /// The menu's name, for `ReedlineEvent::Menu`.
@@ -97,52 +99,253 @@ impl History for SharedHistory {
     }
 }
 
-/// Where the next page comes from: the rows older than the last one read, or
-/// nowhere, the store being read out.
+/// Where a fuzzy page is read from.
+///
+/// reedline's search knows a prefix and a substring, and a fuzzy match — the
+/// query's characters in order, anything between — is neither; it is a `GLOB`
+/// (`*g*s*t*`), which the store's own file answers through a second, read-only
+/// connection, scanning the table in C. A store with no file, the in-memory
+/// one behind `--no-save-history`, has its rows read out and sifted here
+/// instead; so does a file whose reader would not open.
+pub(crate) enum Reader {
+    Sqlite {
+        connection: rusqlite::Connection,
+        /// This session, and when it started, in the store's own terms: the
+        /// recall view is this session's rows plus every row from before it
+        /// began, and reedline applies that to its own searches only. Both
+        /// or neither, as reedline has it.
+        session: Option<(i64, i64)>,
+    },
+    Memory,
+}
+
+impl Reader {
+    /// A read-only reader on the store at `path`, or the in-memory sift when
+    /// the file will not open that way — said once on stderr, since the list
+    /// still works, only slower on a long history.
+    pub(crate) fn open(
+        path: &Path,
+        session: Option<HistorySessionId>,
+        started: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> Self {
+        match rusqlite::Connection::open_with_flags(
+            path,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        ) {
+            Ok(connection) => Reader::Sqlite {
+                connection,
+                session: session
+                    .zip(started)
+                    .map(|(session, started)| (i64::from(session), started.timestamp_millis())),
+            },
+            Err(err) => {
+                note!("mesh: could not open the history database for reading: {err}");
+                Reader::Memory
+            }
+        }
+    }
+
+    /// The page of rows older than `before` whose text has `query`'s
+    /// characters in order, newest first.
+    fn fuzzy_page(
+        &self,
+        history: &SharedHistory,
+        query: &str,
+        before: Option<HistoryItemId>,
+    ) -> Result<Page, String> {
+        match self {
+            Reader::Sqlite {
+                connection,
+                session,
+            } => {
+                // The session clause is reedline's own, `sqlite_backed.rs`.
+                let mut statement = connection
+                    .prepare_cached(
+                        "SELECT id, command_line FROM history \
+                         WHERE command_line GLOB ?1 AND (?2 IS NULL OR id < ?2) \
+                         AND (?4 IS NULL OR session_id = ?4 OR start_timestamp < ?5) \
+                         ORDER BY id DESC LIMIT ?3",
+                    )
+                    .map_err(|err| err.to_string())?;
+                let (session_id, started) = session.unzip();
+                let rows = statement
+                    .query_map(
+                        rusqlite::params![
+                            glob_pattern(query),
+                            before.map(|id| id.0),
+                            PAGE,
+                            session_id,
+                            started
+                        ],
+                        |row| {
+                            Ok((
+                                Some(HistoryItemId(row.get::<_, i64>(0)?)),
+                                row.get::<_, String>(1)?,
+                            ))
+                        },
+                    )
+                    .map_err(|err| err.to_string())?;
+                let rows = rows
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|err| err.to_string())?;
+                Ok(Page::of(rows))
+            }
+            Reader::Memory => {
+                let mut query_ =
+                    SearchQuery::everything(SearchDirection::Backward, history.session());
+                query_.start_id = before;
+                query_.limit = Some(PAGE);
+                let items = history.search(query_).map_err(|err| err.to_string())?;
+                // The page is the store's, matched or not: how far it reached
+                // and whether it was full are read off it *before* the sift,
+                // or a page of near misses would read as the end of the store.
+                let mut page = Page::of(
+                    items
+                        .into_iter()
+                        .map(|item| (item.id, item.command_line))
+                        .collect(),
+                );
+                page.rows
+                    .retain(|(_, command)| is_subsequence(query, command));
+                Ok(page)
+            }
+        }
+    }
+}
+
+/// One page read from the store, with where it reached and whether the
+/// store had more — judged on the page as read, before any sifting.
+struct Page {
+    rows: Vec<(Option<HistoryItemId>, String)>,
+    /// The oldest id on the page; the next page is the rows before it.
+    last: Option<HistoryItemId>,
+    /// A short page is the end of the store. So is a page with no ids at
+    /// all, which cannot be paged past.
+    more: bool,
+}
+
+impl Page {
+    fn of(rows: Vec<(Option<HistoryItemId>, String)>) -> Self {
+        let last = rows.iter().filter_map(|(id, _)| *id).next_back();
+        let more = rows.len() as i64 >= PAGE && last.is_some();
+        Self { rows, last, more }
+    }
+}
+
+/// `query` as the `GLOB` that matches its characters in order: `*g*s*t*`,
+/// with the three characters `GLOB` reads specially bracketed to themselves.
+fn glob_pattern(query: &str) -> String {
+    let mut pattern = String::from("*");
+    for ch in query.chars() {
+        match ch {
+            '*' | '?' | '[' => {
+                pattern.push('[');
+                pattern.push(ch);
+                pattern.push(']');
+            }
+            ch => pattern.push(ch),
+        }
+        pattern.push('*');
+    }
+    pattern
+}
+
+/// Whether `query`'s characters occur in `text` in that order.
+fn is_subsequence(query: &str, text: &str) -> bool {
+    let mut wanted = query.chars();
+    let mut next = wanted.next();
+    for ch in text.chars() {
+        if next == Some(ch) {
+            next = wanted.next();
+        }
+    }
+    next.is_none()
+}
+
+/// Which pass over the store the next page comes from, and where in it.
+/// Commands that *contain* the query come first, newest first; once those are
+/// read out, the commands whose text merely has the query's characters in
+/// order follow, newest first again. Recency ranks within each — a command
+/// that starts with the query is no higher than one that merely contains it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Next {
-    Before(Option<HistoryItemId>),
+enum Pass {
+    Contains(Option<HistoryItemId>),
+    Fuzzy(Option<HistoryItemId>),
     Done,
 }
 
-/// The distinct commands containing a query, newest first — recency alone
-/// ranks them, a command that starts with the query no higher than one that
-/// merely contains it — read from the store a page at a time and only as far
-/// as the list has asked to see.
+/// The distinct commands matching a query, read from the store a page at a
+/// time and only as far as the list has asked to see.
 struct Matches {
     history: SharedHistory,
+    reader: Arc<Mutex<Reader>>,
     query: String,
     rows: Vec<String>,
     seen: HashSet<String>,
-    next: Next,
+    pass: Pass,
     /// A store that could not be read. Kept rather than dropped so the list
     /// can say so — a paint has no stderr to speak through.
     error: Option<String>,
 }
 
 impl Matches {
-    fn new(history: SharedHistory, query: &str) -> Self {
+    fn new(history: SharedHistory, reader: Arc<Mutex<Reader>>, query: &str) -> Self {
         Self {
             history,
+            reader,
             query: query.to_owned(),
             rows: Vec::new(),
             seen: HashSet::new(),
-            next: Next::Before(None),
+            pass: Pass::Contains(None),
             error: None,
         }
     }
 
     /// Read pages until `want` rows are held or the store runs out.
     fn ensure(&mut self, want: usize) {
-        while self.rows.len() < want && self.next != Next::Done {
+        while self.rows.len() < want && self.pass != Pass::Done {
             self.page();
         }
     }
 
     fn page(&mut self) {
-        let Next::Before(before) = self.next else {
-            return;
+        let page = match self.pass {
+            Pass::Contains(before) => self.contains_page(before),
+            Pass::Fuzzy(before) => {
+                let reader = self
+                    .reader
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                reader.fuzzy_page(&self.history, &self.query, before)
+            }
+            Pass::Done => return,
         };
+        let page = match page {
+            Ok(page) => page,
+            Err(err) => {
+                self.error = Some(err);
+                self.pass = Pass::Done;
+                return;
+            }
+        };
+        for (_, command) in page.rows {
+            if self.seen.insert(command.clone()) {
+                self.rows.push(command);
+            }
+        }
+        self.pass = match self.pass {
+            Pass::Contains(_) if page.more => Pass::Contains(page.last),
+            // One character in order is one character contained, and an empty
+            // query already matched every row: neither has a fuzzy pass to run.
+            Pass::Contains(_) if self.query.chars().count() >= 2 => Pass::Fuzzy(None),
+            Pass::Fuzzy(_) if page.more => Pass::Fuzzy(page.last),
+            Pass::Contains(_) | Pass::Fuzzy(_) | Pass::Done => Pass::Done,
+        };
+    }
+
+    /// The page of rows older than `before` that contain the query, newest
+    /// first.
+    fn contains_page(&self, before: Option<HistoryItemId>) -> Result<Page, String> {
         let query = SearchQuery {
             direction: SearchDirection::Backward,
             start_time: None,
@@ -159,27 +362,13 @@ impl Matches {
                 self.history.session(),
             ),
         };
-        let items = match self.history.search(query) {
-            Ok(items) => items,
-            Err(err) => {
-                self.error = Some(err.to_string());
-                self.next = Next::Done;
-                return;
-            }
-        };
-        let exhausted = (items.len() as i64) < PAGE;
-        let mut last = None;
-        for item in items {
-            last = item.id.or(last);
-            if self.seen.insert(item.command_line.clone()) {
-                self.rows.push(item.command_line);
-            }
-        }
-        self.next = match last {
-            Some(_) if !exhausted => Next::Before(last),
-            // A store without ids cannot be paged; the one page it gave is it.
-            _ => Next::Done,
-        };
+        let items = self.history.search(query).map_err(|err| err.to_string())?;
+        Ok(Page::of(
+            items
+                .into_iter()
+                .map(|item| (item.id, item.command_line))
+                .collect(),
+        ))
     }
 }
 
@@ -198,6 +387,7 @@ pub(crate) enum Back {
 /// which one is selected.
 pub(crate) struct HistoryList {
     history: SharedHistory,
+    reader: Arc<Mutex<Reader>>,
     matches: Option<Matches>,
     /// The line as the user left it — the query, and what walking back
     /// restores. The line itself follows the selection.
@@ -208,9 +398,10 @@ pub(crate) struct HistoryList {
 }
 
 impl HistoryList {
-    pub(crate) fn new(history: SharedHistory) -> Self {
+    pub(crate) fn new(history: SharedHistory, reader: Reader) -> Self {
         Self {
             history,
+            reader: Arc::new(Mutex::new(reader)),
             matches: None,
             typed: String::new(),
             selected: None,
@@ -241,7 +432,7 @@ impl HistoryList {
     /// that failed to answer is something to show, so that is `true`.
     pub(crate) fn refilter(&mut self, line: &str) -> bool {
         self.typed = line.to_owned();
-        let mut matches = Matches::new(self.history.clone(), line);
+        let mut matches = Matches::new(self.history.clone(), Arc::clone(&self.reader), line);
         matches.ensure(ROWS);
         let any = !matches.rows.is_empty() || matches.error.is_some();
         self.matches = Some(matches);
@@ -345,12 +536,13 @@ impl HistoryList {
             let text = row_text(command, width.saturating_sub(marker.width() as u16));
             let mut line = String::from(marker);
             if color {
-                let (before, matched, after) = split_match(&text, &self.typed);
-                line.push_str(&style.paint(before).to_string());
-                if !matched.is_empty() {
-                    line.push_str(&style.underline().paint(matched).to_string());
+                let mut at = 0;
+                for (start, end) in match_ranges(&text, &self.typed) {
+                    line.push_str(&style.paint(&text[at..start]).to_string());
+                    line.push_str(&style.underline().paint(&text[start..end]).to_string());
+                    at = end;
                 }
-                line.push_str(&style.paint(after).to_string());
+                line.push_str(&style.paint(&text[at..]).to_string());
             } else {
                 line.push_str(&text);
             }
@@ -400,19 +592,32 @@ fn truncate(text: &str, width: usize) -> String {
     out
 }
 
-/// `text` around its first occurrence of `query`, for underlining the match.
-/// No query, or none left after truncation, leaves the middle empty.
-fn split_match<'a>(text: &'a str, query: &str) -> (&'a str, &'a str, &'a str) {
+/// The byte ranges of `text` to underline as the match: the query's first
+/// occurrence when `text` contains it, else each of its characters at the
+/// first place it can stand, runs of neighbors merged. Nothing for an empty
+/// query, or for a match the row's truncation cut away.
+fn match_ranges(text: &str, query: &str) -> Vec<(usize, usize)> {
     if query.is_empty() {
-        return (text, "", "");
+        return Vec::new();
     }
-    match text.find(query) {
-        Some(start) => {
-            let end = start + query.len();
-            (&text[..start], &text[start..end], &text[end..])
+    if let Some(start) = text.find(query) {
+        return vec![(start, start + query.len())];
+    }
+    let mut ranges: Vec<(usize, usize)> = Vec::new();
+    let mut wanted = query.chars();
+    let mut next = wanted.next();
+    for (at, ch) in text.char_indices() {
+        if next != Some(ch) {
+            continue;
         }
-        None => (text, "", ""),
+        let end = at + ch.len_utf8();
+        match ranges.last_mut() {
+            Some(last) if last.1 == at => last.1 = end,
+            _ => ranges.push((at, end)),
+        }
+        next = wanted.next();
     }
+    if next.is_some() { Vec::new() } else { ranges }
 }
 
 /// The [`Menu`] reedline paints. Its active flag is shared with the edit mode,
@@ -435,10 +640,10 @@ pub(crate) struct HistoryMenu {
 }
 
 impl HistoryMenu {
-    pub(crate) fn new(history: SharedHistory) -> Self {
+    pub(crate) fn new(history: SharedHistory, reader: Reader) -> Self {
         Self {
             active: Arc::new(AtomicBool::new(false)),
-            list: HistoryList::new(history),
+            list: HistoryList::new(history, reader),
             events: Vec::new(),
             synced: None,
             width: 80,
@@ -693,7 +898,7 @@ mod tests {
             "ls",
             "git status",
         ]);
-        let mut list = HistoryList::new(store);
+        let mut list = HistoryList::new(store, Reader::Memory);
         assert!(list.open("git"));
         assert_eq!(
             rows(&list),
@@ -707,14 +912,14 @@ mod tests {
     #[test]
     fn an_empty_line_lists_the_last_distinct_commands() {
         let store = store(&["a", "b", "c", "d", "e", "f", "e", "g"]);
-        let mut list = HistoryList::new(store);
+        let mut list = HistoryList::new(store, Reader::Memory);
         assert!(list.open(""));
         assert_eq!(rows(&list), ["g", "e", "f", "d", "c"]);
     }
 
     #[test]
     fn nothing_matching_is_no_list() {
-        let mut list = HistoryList::new(store(&["ls", "pwd"]));
+        let mut list = HistoryList::new(store(&["ls", "pwd"]), Reader::Memory);
         assert!(!list.open("git"));
         assert!(rows(&list).is_empty());
         assert_eq!(list.line(), "git", "the typed line stands");
@@ -723,7 +928,7 @@ mod tests {
     #[test]
     fn walking_moves_the_selection_and_scrolls_the_window() {
         let store = store(&["m1", "m2", "m3", "m4", "m5", "m6", "m7", "m8"]);
-        let mut list = HistoryList::new(store);
+        let mut list = HistoryList::new(store, Reader::Memory);
         list.open("m");
         assert_eq!(rows(&list), ["m8", "m7", "m6", "m5", "m4"]);
         for _ in 0..4 {
@@ -751,7 +956,7 @@ mod tests {
 
     #[test]
     fn the_walk_stops_at_the_oldest_match() {
-        let mut list = HistoryList::new(store(&["ls -l", "ls"]));
+        let mut list = HistoryList::new(store(&["ls -l", "ls"]), Reader::Memory);
         list.open("ls");
         assert!(list.walk());
         assert_eq!(list.line(), "ls -l");
@@ -761,7 +966,7 @@ mod tests {
 
     #[test]
     fn walking_back_past_the_first_row_restores_the_typed_line_then_closes() {
-        let mut list = HistoryList::new(store(&["ls -l", "ls"]));
+        let mut list = HistoryList::new(store(&["ls -l", "ls"]), Reader::Memory);
         list.open("l");
         assert_eq!(list.line(), "ls");
         assert_eq!(list.back(), Back::ToTyped);
@@ -778,12 +983,16 @@ mod tests {
 
     #[test]
     fn refiltering_selects_nothing_and_reports_whether_anything_matched() {
-        let mut list = HistoryList::new(store(&["git status", "git push"]));
+        let mut list = HistoryList::new(store(&["git status", "git push"]), Reader::Memory);
         list.open("git");
         list.walk();
         assert!(list.refilter("git s"));
         assert_eq!(list.selected_line(), None);
-        assert_eq!(rows(&list), ["git status"]);
+        assert_eq!(
+            rows(&list),
+            ["git status", "git push"],
+            "the containing row, then the fuzzy one (`git pu`s`h`)"
+        );
         assert_eq!(list.line(), "git s");
         assert!(!list.refilter("git x"));
         assert!(rows(&list).is_empty());
@@ -793,7 +1002,7 @@ mod tests {
     fn matches_are_read_a_page_at_a_time_as_the_walk_needs_them() {
         let commands: Vec<String> = (0..150).map(|n| format!("cmd {n}")).collect();
         let refs: Vec<&str> = commands.iter().map(String::as_str).collect();
-        let mut list = HistoryList::new(store(&refs));
+        let mut list = HistoryList::new(store(&refs), Reader::Memory);
         list.open("cmd");
         assert_eq!(
             list.matches.as_ref().unwrap().rows.len(),
@@ -811,7 +1020,7 @@ mod tests {
     fn repeats_inside_a_page_do_not_count_toward_the_window() {
         let mut commands = vec!["ls"; 100];
         commands.push("ls -l");
-        let mut list = HistoryList::new(store(&commands));
+        let mut list = HistoryList::new(store(&commands), Reader::Memory);
         list.open("ls");
         assert_eq!(
             rows(&list),
@@ -829,7 +1038,7 @@ mod tests {
             "echo a very long command line that will not fit",
             "ls",
         ]);
-        let mut list = HistoryList::new(store);
+        let mut list = HistoryList::new(store, Reader::Memory);
         list.open("");
         assert_eq!(
             list.render(24, false),
@@ -840,7 +1049,7 @@ mod tests {
 
     #[test]
     fn with_color_the_selection_is_reversed_and_the_match_underlined() {
-        let mut list = HistoryList::new(store(&["git status"]));
+        let mut list = HistoryList::new(store(&["git status"]), Reader::Memory);
         list.open("stat");
         let drawn = list.render(80, true);
         assert!(drawn.starts_with("> "), "{drawn:?}");
@@ -849,6 +1058,88 @@ mod tests {
             drawn.contains("\u{1b}[1;4;7mstat"),
             "underlined match: {drawn:?}"
         );
+    }
+
+    #[test]
+    fn fuzzy_matches_follow_the_substring_matches_newest_first() {
+        let store = store(&["git stash", "gs", "git status", "ls", "grep -rs tail"]);
+        let mut list = HistoryList::new(store, Reader::Memory);
+        assert!(list.open("gs"));
+        assert_eq!(
+            rows(&list),
+            ["gs", "grep -rs tail", "git status", "git stash"],
+            "the one row containing `gs`, then those with a g before an s, newest first"
+        );
+        assert!(list.refilter("gst"));
+        assert_eq!(rows(&list), ["grep -rs tail", "git status", "git stash"]);
+        assert!(!list.refilter("gsx"));
+    }
+
+    #[test]
+    fn the_in_memory_sift_pages_past_a_page_of_near_misses() {
+        // Newest first, the first page holds nothing that matches; the match
+        // is older than the page, and the sift must not take a page it
+        // emptied for the end of the store.
+        let mut commands = vec!["git status"];
+        commands.extend(std::iter::repeat_n("ls -la", PAGE as usize + 3));
+        let mut list = HistoryList::new(store(&commands), Reader::Memory);
+        assert!(list.open("gst"));
+        assert_eq!(rows(&list), ["git status"]);
+    }
+
+    #[test]
+    fn a_one_character_query_has_no_fuzzy_pass() {
+        let mut list = HistoryList::new(store(&["ab", "b"]), Reader::Memory);
+        list.open("b");
+        assert_eq!(rows(&list), ["b", "ab"]);
+        assert_eq!(list.matches.as_ref().unwrap().pass, Pass::Done);
+    }
+
+    #[test]
+    fn the_sqlite_reader_answers_the_fuzzy_pass_with_a_glob() {
+        let dir = std::env::temp_dir().join(format!("mesh-history-list-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("history.sqlite3");
+        let _ = std::fs::remove_file(&path);
+        let mut history =
+            reedline::SqliteBackedHistory::with_file(path.clone(), None, None).unwrap();
+        for command in ["git stash", "a*b?[c]", "git status", "ls"] {
+            history
+                .save(HistoryItem::from_command_line(command))
+                .unwrap();
+        }
+        let reader = Reader::open(&path, None, None);
+        assert!(matches!(reader, Reader::Sqlite { .. }));
+        let mut list = HistoryList::new(SharedHistory::new(history), reader);
+        assert!(list.open("gst"));
+        assert_eq!(rows(&list), ["git status", "git stash"]);
+        assert!(
+            list.refilter("*?["),
+            "the GLOB's own characters match themselves"
+        );
+        assert_eq!(rows(&list), ["a*b?[c]"]);
+        assert!(!list.refilter("zz"));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_glob_pattern_puts_the_query_in_order_and_brackets_its_specials() {
+        assert_eq!(glob_pattern("gst"), "*g*s*t*");
+        assert_eq!(glob_pattern("a*b?["), "*a*[*]*b*[?]*[[]*");
+        assert_eq!(glob_pattern(""), "*");
+    }
+
+    #[test]
+    fn a_fuzzy_row_underlines_each_matched_character() {
+        assert_eq!(match_ranges("git status", "stat"), vec![(4, 8)]);
+        assert_eq!(match_ranges("git status", "gst"), vec![(0, 1), (4, 6)]);
+        assert_eq!(
+            match_ranges("git status", "gsx"),
+            vec![],
+            "no match, nothing underlined"
+        );
+        assert_eq!(match_ranges("git status", ""), vec![]);
+        assert_eq!(match_ranges("日本語", "日語"), vec![(0, 3), (6, 9)]);
     }
 
     #[test]
@@ -909,7 +1200,7 @@ mod tests {
 
     #[test]
     fn a_store_that_cannot_be_read_is_said_so_in_the_list() {
-        let mut list = HistoryList::new(SharedHistory::new(Broken));
+        let mut list = HistoryList::new(SharedHistory::new(Broken), Reader::Memory);
         assert!(list.open("x"), "a failure is something to show");
         assert_eq!(list.selected_line(), None);
         assert_eq!(list.lines(), 1);
@@ -925,7 +1216,7 @@ mod tests {
             "the row is cut to the width, as `lines` books one line for it"
         );
         let (mut menu, mut editor) = (
-            HistoryMenu::new(SharedHistory::new(Broken)),
+            HistoryMenu::new(SharedHistory::new(Broken), Reader::Memory),
             Editor::default(),
         );
         menu.menu_event(MenuEvent::Activate(false));
@@ -936,6 +1227,50 @@ mod tests {
             menu.menu_string(10, false)
                 .contains("could not read history")
         );
+    }
+
+    /// The store as one session sees it: `session` started at `started`.
+    fn session_store(
+        path: &std::path::Path,
+        session: Option<HistorySessionId>,
+        started: chrono::DateTime<chrono::Utc>,
+    ) -> reedline::SqliteBackedHistory {
+        reedline::SqliteBackedHistory::with_file(path.to_path_buf(), session, Some(started))
+            .unwrap()
+    }
+
+    #[test]
+    fn a_peer_sessions_running_commands_are_not_yet_history_in_either_pass() {
+        let dir = std::env::temp_dir().join(format!("mesh-history-peer-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("history.sqlite3");
+        let _ = std::fs::remove_file(&path);
+        let earlier = chrono::Utc::now() - chrono::Duration::seconds(10);
+        let now = chrono::Utc::now();
+        let peer_session = reedline::Reedline::create_history_session_id();
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        let this_session = reedline::Reedline::create_history_session_id();
+        assert_ne!(peer_session, this_session);
+        let mut peer = session_store(&path, peer_session, earlier);
+        let this = session_store(&path, this_session, now);
+        // Before this session began: history. After: a peer still at work.
+        for (command, when) in [
+            ("git status", earlier),
+            ("peer secret", now + chrono::Duration::seconds(1)),
+        ] {
+            let mut item = HistoryItem::from_command_line(command);
+            item.session_id = peer_session;
+            item.start_timestamp = Some(when);
+            peer.save(item).unwrap();
+        }
+        let reader = Reader::open(&path, this_session, Some(now));
+        let mut list = HistoryList::new(SharedHistory::new(this), reader);
+        assert!(list.open(""));
+        assert_eq!(rows(&list), ["git status"], "the substring pass");
+        assert!(!list.refilter("psc"), "the fuzzy pass through the reader");
+        assert!(list.refilter("gst"));
+        assert_eq!(rows(&list), ["git status"]);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     fn typed(editor: &mut Editor, line: &str) {
@@ -949,7 +1284,7 @@ mod tests {
     fn menu(commands: &[&str], line: &str) -> (HistoryMenu, Editor) {
         let mut editor = Editor::default();
         typed(&mut editor, line);
-        (HistoryMenu::new(store(commands)), editor)
+        (HistoryMenu::new(store(commands), Reader::Memory), editor)
     }
 
     #[test]

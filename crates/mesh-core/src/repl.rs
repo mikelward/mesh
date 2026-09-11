@@ -37,7 +37,7 @@ use crate::builtins::{self, Builtin, Multiplexer, NOTIFY_LIMIT};
 use crate::completion::{CompletionCache, CompletionSpec, ValueHint, man_pages, rank_candidates};
 use crate::expand::{Piece, VarRef, Word};
 use crate::funcs::{self, FuncDef, Funcs};
-use crate::history_list::{HISTORY_LIST, HistoryMenu, SharedHistory};
+use crate::history_list::{HISTORY_LIST, HistoryMenu, Reader, SharedHistory};
 #[cfg(test)]
 use crate::hooks::Hook;
 use crate::hooks::HookEvent;
@@ -16513,6 +16513,7 @@ fn run_interactive(options: &StartupOptions) -> ExitCode {
     let mut argument_recall = ArgumentRecall::default();
     let mut history_session = None;
     let mut history = None;
+    let mut reader = Reader::Memory;
     if options.save_history
         && let Some(path) = history_path()
     {
@@ -16520,19 +16521,20 @@ fn run_interactive(options: &StartupOptions) -> ExitCode {
         let session_started = Some(std::time::SystemTime::now().into());
         let opened = prepare_history_path(&path)
             .map_err(|err| err.to_string())
-            .and_then(|()| open_history(path, session, session_started));
+            .and_then(|()| open_history(path.clone(), session, session_started));
         match opened {
             Ok(opened) => {
                 argument_recall.load(&opened, session);
                 history_session = session;
                 history = Some(SharedHistory::new(opened));
+                reader = Reader::open(&path, session, session_started);
             }
             Err(err) => note!("mesh: could not open history database: {err}"),
         }
     }
     let history =
         history.unwrap_or_else(|| SharedHistory::new(reedline::FileBackedHistory::default()));
-    let history_menu = HistoryMenu::new(history.clone());
+    let history_menu = HistoryMenu::new(history.clone(), reader);
     let edit_mode = EscapePrefix::new(interactive_keybindings(), history_menu.active_flag());
     let search_state = edit_mode.search_state();
     let list_state = history_menu.active_flag();
