@@ -308,6 +308,7 @@ and each is **on**:
 | `bold-input` | The line you are typing is drawn in the terminal's normal weight, not bold |
 | `command-notify` | A command that runs longer than ten seconds finishes quietly, instead of raising a desktop notification. `notify` still works — it is called, not drawn |
 | `cwd-report` | No `OSC 7` working-directory report, so a new tab or split opens wherever your terminal would have anyway |
+| `history-inline` | No inline suggestion ahead of the cursor — the line you type is not completed from your most recent matching command |
 | `osc-title` | The window and tab title is left alone, for a terminal or multiplexer that sets it itself |
 | `shell-integration` | No prompt marks, so a terminal cannot tell prompt from input from output. `OSC 133`, or `OSC 633` with the command line under VS Code |
 
@@ -327,7 +328,7 @@ Write one at a time, usually from a startup file:
 ```mesh
 $sh.options.bold-input = false          # takes effect at once
 puts $sh.options.bold-input             # false
-puts ...$sh.options:keys                # bold-input command-notify cwd-report osc-title shell-integration
+puts ...$sh.options:keys                # bold-input command-notify cwd-report history-inline osc-title shell-integration
 ```
 
 The map is strict in both directions, because a setting that is silently not
@@ -1028,6 +1029,16 @@ to edit; Esc closes the list and gives your text back. While a recalled
 command is on the line, only the part you typed is bold; the rest is drawn in
 normal weight, so the line reads as your text plus the suggestion. Nothing
 matching, no list. Ctrl-R is still the search for a command from further back.
+
+As you type, the rest of your most recent command that **starts with** the line
+is drawn ahead of the cursor in dim text — a ghost you can accept or type
+straight past. It is a prefix match, not the list's fuzzy one, so the suggestion
+only ever finishes the exact line: Right, Ctrl-F or End take the whole of it and
+Alt-F one word, while Enter runs what you typed and leaves the ghost behind. It
+shows only with the cursor at the end of the line, since that is where it is
+accepted; move back into the line to edit and it steps aside.
+`$sh.options.history-inline = false` turns it off. A damaged history file draws no
+ghost rather than failing the prompt.
 
 ```text
 mesh$ git

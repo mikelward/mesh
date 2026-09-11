@@ -30122,7 +30122,7 @@ fn the_settings_map_reads_as_booleans_that_start_on() {
     let out = run_with_input("puts ...$sh.options:keys\n");
     assert_eq!(
         String::from_utf8_lossy(&out.stdout),
-        "bold-input command-notify cwd-report osc-title shell-integration\n"
+        "bold-input command-notify cwd-report history-inline osc-title shell-integration\n"
     );
 
     let out = run_with_input(
@@ -30131,7 +30131,7 @@ fn the_settings_map_reads_as_booleans_that_start_on() {
     );
     assert_eq!(
         String::from_utf8_lossy(&out.stdout),
-        "bold-input true\ncommand-notify true\ncwd-report true\nosc-title true\n\
+        "bold-input true\ncommand-notify true\ncwd-report true\nhistory-inline true\nosc-title true\n\
          shell-integration true\ndirect true\n"
     );
     assert!(
@@ -30168,7 +30168,7 @@ fn a_setting_can_be_turned_off_and_back_on() {
     let out = run_with_input("$sh.options.bold-input = false\nputs ...$sh.options:values\n");
     assert_eq!(
         String::from_utf8_lossy(&out.stdout),
-        "false true true true true\n"
+        "false true true true true true\n"
     );
 }
 
