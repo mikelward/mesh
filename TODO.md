@@ -2058,26 +2058,35 @@ line-buffer/widget API, and the hint (autosuggestion) / highlighter hooks —
 all under "Beyond M3 — External tool integration".
 
 - [ ] **The history list, second round.** What landed is the five-row list
-      of the commands containing the line, newest first, over the shared
-      store. Candidates, each a small change to `history_list.rs`:
+      of the commands containing the line, then those matching it fuzzily
+      (`GLOB` through a read-only reader on the store), newest first within
+      each, over the shared store. Candidates, each a small change to
+      `history_list.rs`:
       - **Prefix matches first?** The first cut ranked commands *starting
         with* the line ahead of those merely containing it; the lean was
         that recency alone reads better, and only use will say. Reversible
-        by adding a `Prefix` pass ahead of the substring one in `Matches`.
-      - **A fuzzy third tier** — after the substring matches, rows a `nucleo`
-        pattern matches (`gst` → `git status`), ranked by score. The matcher is
-        already a dependency, so the cost is the scan: the store answers the
-        substring match in SQL, but a fuzzy pass reads every row in pages, on
-        each keystroke that leaves the window short. A second pass in `Matches`.
-      - **Case-insensitive matching.** The match is exact: the store's `instr`
-        is. A lowercase query matching `Git` needs the Rust-side filter the
-        fuzzy tier would bring anyway.
+        by adding a `Prefix` pass ahead of the `Contains` one in `Matches`.
+      - **Score the fuzzy rows?** They rank by recency, like the rest. `fzf`
+        ranks a subsequence match by tightness and word starts, and `nucleo`
+        (already a dependency) scores the same way; the `GLOB` would stay as
+        the sieve and the score would order a page. Only use will say whether
+        `gst` wants `git stash` above an older `git status`.
+      - **Case-insensitive matching.** Both passes are exact — the store's
+        `instr` and `GLOB` are. A lowercase query matching `Git` needs `LIKE`
+        for the fuzzy pass (ASCII-insensitive) and a Rust sift for the rest.
       - **A right-hand column** — how long ago, or the directory — once the
         rich rows below exist. Dim, so the command stays the row.
       - **Deleting narrows rather than closes.** `Backspace` closes the list
         because the engine closes any quick menu on it (`can_quick_complete`,
         with the reason in its doc comment); re-filtering on delete needs
         either an engine option or a no-op-first edit the mode can rewrite to.
+- [ ] **Startup reads the whole history.** `ArgumentRecall::load` (`repl.rs`)
+      fetches every row and runs `needs_more_input` over each to reassemble
+      multi-line commands, so a 100k-row store takes a debug build about 20
+      seconds to reach the first prompt (found padding a store to time the
+      history list's `GLOB`, which itself answers in about 10 ms). It wants
+      the last few *complete* commands, not all of them: read backward a page
+      at a time and stop once one has been assembled per live session.
 - [ ] **The `history` built-in.** `DESIGN.md` §"Interactive history" calls a
       listing built-in *the MVP surface* — entries newest last, and
       `history | grep foo` as the search — and it does not exist: nothing

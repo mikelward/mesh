@@ -1014,10 +1014,13 @@ lines. `--no-save-history` keeps a session's history in memory instead.
 **Up or Down opens the history list**: beneath the line, the five most recent
 distinct commands that contain what you have typed, newest first, with the
 first selected and already on the line, so Up, Enter runs the last matching
-command as it always has. An empty
-line lists the last five commands. The key that opened the list walks it toward
-older commands and the other key walks back, so Up, Up, Enter and Down, Down,
-Enter both run the second one; the line follows the selection, and walking back
+command as it always has. An empty line lists the last five commands. When the
+commands containing the text run out, the ones whose characters merely appear
+*in that order* follow — `gst` reaches `git status` — newest first again, so a
+literal match is always listed before a loose one. The key that opened the list
+walks it toward older commands and the other key walks back, so Up, Up, Enter
+and Down, Down, Enter both run the second one; the line follows the selection,
+and walking back
 past the first row restores what you typed. Enter runs the line. Tab, Esc, a
 cursor key, or Backspace closes the list and leaves the line to edit, and
 typing more narrows the list to the new text. Nothing matching, no list. Ctrl-R
