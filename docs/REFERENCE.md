@@ -1024,8 +1024,10 @@ and walking back
 past the first row restores what you typed. Enter runs the line. Typing and
 Backspace edit what you typed, not the selected command, and the list narrows
 to the new text. Tab or a cursor key takes the selected command onto the line
-to edit; Esc closes the list and gives your text back. Nothing matching, no
-list. Ctrl-R is still the search for a command from further back.
+to edit; Esc closes the list and gives your text back. While a recalled
+command is on the line, only the part you typed is bold; the rest is drawn in
+normal weight, so the line reads as your text plus the suggestion. Nothing
+matching, no list. Ctrl-R is still the search for a command from further back.
 
 ```text
 mesh$ git
