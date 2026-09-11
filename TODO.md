@@ -2080,6 +2080,23 @@ all under "Beyond M3 — External tool integration".
         because the engine closes any quick menu on it (`can_quick_complete`,
         with the reason in its doc comment); re-filtering on delete needs
         either an engine option or a no-op-first edit the mode can rewrite to.
+      - **Keys batched with the opener are steered as if the list were
+        closed.** reedline's `process_input_batch` parses every raw event a
+        poll returned *before* handling any, so when `Up` and a second key
+        arrive in one batch — held-key auto-repeat on a slow build, a pasted
+        key sequence — `EscapePrefix` reads the menu's active flag before the
+        activation has run: the second `Up` walks back instead of older, and
+        `Enter` closes the list without submitting. Deferred from #554 (Codex,
+        the second verified finding against the same mechanism): the edit
+        mode steering the list off a flag the engine updates per batch is the
+        design at fault, not the classification. Two ways out: the mode
+        tracks a *pending* activation from the `Menu(history_list)` it
+        emitted until the flag catches up (it must also forget it when the
+        activation could not happen — a completion menu open, the reverse
+        search, no matches — which is exactly the state it cannot see), or
+        the steering moves into reedline as a menu that answers its own keys,
+        the honest fix. Not reachable from a single keystroke, so it waits on
+        one of those rather than a third mirror.
 - [ ] **Startup reads the whole history.** `ArgumentRecall::load` (`repl.rs`)
       fetches every row and runs `needs_more_input` over each to reassemble
       multi-line commands, so a 100k-row store takes a debug build about 20
