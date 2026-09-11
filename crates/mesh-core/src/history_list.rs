@@ -496,6 +496,17 @@ impl HistoryList {
         self.selected_line().unwrap_or(&self.typed)
     }
 
+    /// The typed line — the query, and what an edit applies to.
+    pub(crate) fn typed(&self) -> &str {
+        &self.typed
+    }
+
+    /// Drop the selection so the typed line stands again. `false` when there
+    /// was none.
+    pub(crate) fn deselect(&mut self) -> bool {
+        self.selected.take().is_some()
+    }
+
     /// The visible rows, each with whether it is the selected one.
     pub(crate) fn visible(&self) -> Vec<(&str, bool)> {
         let Some(matches) = self.matches.as_ref() else {
@@ -712,16 +723,28 @@ impl HistoryMenu {
                 match &self.synced {
                     // The engine reports a quick menu's edit twice per key.
                     Some(synced) if *synced == now => {}
-                    // Typing narrows the list; nothing is selected until walked to.
-                    Some((line, _)) if *line != now.0 => {
+                    // Typing edits what was typed, and the list narrows to it.
+                    // The edit mode puts the typed line back (`MoveLeft`)
+                    // ahead of every such edit, so with nothing selected a
+                    // changed line is the typed line changed — never a
+                    // keystroke on a row's text to be inferred back.
+                    Some((line, _)) if *line != now.0 && self.list.selected_line().is_none() => {
                         if !self.list.refilter(&now.0) {
                             self.deactivate();
                         }
                     }
-                    // The cursor moved on a line that did not change: the line
-                    // is being edited, and the list is in the way of that.
+                    // The cursor moved, or a selected row was edited by a
+                    // path that did not put the typed line back first: the
+                    // line is being edited, and the list is in the way of it.
                     Some(_) => self.deactivate(),
                     None => {}
+                }
+            }
+            // The edit mode's "back to what was typed": `Esc` leads with it so
+            // the list closes over the typed line, not the selection.
+            MenuEvent::MoveLeft => {
+                if self.list.deselect() {
+                    Self::show(editor, self.list.line());
                 }
             }
             MenuEvent::MoveDown | MenuEvent::NextElement => {
@@ -736,7 +759,6 @@ impl HistoryMenu {
                 Back::Close => self.deactivate(),
             },
             MenuEvent::Deactivate
-            | MenuEvent::MoveLeft
             | MenuEvent::MoveRight
             | MenuEvent::NextPage
             | MenuEvent::PreviousPage => {}
@@ -1337,18 +1359,90 @@ mod tests {
         assert_eq!(menu.list().selected_line(), Some("git status"));
         assert!(menu.is_active());
 
+        // The edit mode's spelling of a keystroke with a row selected: back
+        // to the typed line, then the edit — which lands on that line.
+        menu.menu_event(MenuEvent::MoveLeft);
+        menu.menu_event(MenuEvent::Edit(false));
+        menu.apply(&mut editor);
+        assert_eq!(editor.get_buffer(), "git");
         typed(&mut editor, "git p");
         menu.menu_event(MenuEvent::Edit(false));
         menu.apply(&mut editor);
         assert!(menu.is_active());
         assert_eq!(menu.list().selected_line(), None);
         assert_eq!(rows(menu.list()), ["git push"]);
-        assert_eq!(editor.get_buffer(), "git p", "typing is not overwritten");
+        assert_eq!(editor.get_buffer(), "git p");
 
+        // With nothing selected the line is the typed text and edits are direct.
         typed(&mut editor, "git px");
         menu.menu_event(MenuEvent::Edit(false));
         menu.apply(&mut editor);
         assert!(!menu.is_active(), "nothing matches: no list");
+        assert_eq!(editor.get_buffer(), "git px");
+    }
+
+    #[test]
+    fn an_edit_on_a_selected_row_without_the_typed_line_put_back_closes_the_list() {
+        let (mut menu, mut editor) = menu(&["git push", "git status"], "git");
+        menu.menu_event(MenuEvent::Activate(false));
+        menu.apply(&mut editor);
+        assert_eq!(editor.get_buffer(), "git status");
+        // No path in the edit mode does this; were one to, the row's text is
+        // not the typed line, and guessing the typed edit from it is what
+        // went wrong three times over. The list gets out of the way instead.
+        typed(&mut editor, "git statu");
+        menu.menu_event(MenuEvent::Edit(false));
+        menu.apply(&mut editor);
+        assert!(!menu.is_active());
+        assert_eq!(
+            editor.get_buffer(),
+            "git statu",
+            "the line is left as edited"
+        );
+    }
+
+    #[test]
+    fn a_word_deletion_runs_on_the_typed_line_once_it_is_put_back() {
+        let (mut menu, mut editor) = menu(&["git stash", "git status --short"], "git st");
+        menu.menu_event(MenuEvent::Activate(false));
+        menu.apply(&mut editor);
+        assert_eq!(editor.get_buffer(), "git status --short");
+        // Ctrl-W as the edit mode spells it: back to the typed line, then the
+        // cut — which the engine runs on that line, so the count of what
+        // came off the row never enters into it.
+        menu.menu_event(MenuEvent::MoveLeft);
+        menu.menu_event(MenuEvent::Edit(false));
+        menu.apply(&mut editor);
+        assert_eq!(editor.get_buffer(), "git st");
+        typed(&mut editor, "git ");
+        menu.menu_event(MenuEvent::Edit(false));
+        menu.apply(&mut editor);
+        assert_eq!(
+            editor.get_buffer(),
+            "git ",
+            "the word came off the typed line"
+        );
+        assert_eq!(rows(menu.list()), ["git status --short", "git stash"]);
+        assert_eq!(menu.list().selected_line(), None);
+    }
+
+    #[test]
+    fn the_back_to_typed_event_drops_the_selection() {
+        let (mut menu, mut editor) = menu(&["git push", "git status"], "git");
+        menu.menu_event(MenuEvent::Activate(false));
+        menu.apply(&mut editor);
+        menu.menu_event(MenuEvent::MoveLeft);
+        menu.apply(&mut editor);
+        assert!(menu.is_active(), "the list stays; only the selection goes");
+        assert_eq!(editor.get_buffer(), "git");
+        assert_eq!(menu.list().selected_line(), None);
+        menu.menu_event(MenuEvent::MoveLeft);
+        menu.apply(&mut editor);
+        assert_eq!(
+            editor.get_buffer(),
+            "git",
+            "nothing selected: nothing to do"
+        );
     }
 
     #[test]

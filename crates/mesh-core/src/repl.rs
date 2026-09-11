@@ -16865,30 +16865,67 @@ fn without_menu_arms(event: ReedlineEvent) -> ReedlineEvent {
     }
 }
 
-/// The events the open history list lets by unchanged: typing, which
-/// narrows it; `Esc` and `Ctrl-C`, which the engine answers by closing every
-/// menu; and the ones that are not keys at all. Everything else closes the
-/// list before it runs — see [`EscapePrefix::steer_list`].
-fn passes_through_open_list(event: &ReedlineEvent) -> bool {
-    match event {
-        ReedlineEvent::Edit(commands) => commands.iter().all(|command| {
-            matches!(
-                command,
-                EditCommand::InsertChar(_)
-                    | EditCommand::InsertString(_)
-                    | EditCommand::InsertNewline
-            )
-        }),
-        ReedlineEvent::Esc
-        | ReedlineEvent::CtrlC
-        | ReedlineEvent::ClearScreen
-        | ReedlineEvent::ClearScrollback
-        | ReedlineEvent::None
-        | ReedlineEvent::Repaint
-        | ReedlineEvent::Resize(..)
-        | ReedlineEvent::Mouse { .. } => true,
-        _ => false,
+/// `event` as an edit of the typed line, when it is one: typing, or a
+/// deletion to the left. The list re-filters on it.
+///
+/// Every such edit runs on the typed line itself: the line is put back first
+/// (`MenuLeft`, applied by the empty edit — see `walk`), and the edit then
+/// lands on it. With a row selected the line holds that row's text, and an
+/// edit made there would have to be inferred back onto the typed line —
+/// which a word deletion, a grapheme deletion and a combining character
+/// each defeated in turn. Nothing is inferred now: the editor makes the
+/// edit on the text it belongs to.
+///
+/// A deletion is led by a move to the end of the line, which is where the
+/// cursor already is (showing a line puts it there, and a cursor motion
+/// closes the list), so it moves nothing and starts no undo point. It is
+/// there because the engine closes a quick menu when the *first* command of
+/// an edit is a `Backspace` or a word backspace, before the menu can answer;
+/// led by the no-op, the deletion runs with its own semantics — the same
+/// undo snapshot and the same cut buffer as with no list open — and the
+/// menu is asked to re-filter.
+fn filter_edit(event: &ReedlineEvent) -> Option<ReedlineEvent> {
+    let ReedlineEvent::Edit(commands) = event else {
+        return None;
+    };
+    let mut edit = Vec::with_capacity(commands.len() + 1);
+    for command in commands {
+        match command {
+            EditCommand::InsertChar(_)
+            | EditCommand::InsertString(_)
+            | EditCommand::InsertNewline => {}
+            EditCommand::Backspace | EditCommand::BackspaceWord | EditCommand::CutWordLeft => {
+                if edit.is_empty() {
+                    edit.push(EditCommand::MoveToLineEnd { select: false });
+                }
+            }
+            _ => return None,
+        }
+        edit.push(command.clone());
     }
+    Some(ReedlineEvent::Multiple(vec![
+        ReedlineEvent::MenuLeft,
+        ReedlineEvent::Edit(Vec::new()),
+        ReedlineEvent::Edit(edit),
+    ]))
+}
+
+/// The events the open history list lets by unchanged: `Ctrl-C`, which the
+/// engine answers by abandoning the line, and the ones that are not keys at
+/// all. Typing, deleting and `Esc` are respelled before this is asked, and
+/// everything else closes the list before it runs — see
+/// [`EscapePrefix::steer_list`].
+fn passes_through_open_list(event: &ReedlineEvent) -> bool {
+    matches!(
+        event,
+        ReedlineEvent::CtrlC
+            | ReedlineEvent::ClearScreen
+            | ReedlineEvent::ClearScrollback
+            | ReedlineEvent::None
+            | ReedlineEvent::Repaint
+            | ReedlineEvent::Resize(..)
+            | ReedlineEvent::Mouse { .. }
+    )
 }
 
 /// Whether `event` is, or contains, the reverse search's entry.
@@ -16976,13 +17013,13 @@ impl EscapePrefix {
 
     /// What a key does while the history list is open. `Up` and `Down` walk
     /// it, the opening key toward older matches; `Enter` closes it and runs
-    /// the line; typing narrows it, and `Esc` and `Ctrl-C` leave it to the
-    /// engine, which closes menus itself. **Everything else closes the list
-    /// first and then does its plain work** — a cursor key, a cut, a delete,
-    /// `Tab`, a host command, the search — so no key is ever lost on the
-    /// menu, and the line is the user's again the moment they change rather
-    /// than add to it. Closing-first is the default rather than a list of
-    /// keys because the list of keys is what goes stale.
+    /// the line; typing and deleting edit what was typed and narrow it; `Esc`
+    /// gives the typed line back and closes it; `Ctrl-C` is left to the
+    /// engine, which abandons the line. **Everything else closes the list
+    /// first and then does its plain work** — a cursor key, a cut to the
+    /// right, `Tab`, a host command, the search — so no key is ever lost on
+    /// the menu. Closing-first is the default rather than a list of keys
+    /// because the list of keys is what goes stale.
     fn steer_list(&mut self, event: ReedlineEvent) -> ReedlineEvent {
         let (up, down) = (list_up(), list_down());
         if !self.list_open.load(Ordering::Relaxed) {
@@ -17015,6 +17052,17 @@ impl EscapePrefix {
         } else if contains_menu(&event, COMPLETION_MENU) {
             // `Tab` keeps the line to edit; the next `Tab` completes it.
             accept
+        } else if event == ReedlineEvent::Esc {
+            // Back to the typed line first, so the list closes over that and
+            // not the selection; the empty edit is what makes the engine
+            // apply it before `Esc` runs (see `walk`).
+            ReedlineEvent::Multiple(vec![
+                ReedlineEvent::MenuLeft,
+                ReedlineEvent::Edit(Vec::new()),
+                ReedlineEvent::Esc,
+            ])
+        } else if let Some(edit) = filter_edit(&event) {
+            edit
         } else if passes_through_open_list(&event) {
             event
         } else {
@@ -20780,21 +20828,64 @@ mod tests {
     }
 
     #[test]
-    fn typing_passes_through_to_the_open_list_and_editing_closes_it_first() {
+    fn typing_and_deleting_edit_the_filter_and_esc_gives_the_typed_line_back() {
         let (mut mode, flag) = escape_prefix_with_list();
         flag.store(true, Ordering::Relaxed);
+        // Every edit runs on the typed line itself, put back first.
+        let on_typed_line = |edit| {
+            ReedlineEvent::Multiple(vec![
+                ReedlineEvent::MenuLeft,
+                ReedlineEvent::Edit(vec![]),
+                ReedlineEvent::Edit(edit),
+            ])
+        };
         assert_eq!(
             press(&mut mode, KeyCode::Char('x'), KeyModifiers::NONE),
-            ReedlineEvent::Edit(vec![EditCommand::InsertChar('x')]),
+            on_typed_line(vec![EditCommand::InsertChar('x')]),
             "the engine re-filters the list on the edit"
+        );
+        // A deletion keeps its own command — its undo snapshot, its cut
+        // buffer — behind a no-op that keeps the engine from closing the
+        // list on it.
+        let to_end = EditCommand::MoveToLineEnd { select: false };
+        assert_eq!(
+            press(&mut mode, KeyCode::Backspace, KeyModifiers::NONE),
+            on_typed_line(vec![to_end.clone(), EditCommand::Backspace]),
+            "led past the engine's close-on-Backspace"
+        );
+        assert_eq!(
+            press(&mut mode, KeyCode::Backspace, KeyModifiers::ALT),
+            on_typed_line(vec![to_end.clone(), EditCommand::BackspaceWord])
+        );
+        assert_eq!(
+            press(&mut mode, KeyCode::Char('w'), KeyModifiers::CONTROL),
+            on_typed_line(vec![to_end, EditCommand::CutWordLeft])
         );
         assert_eq!(
             press(&mut mode, KeyCode::Esc, KeyModifiers::NONE),
-            ReedlineEvent::Esc,
-            "Esc closes the list in the engine and arms the prefix as ever"
+            ReedlineEvent::Multiple(vec![
+                ReedlineEvent::MenuLeft,
+                ReedlineEvent::Edit(vec![]),
+                ReedlineEvent::Esc
+            ]),
+            "back to the typed line, then the engine closes the list"
         );
-        // A motion, a cut, a delete, and a jump: each closes the list over
-        // the selection and then does its own work on the line.
+        // The engine has closed the list by the time the next key arrives.
+        flag.store(false, Ordering::Relaxed);
+        assert_eq!(
+            press(&mut mode, KeyCode::Char('.'), KeyModifiers::NONE),
+            recall_last_argument(),
+            "and that Esc still armed the meta prefix"
+        );
+    }
+
+    #[test]
+    fn a_key_the_list_cannot_answer_closes_it_over_the_selection_first() {
+        let (mut mode, flag) = escape_prefix_with_list();
+        flag.store(true, Ordering::Relaxed);
+        // A motion, a cut to the right, a delete under the cursor, and a
+        // jump: each closes the list over the selection and then does its
+        // own work on the line.
         for (code, modifiers, plain) in [
             (
                 KeyCode::Char('a'),
@@ -20802,14 +20893,9 @@ mod tests {
                 ReedlineEvent::Edit(vec![EditCommand::MoveToLineStart { select: false }]),
             ),
             (
-                KeyCode::Char('w'),
+                KeyCode::Char('k'),
                 KeyModifiers::CONTROL,
-                ReedlineEvent::Edit(vec![EditCommand::CutWordLeft]),
-            ),
-            (
-                KeyCode::Backspace,
-                KeyModifiers::NONE,
-                ReedlineEvent::Edit(vec![EditCommand::Backspace]),
+                ReedlineEvent::Edit(vec![EditCommand::KillLine]),
             ),
             (
                 KeyCode::Char('<'),

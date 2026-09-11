@@ -2081,10 +2081,15 @@ all under "Beyond M3 — External tool integration".
         one style.
       - **A right-hand column** — how long ago, or the directory — once the
         rich rows below exist. Dim, so the command stays the row.
-      - **Deleting narrows rather than closes.** `Backspace` closes the list
-        because the engine closes any quick menu on it (`can_quick_complete`,
-        with the reason in its doc comment); re-filtering on delete needs
-        either an engine option or a no-op-first edit the mode can rewrite to.
+      - **Deleting the last typed character closes the list.** The engine
+        deactivates every non-persistent menu the moment the line is empty
+        (`ReedlineEvent::Edit` in reedline's engine), after the list has
+        already re-filtered to the empty query. So Backspace narrows down to
+        one character and then closes rather than showing the recent
+        commands; Up reopens it. Deferred from #555 (Codex). The way out is
+        an engine option — `persistent_menus` is global and would also keep
+        the completion menu open on Backspace — or a per-menu say in that
+        rule, which reedline does not offer yet.
       - **Keys batched with the opener are steered as if the list were
         closed.** reedline's `process_input_batch` parses every raw event a
         poll returned *before* handling any, so when `Up` and a second key
