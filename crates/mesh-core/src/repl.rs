@@ -37,6 +37,7 @@ use crate::builtins::{self, Builtin, Multiplexer, NOTIFY_LIMIT};
 use crate::completion::{CompletionCache, CompletionSpec, ValueHint, man_pages, rank_candidates};
 use crate::expand::{Piece, VarRef, Word};
 use crate::funcs::{self, FuncDef, Funcs};
+use crate::history_list::{HISTORY_LIST, HistoryMenu, SharedHistory};
 #[cfg(test)]
 use crate::hooks::Hook;
 use crate::hooks::HookEvent;
@@ -16505,8 +16506,36 @@ fn run_interactive(options: &StartupOptions) -> ExitCode {
         return ExitCode::from(1);
     }
     let completion = Arc::new(RwLock::new(CompletionState::default()));
-    let edit_mode = EscapePrefix::new(interactive_keybindings());
+    // One store for the whole session: reedline saves to it, the history list
+    // reads it. Opened before the editor so the list can be built over it, and
+    // in memory until `--no-save-history` or a database that will not open
+    // says that is all there is.
+    let mut argument_recall = ArgumentRecall::default();
+    let mut history_session = None;
+    let mut history = None;
+    if options.save_history
+        && let Some(path) = history_path()
+    {
+        let session = Reedline::create_history_session_id();
+        let session_started = Some(std::time::SystemTime::now().into());
+        let opened = prepare_history_path(&path)
+            .map_err(|err| err.to_string())
+            .and_then(|()| open_history(path, session, session_started));
+        match opened {
+            Ok(opened) => {
+                argument_recall.load(&opened, session);
+                history_session = session;
+                history = Some(SharedHistory::new(opened));
+            }
+            Err(err) => note!("mesh: could not open history database: {err}"),
+        }
+    }
+    let history =
+        history.unwrap_or_else(|| SharedHistory::new(reedline::FileBackedHistory::default()));
+    let history_menu = HistoryMenu::new(history.clone());
+    let edit_mode = EscapePrefix::new(interactive_keybindings(), history_menu.active_flag());
     let search_state = edit_mode.search_state();
+    let list_state = history_menu.active_flag();
     let completion_menu = completion_menu();
     // Before the editor, so the highlighter can be handed the *same* settings the
     // shell writes to: `$sh.options.bold-input = false` has to reach a reedline
@@ -16536,30 +16565,15 @@ fn run_interactive(options: &StartupOptions) -> ExitCode {
         ))))
         .with_visual_selection_style(nu_ansi_term::Style::default())
         .with_menu(ReedlineMenu::EngineCompleter(Box::new(completion_menu)))
+        // `HistoryMenu` rather than `WithCompleter`: the list reads the shared
+        // store itself, and this is the one variant whose activation the
+        // engine knows leaves the host completer alone.
+        .with_menu(ReedlineMenu::HistoryMenu(Box::new(history_menu)))
         .with_completer(Box::new(MeshCompleter {
             state: Arc::clone(&completion),
-        }));
-    let mut argument_recall = ArgumentRecall::default();
-    let mut history_session = None;
-    if options.save_history
-        && let Some(path) = history_path()
-    {
-        let session = Reedline::create_history_session_id();
-        let session_started = Some(std::time::SystemTime::now().into());
-        let history = prepare_history_path(&path)
-            .map_err(|err| err.to_string())
-            .and_then(|()| open_history(path, session, session_started));
-        match history {
-            Ok(history) => {
-                argument_recall.load(&history, session);
-                history_session = session;
-                editor = editor
-                    .with_history(Box::new(history))
-                    .with_history_session_id(session);
-            }
-            Err(err) => note!("mesh: could not open history database: {err}"),
-        }
-    }
+        }))
+        .with_history(Box::new(history))
+        .with_history_session_id(history_session);
     shell
         .vars
         .set_invocation(options.name.clone(), options.args.clone());
@@ -16640,6 +16654,10 @@ fn run_interactive(options: &StartupOptions) -> ExitCode {
         // that signal is ignored below and the loop reads again.
         if !matches!(read, Ok(Signal::HostCommand(_))) {
             search_state.store(false, Ordering::Relaxed);
+            // The list's flag is the menu's own, and every such return has
+            // closed the menu; `Ctrl-D` is the exit that closes it without an
+            // event, and here is where that shows.
+            list_state.store(false, Ordering::Relaxed);
         }
         match read {
             Ok(Signal::HostCommand(command)) if command == "mesh:recall-last-argument" => {
@@ -16735,6 +16753,17 @@ fn interactive_keybindings() -> Keybindings {
         KeyCode::Char('.'),
         ReedlineEvent::ExecuteHostCommand("mesh:recall-last-argument".to_owned()),
     );
+    // The history list, on the four keys that walked history one line at a
+    // time. A completion menu already open keeps the arrow (`MenuUp`); the
+    // reverse search ignores `Menu` and takes the plain walk after it.
+    for (modifiers, code, event) in [
+        (KeyModifiers::NONE, KeyCode::Up, list_up()),
+        (KeyModifiers::NONE, KeyCode::Down, list_down()),
+        (KeyModifiers::CONTROL, KeyCode::Char('p'), list_up()),
+        (KeyModifiers::CONTROL, KeyCode::Char('n'), list_down()),
+    ] {
+        keybindings.add_binding(modifiers, code, event);
+    }
     keybindings.add_binding(
         KeyModifiers::NONE,
         KeyCode::Tab,
@@ -16744,6 +16773,131 @@ fn interactive_keybindings() -> Keybindings {
         ]),
     );
     keybindings
+}
+
+/// Whether `event` is, or contains, `Menu(name)`.
+fn contains_menu(event: &ReedlineEvent, name: &str) -> bool {
+    match event {
+        ReedlineEvent::Menu(menu) => menu == name,
+        ReedlineEvent::UntilFound(events) | ReedlineEvent::Multiple(events) => {
+            events.iter().any(|event| contains_menu(event, name))
+        }
+        _ => false,
+    }
+}
+
+/// `Up` with the history list closed: the open completion menu's row, else
+/// the list, else — in a reverse search, which ignores menus — the walk.
+fn list_up() -> ReedlineEvent {
+    ReedlineEvent::UntilFound(vec![
+        ReedlineEvent::MenuUp,
+        ReedlineEvent::Menu(HISTORY_LIST.to_owned()),
+        ReedlineEvent::Up,
+    ])
+}
+
+/// `Down` with the history list closed; see [`list_up`].
+fn list_down() -> ReedlineEvent {
+    ReedlineEvent::UntilFound(vec![
+        ReedlineEvent::MenuDown,
+        ReedlineEvent::Menu(HISTORY_LIST.to_owned()),
+        ReedlineEvent::Down,
+    ])
+}
+
+/// Which key opened the history list. That key walks the list toward older
+/// matches and the other walks back, so `Up` `Up` `Enter` and `Down` `Down`
+/// `Enter` both reach the second match — see `docs/DESIGN.md` §"Interactive
+/// history" and the entry under TODO.md's *Decisions needing review*.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Opener {
+    Up,
+    Down,
+}
+
+/// A step through the open history list. The empty edit behind it is what
+/// makes the engine refresh the menu — and so the line the step changed —
+/// before it paints, rather than one keystroke later; it edits nothing.
+fn walk(step: ReedlineEvent) -> ReedlineEvent {
+    ReedlineEvent::Multiple(vec![step, ReedlineEvent::Edit(Vec::new())])
+}
+
+/// Whether `event` is, or contains, one of the menu-navigation events the
+/// history list does not answer — a `Left`, a `Tab`'s `MenuNext`. With the
+/// list open those would move nothing, so the edit mode closes the list ahead
+/// of them and lets the key do its plain work.
+fn strays_into_menu(event: &ReedlineEvent) -> bool {
+    match event {
+        ReedlineEvent::MenuNext
+        | ReedlineEvent::MenuPrevious
+        | ReedlineEvent::MenuLeft
+        | ReedlineEvent::MenuRight
+        | ReedlineEvent::MenuPageNext
+        | ReedlineEvent::MenuPagePrevious => true,
+        ReedlineEvent::UntilFound(events) | ReedlineEvent::Multiple(events) => {
+            events.iter().any(strays_into_menu)
+        }
+        _ => false,
+    }
+}
+
+/// `event` with the menu-navigation arms [`strays_into_menu`] names removed,
+/// so what is left is what the key does with no menu open.
+fn without_menu_arms(event: ReedlineEvent) -> ReedlineEvent {
+    match event {
+        ReedlineEvent::UntilFound(events) => ReedlineEvent::UntilFound(
+            events
+                .into_iter()
+                .filter(|event| !strays_into_menu(event))
+                .map(without_menu_arms)
+                .collect(),
+        ),
+        ReedlineEvent::Multiple(events) => ReedlineEvent::Multiple(
+            events
+                .into_iter()
+                .filter(|event| !strays_into_menu(event))
+                .map(without_menu_arms)
+                .collect(),
+        ),
+        event => event,
+    }
+}
+
+/// The events the open history list lets by unchanged: typing, which
+/// narrows it; `Esc` and `Ctrl-C`, which the engine answers by closing every
+/// menu; and the ones that are not keys at all. Everything else closes the
+/// list before it runs — see [`EscapePrefix::steer_list`].
+fn passes_through_open_list(event: &ReedlineEvent) -> bool {
+    match event {
+        ReedlineEvent::Edit(commands) => commands.iter().all(|command| {
+            matches!(
+                command,
+                EditCommand::InsertChar(_)
+                    | EditCommand::InsertString(_)
+                    | EditCommand::InsertNewline
+            )
+        }),
+        ReedlineEvent::Esc
+        | ReedlineEvent::CtrlC
+        | ReedlineEvent::ClearScreen
+        | ReedlineEvent::ClearScrollback
+        | ReedlineEvent::None
+        | ReedlineEvent::Repaint
+        | ReedlineEvent::Resize(..)
+        | ReedlineEvent::Mouse { .. } => true,
+        _ => false,
+    }
+}
+
+/// Whether `event` is, or contains, the reverse search's entry.
+fn enters_history_search(event: &ReedlineEvent) -> bool {
+    match event {
+        ReedlineEvent::SearchHistory => true,
+        ReedlineEvent::UntilFound(events) | ReedlineEvent::Multiple(events) => {
+            events.iter().any(enters_history_search)
+        }
+        _ => false,
+    }
 }
 
 /// readline's meta prefix: `Esc` and then a character behaves as `Alt` plus
@@ -16762,6 +16916,11 @@ fn interactive_keybindings() -> Keybindings {
 /// buffer returns a signal instead — so the mirror is shared with the read
 /// loop (see [`EscapePrefix::search_state`]), which clears it whenever
 /// `read_line` returns with the engine reset to regular input.
+///
+/// The history list is steered from here too. While it is open — its own flag
+/// says so, set by the engine — the arrows walk it, `Enter` runs the line it
+/// put there, and every other key first closes it and then does its plain
+/// work, so the list never swallows a keystroke.
 struct EscapePrefix {
     inner: Emacs,
     /// The previous key was a bare `Esc`, so the next character is `Alt`-ed.
@@ -16769,6 +16928,10 @@ struct EscapePrefix {
     /// The engine is in reverse history search, where `Esc` means "leave the
     /// search" rather than the meta prefix.
     searching: Arc<AtomicBool>,
+    /// The history list is open — [`HistoryMenu`]'s own active flag.
+    list_open: Arc<AtomicBool>,
+    /// The key that last asked for the list, so the walk knows its direction.
+    opener: Opener,
 }
 
 /// Whether the engine's reverse-history-search handler answers `event` by
@@ -16799,11 +16962,61 @@ fn leaves_history_search(event: &ReedlineEvent) -> bool {
 }
 
 impl EscapePrefix {
-    fn new(keybindings: Keybindings) -> Self {
+    fn new(keybindings: Keybindings, list_open: Arc<AtomicBool>) -> Self {
         Self {
             inner: Emacs::new(keybindings),
             armed: false,
             searching: Arc::new(AtomicBool::new(false)),
+            list_open,
+            opener: Opener::Up,
+        }
+    }
+
+    /// What a key does while the history list is open. `Up` and `Down` walk
+    /// it, the opening key toward older matches; `Enter` closes it and runs
+    /// the line; typing narrows it, and `Esc` and `Ctrl-C` leave it to the
+    /// engine, which closes menus itself. **Everything else closes the list
+    /// first and then does its plain work** — a cursor key, a cut, a delete,
+    /// `Tab`, a host command, the search — so no key is ever lost on the
+    /// menu, and the line is the user's again the moment they change rather
+    /// than add to it. Closing-first is the default rather than a list of
+    /// keys because the list of keys is what goes stale.
+    fn steer_list(&mut self, event: ReedlineEvent) -> ReedlineEvent {
+        let (up, down) = (list_up(), list_down());
+        if !self.list_open.load(Ordering::Relaxed) {
+            if event == up {
+                self.opener = Opener::Up;
+            } else if event == down {
+                self.opener = Opener::Down;
+            }
+            return event;
+        }
+        // `Enter` on an open menu closes it over the selection and is handled;
+        // the second one is what submits.
+        let accept = ReedlineEvent::Enter;
+        if event == up || event == down {
+            let opened_by = if event == up {
+                Opener::Up
+            } else {
+                Opener::Down
+            };
+            walk(if opened_by == self.opener {
+                ReedlineEvent::MenuDown
+            } else {
+                ReedlineEvent::MenuUp
+            })
+        } else if matches!(
+            event,
+            ReedlineEvent::Enter | ReedlineEvent::Submit | ReedlineEvent::SubmitOrNewline
+        ) {
+            ReedlineEvent::Multiple(vec![accept, event])
+        } else if contains_menu(&event, COMPLETION_MENU) {
+            // `Tab` keeps the line to edit; the next `Tab` completes it.
+            accept
+        } else if passes_through_open_list(&event) {
+            event
+        } else {
+            ReedlineEvent::Multiple(vec![accept, without_menu_arms(event)])
         }
     }
 
@@ -16858,7 +17071,8 @@ impl EditMode for EscapePrefix {
             }
             event => self.forward(event),
         };
-        if parsed == ReedlineEvent::SearchHistory {
+        let parsed = self.steer_list(parsed);
+        if enters_history_search(&parsed) {
             self.searching.store(true, Ordering::Relaxed);
         } else if self.searching.load(Ordering::Relaxed) && leaves_history_search(&parsed) {
             self.searching.store(false, Ordering::Relaxed);
@@ -18387,19 +18601,22 @@ impl Prompt for MeshPrompt {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
     use super::{
-        ArgumentRecall, CommandLine, CompletionState, EscapePrefix, HeredocGate, Hook, HookEvent,
-        Integration, Invocation, Lookup, MeshPrompt, NOTIFY_LIMIT, PromptMarkers, SemanticMark,
-        Shell, StartupOptions, Step, TITLE_LIMIT, TYPE_MARKER_WORDS, TimestampedHistory,
-        argument_completions, body_awaits_close, command_line, command_notification,
-        command_position, command_segment_words, command_words, completed_command, deferred_words,
-        duration_words, escape_stripped_width, eval_binary, expand_history_designators,
-        expansion_word, external_stage, func_definition_is_open, handle_signal, help_completions,
-        history_designators, history_path_from, input_highlighter, interactive_keybindings,
-        interruptible_task, last_argument, mark_sequence, needs_more_input, open_history,
-        path_completions_sync, persist_logical_history, prepare_history_path, run_hooks, run_line,
-        run_source, segment_completions, strip_type_marker, title_sequence, title_text,
-        variable_completions, vscode_escaped,
+        ArgumentRecall, CommandLine, CompletionState, EscapePrefix, HISTORY_LIST, HeredocGate,
+        Hook, HookEvent, Integration, Invocation, Lookup, MeshPrompt, NOTIFY_LIMIT, PromptMarkers,
+        SemanticMark, Shell, StartupOptions, Step, TITLE_LIMIT, TYPE_MARKER_WORDS,
+        TimestampedHistory, argument_completions, body_awaits_close, command_line,
+        command_notification, command_position, command_segment_words, command_words,
+        completed_command, deferred_words, duration_words, escape_stripped_width, eval_binary,
+        expand_history_designators, expansion_word, external_stage, func_definition_is_open,
+        handle_signal, help_completions, history_designators, history_path_from, input_highlighter,
+        interactive_keybindings, interruptible_task, last_argument, list_down, list_up,
+        mark_sequence, needs_more_input, open_history, path_completions_sync,
+        persist_logical_history, prepare_history_path, run_hooks, run_line, run_source,
+        segment_completions, strip_type_marker, title_sequence, title_text, variable_completions,
+        vscode_escaped, walk,
     };
 
     /// One debt per dialect, however many titles were written.
@@ -20438,7 +20655,177 @@ mod tests {
     }
 
     fn escape_prefix() -> EscapePrefix {
-        EscapePrefix::new(interactive_keybindings())
+        EscapePrefix::new(interactive_keybindings(), Arc::new(AtomicBool::new(false)))
+    }
+
+    /// An edit mode and the history list's flag, as the menu would set it.
+    fn escape_prefix_with_list() -> (EscapePrefix, Arc<AtomicBool>) {
+        let flag = Arc::new(AtomicBool::new(false));
+        (
+            EscapePrefix::new(interactive_keybindings(), Arc::clone(&flag)),
+            flag,
+        )
+    }
+
+    #[test]
+    fn up_and_down_open_the_history_list() {
+        let keys = interactive_keybindings();
+        for (modifiers, code, event) in [
+            (KeyModifiers::NONE, KeyCode::Up, list_up()),
+            (KeyModifiers::CONTROL, KeyCode::Char('p'), list_up()),
+            (KeyModifiers::NONE, KeyCode::Down, list_down()),
+            (KeyModifiers::CONTROL, KeyCode::Char('n'), list_down()),
+        ] {
+            assert_eq!(keys.find_binding(modifiers, code), Some(event));
+        }
+        assert_eq!(
+            list_up(),
+            ReedlineEvent::UntilFound(vec![
+                ReedlineEvent::MenuUp,
+                ReedlineEvent::Menu(HISTORY_LIST.to_owned()),
+                ReedlineEvent::Up,
+            ]),
+            "a completion menu keeps the arrow; the reverse search keeps the walk"
+        );
+    }
+
+    #[test]
+    fn the_key_that_opened_the_list_walks_it_and_the_other_walks_back() {
+        let (mut mode, flag) = escape_prefix_with_list();
+        assert_eq!(press(&mut mode, KeyCode::Up, KeyModifiers::NONE), list_up());
+        flag.store(true, Ordering::Relaxed);
+        assert_eq!(
+            press(&mut mode, KeyCode::Up, KeyModifiers::NONE),
+            walk(ReedlineEvent::MenuDown),
+            "Up Up reaches the second match"
+        );
+        assert_eq!(
+            press(&mut mode, KeyCode::Down, KeyModifiers::NONE),
+            walk(ReedlineEvent::MenuUp)
+        );
+        assert_eq!(
+            press(&mut mode, KeyCode::Char('p'), KeyModifiers::CONTROL),
+            walk(ReedlineEvent::MenuDown),
+            "Ctrl-P is Up"
+        );
+        flag.store(false, Ordering::Relaxed);
+        assert_eq!(
+            press(&mut mode, KeyCode::Down, KeyModifiers::NONE),
+            list_down()
+        );
+        flag.store(true, Ordering::Relaxed);
+        assert_eq!(
+            press(&mut mode, KeyCode::Down, KeyModifiers::NONE),
+            walk(ReedlineEvent::MenuDown),
+            "Down Down reaches the second match too"
+        );
+        assert_eq!(
+            press(&mut mode, KeyCode::Up, KeyModifiers::NONE),
+            walk(ReedlineEvent::MenuUp)
+        );
+        assert_eq!(
+            walk(ReedlineEvent::MenuDown),
+            ReedlineEvent::Multiple(vec![ReedlineEvent::MenuDown, ReedlineEvent::Edit(vec![])]),
+            "the empty edit makes the engine refresh the list before painting"
+        );
+    }
+
+    #[test]
+    fn enter_runs_the_line_the_list_put_there() {
+        let (mut mode, flag) = escape_prefix_with_list();
+        flag.store(true, Ordering::Relaxed);
+        assert_eq!(
+            press(&mut mode, KeyCode::Enter, KeyModifiers::NONE),
+            ReedlineEvent::Multiple(vec![ReedlineEvent::Enter, ReedlineEvent::Enter]),
+            "the first Enter closes the list over the selection, the second submits"
+        );
+    }
+
+    #[test]
+    fn tab_closes_the_list_and_keeps_the_line_to_edit() {
+        let (mut mode, flag) = escape_prefix_with_list();
+        flag.store(true, Ordering::Relaxed);
+        assert_eq!(
+            press(&mut mode, KeyCode::Tab, KeyModifiers::NONE),
+            ReedlineEvent::Enter
+        );
+    }
+
+    #[test]
+    fn a_key_the_list_would_swallow_closes_it_first() {
+        let (mut mode, flag) = escape_prefix_with_list();
+        flag.store(true, Ordering::Relaxed);
+        assert_eq!(
+            press(&mut mode, KeyCode::Left, KeyModifiers::NONE),
+            ReedlineEvent::Multiple(vec![
+                ReedlineEvent::Enter,
+                ReedlineEvent::UntilFound(vec![ReedlineEvent::Left]),
+            ]),
+            "Left moves in the line, not in a list that has no columns"
+        );
+        assert_eq!(
+            press(&mut mode, KeyCode::Char('.'), KeyModifiers::ALT),
+            ReedlineEvent::Multiple(vec![ReedlineEvent::Enter, recall_last_argument()])
+        );
+        assert_eq!(
+            press(&mut mode, KeyCode::Char('r'), KeyModifiers::CONTROL),
+            ReedlineEvent::Multiple(vec![ReedlineEvent::Enter, ReedlineEvent::SearchHistory])
+        );
+        assert!(
+            mode.search_state().load(Ordering::Relaxed),
+            "and the search mirror still sees the search begin"
+        );
+    }
+
+    #[test]
+    fn typing_passes_through_to_the_open_list_and_editing_closes_it_first() {
+        let (mut mode, flag) = escape_prefix_with_list();
+        flag.store(true, Ordering::Relaxed);
+        assert_eq!(
+            press(&mut mode, KeyCode::Char('x'), KeyModifiers::NONE),
+            ReedlineEvent::Edit(vec![EditCommand::InsertChar('x')]),
+            "the engine re-filters the list on the edit"
+        );
+        assert_eq!(
+            press(&mut mode, KeyCode::Esc, KeyModifiers::NONE),
+            ReedlineEvent::Esc,
+            "Esc closes the list in the engine and arms the prefix as ever"
+        );
+        // A motion, a cut, a delete, and a jump: each closes the list over
+        // the selection and then does its own work on the line.
+        for (code, modifiers, plain) in [
+            (
+                KeyCode::Char('a'),
+                KeyModifiers::CONTROL,
+                ReedlineEvent::Edit(vec![EditCommand::MoveToLineStart { select: false }]),
+            ),
+            (
+                KeyCode::Char('w'),
+                KeyModifiers::CONTROL,
+                ReedlineEvent::Edit(vec![EditCommand::CutWordLeft]),
+            ),
+            (
+                KeyCode::Backspace,
+                KeyModifiers::NONE,
+                ReedlineEvent::Edit(vec![EditCommand::Backspace]),
+            ),
+            (
+                KeyCode::Char('<'),
+                KeyModifiers::ALT,
+                ReedlineEvent::ToStart,
+            ),
+            (
+                KeyCode::Char('d'),
+                KeyModifiers::CONTROL,
+                ReedlineEvent::CtrlD,
+            ),
+        ] {
+            assert_eq!(
+                press(&mut mode, code, modifiers),
+                ReedlineEvent::Multiple(vec![ReedlineEvent::Enter, plain]),
+                "{code:?}"
+            );
+        }
     }
 
     fn press(mode: &mut EscapePrefix, code: KeyCode, modifiers: KeyModifiers) -> ReedlineEvent {
@@ -20504,10 +20891,7 @@ mod tests {
         // `Alt`+`Up`, and a control chord keeps its unprefixed meaning.
         let mut mode = escape_prefix();
         press(&mut mode, KeyCode::Esc, KeyModifiers::NONE);
-        assert_eq!(
-            press(&mut mode, KeyCode::Up, KeyModifiers::NONE),
-            ReedlineEvent::UntilFound(vec![ReedlineEvent::MenuUp, ReedlineEvent::Up])
-        );
+        assert_eq!(press(&mut mode, KeyCode::Up, KeyModifiers::NONE), list_up());
         press(&mut mode, KeyCode::Esc, KeyModifiers::NONE);
         assert_eq!(
             press(&mut mode, KeyCode::Char('w'), KeyModifiers::CONTROL),
