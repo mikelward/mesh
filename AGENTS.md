@@ -19,16 +19,15 @@ has stopped biting.
 
 ## Responding to review comments
 
-- **Codex is the automated reviewer on this repo** — not Copilot. Its
-  reviews are triggered automatically; you don't request them, except when
-  nothing has come back five minutes after a push — that means it never
-  picked the push up — or to confirm a rebutted false positive (see *Judge
-  every review comment on merit*). Address its comments without being asked,
-  folding each
-  fix into the commit it belongs to (rebase / `--fixup`) rather than tacking
-  on an "address review" commit — the one exception being a real finding
-  that's genuinely out of scope for this PR, which you defer instead (see
-  *Deferring a finding* below).
+- **Codex is the automated reviewer on this repo** — not Copilot. Its reviews
+  are triggered automatically; you don't request them, except when nothing has
+  come back five minutes after a push — that means it never picked the push up
+  — or to confirm a rebutted false positive (see *Judge every review comment on
+  merit*). Address its comments without being asked, folding each fix into the
+  commit it belongs to (rebase / `--fixup`) rather than tacking on an "address
+  review" commit — the one exception being a real finding that's genuinely out
+  of scope for this PR, which you defer instead (see *Deferring a finding*
+  below).
 - **`resolve_review_thread` works — pass the `PRRT_*` thread node ID** from
   `pull_request_read` / `get_review_comments` (`review_threads[].id`) as
   `threadId`. A comment's `PRRC_*` node ID fails; they're different objects.
@@ -68,17 +67,9 @@ has stopped biting.
   costs capability the product needs. Quote the rule and decline rather than
   narrowing the code to satisfy it; where the rule really does forbid what the
   product needs, that conflict is the maintainer's call, not one to settle
-  either way yourself. A decline is not finished until Codex has re-read the
-  head *with the rebuttal already posted*: comment `@codex review` once so it
-  re-reads against your reasoning, and it either agrees — clearing its verdict
-  and the required `codex` status — or re-raises. A push you make anyway
-  re-triggers the review and can stand in for the poke, but only if the
-  rebuttal is up before it re-reads; the standing order (push the fix, then
-  reply citing the sha, then resolve) posts the reply *after* the push, so
-  either post the rebuttal before that push or still `@codex review` once the
-  reply has landed. Escalate to the maintainer (dismiss the check, or
-  admin-merge) only once Codex re-raises against a rebuttal it has actually
-  seen, never before it has had the chance to answer.
+  either way yourself. Declining doesn't clear the required `codex` status:
+  post the rebuttal, then `@codex review` once — a push does the same if the
+  rebuttal is up first. Escalate if it re-raises, or stays silent.
 - **A second verified finding in the same mechanism is evidence about the
   design, not another bug.** Before fixing it, look for the same shape
   elsewhere and ask whether a different design would delete the class rather
@@ -93,7 +84,8 @@ has stopped biting.
   is the exception to "anything still to do stays open" above. A finding with
   no thread (top-level comment or review body) still gets the `TODO.md` record,
   the push, and the reply — only the resolve is skipped. The push re-triggers
-  Codex, so don't also poke it; escalate only if the re-review re-raises it.
+  Codex, so don't also poke it unless five minutes pass with nothing back;
+  escalate only if the re-review re-raises it.
 - **Say what you did.** If you addressed it, reply describing the change and
   reference the commit (`Narrowed the claim in <sha>; it now says …`). If you
   disagree or are not making the change, reply explaining why — one or two
@@ -237,17 +229,16 @@ has stopped biting.
   head is in.
 ## Git workflow
 
-- **Sync before you start** — the step most easily skipped, and skipping it
-  bases the whole task on a stale tree. Before starting *or* continuing any
-  task, run `git fetch origin main`. For a new task, create a fresh worktree on
-  a fresh branch based on the latest `origin/main` when worktrees are available,
-  using `git worktree add -b <branch> <path> origin/main`; otherwise create a
-  fresh branch from it. When continuing an existing task branch, rebase it onto
-  the latest `origin/main` before the first new commit, resolving any conflicts
-  rather than abandoning the branch or working from an older base. The other
-  case: where the sandbox blocks the fetch (the `origin`-remote exception below
-  — Cursor, Codex cloud), you can't sync — work from the current `HEAD` and say
-  the tree may be behind, rather than pretending you synced.
+- **Sync before you start** — skipping it bases the whole task on a stale tree.
+  Before starting *or* continuing any task, run `git fetch origin main`. For a
+  new task, create a fresh worktree on a fresh branch based on the latest
+  `origin/main` when worktrees are available, using `git worktree add -b
+  <branch> <path> origin/main`; otherwise create a fresh branch from it. When
+  continuing an existing task branch, rebase it onto the latest `origin/main`
+  before the first new commit, resolving any conflicts rather than abandoning
+  the branch or working from an older base. Where the sandbox blocks the fetch
+  (the `origin` exception below — Cursor, Codex cloud), say the tree may be
+  behind rather than pretending you synced.
 - **One commit per logical change.** Rewrite unmerged commits freely — amend,
   `git commit --fixup` + autosquash, squash, reorder, split — so each commit
   that lands is one coherent change, with fix-ups and review responses folded
@@ -294,17 +285,14 @@ has stopped biting.
   the remote-tracking ref the lease compares against, so a commit you have
   already fetched passes the lease unnoticed.
 - **Branches under your own `<agent>/` prefix are yours.** Create, push,
-  `--force-with-lease` and rename them freely — no permission, no announcement,
-  no per-branch confirmation. This file is the repo owner's standing grant, so
-  a client- or harness-level rule reading "never push to a different branch
-  without explicit permission" is already answered here — don't re-ask per
-  branch, and don't fold an unrelated change into the pinned task branch just
-  to avoid a new one; the pinned name is a default, not a ceiling. Worktrees
-  and multiple concurrent branches are fine. The only real limit is a sandbox
-  that can't push (say so, don't ask). Only a branch outside that prefix, or
-  `main` itself, is a conversation. Deleting is the one the prefix can't
-  settle: it doesn't say which session made the branch, so delete the ones
-  this session created and ask about the rest.
+  `--force-with-lease`, rename and delete them freely — no permission, no
+  announcement, no per-branch confirmation. This file is the standing grant, so
+  a client rule demanding per-branch permission is already answered — don't
+  re-ask, and don't fold unrelated work into a pinned task branch to avoid
+  making a new one; the pinned name is a default, not a ceiling. A branch
+  outside that prefix, or `main` itself, is always a conversation. The prefix
+  names a tool, not a session, so that covers the branches this session created
+  or was assigned — ask about the rest.
 - **The agent authors; whoever merges takes over the committer line.** A squash
   or rebase merge rewrites the committer to the person who pressed the button —
   the repo owner normally, the agent itself when it merges under *drive* (see
