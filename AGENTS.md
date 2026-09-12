@@ -85,7 +85,7 @@ has stopped biting.
   no thread (top-level comment or review body) still gets the `TODO.md` record,
   the push, and the reply — only the resolve is skipped. The push re-triggers
   Codex, so don't also poke it unless five minutes pass with nothing back;
-  escalate only if the re-review re-raises it.
+  escalate if the re-review re-raises it, or stays silent.
 - **Say what you did.** If you addressed it, reply describing the change and
   reference the commit (`Narrowed the claim in <sha>; it now says …`). If you
   disagree or are not making the change, reply explaining why — one or two
