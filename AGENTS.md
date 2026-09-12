@@ -51,9 +51,11 @@ has stopped biting.
   `get_review_comments`, `get_comments` and `get_reviews` to the last page,
   since all three page oldest first — and they block the merge until fixed,
   rebutted, or deferred (see *Deferring a finding* below); an acknowledgment
-  is not an answer. Nothing from Codex since
-  the push, five minutes on, means it never picked it up — comment `@codex
-  review`, once. Reading the verdict is a protocol, not a glance: a state
+  is not an answer. Nothing from Codex since the push, five minutes on, or a
+  clean review that left no reaction, leaves the `codex` status pending —
+  comment `@codex review`, once; if that has not landed five minutes on,
+  escalate rather than poking again.
+  Reading the verdict is a protocol, not a glance: a state
   report draws on ALL the sources — the PR-body reactions, the reviews, the
   review comments and issue comments to their last pages, and the `codex`
   commit status where the ruleset requires it (a separate API surface from
