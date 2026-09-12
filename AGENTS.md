@@ -226,13 +226,17 @@ has stopped biting.
   head is in.
 ## Git workflow
 
-- Before starting or continuing any task, run `git fetch origin main`. For a new
-  task, create a fresh worktree on a fresh branch based on the latest
-  `origin/main` when worktrees are available, using
-  `git worktree add -b <branch> <path> origin/main`; otherwise create a fresh
-  branch from it. When continuing an existing task branch, rebase it onto the
-  latest `origin/main` before the first new commit, resolving any conflicts
-  rather than abandoning the branch or working from an older base.
+- **Sync before you start** — the step most easily skipped, and skipping it
+  bases the whole task on a stale tree. Before starting *or* continuing any
+  task, run `git fetch origin main`. For a new task, create a fresh worktree on
+  a fresh branch based on the latest `origin/main` when worktrees are available,
+  using `git worktree add -b <branch> <path> origin/main`; otherwise create a
+  fresh branch from it. When continuing an existing task branch, rebase it onto
+  the latest `origin/main` before the first new commit, resolving any conflicts
+  rather than abandoning the branch or working from an older base. The other
+  case: where the sandbox blocks the fetch (the `origin`-remote exception below
+  — Cursor, Codex cloud), you can't sync — work from the current `HEAD` and say
+  the tree may be behind, rather than pretending you synced.
 - **One commit per logical change.** Rewrite unmerged commits freely — amend,
   `git commit --fixup` + autosquash, squash, reorder, split — so each commit
   that lands is one coherent change, with fix-ups and review responses folded
@@ -244,7 +248,8 @@ has stopped biting.
 - **These rules assume an `origin` remote.** Without one you can't fetch,
   branch from `origin/main`, push, or open a PR — say so and stop rather than
   improvising a local substitute. **Exception:** in a sandbox that
-  intentionally provides no remote Git support (Codex cloud, say), follow the
+  intentionally provides no remote Git support (Codex cloud or Cursor, say),
+  follow the
   normal branch rules from the current `HEAD` — a pre-created working branch
   counts — commit locally, and report that fetch, push, and pull requests are
   unavailable, using the sandbox's own PR handoff if it has one. That exception
