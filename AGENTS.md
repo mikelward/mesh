@@ -20,11 +20,11 @@ has stopped biting.
 ## Responding to review comments
 
 - **Codex is the automated reviewer on this repo** — not Copilot. Its reviews
-  are triggered automatically; you don't request them, except when nothing has
-  come back five minutes after a push — that means it never picked the push up
-  — or to confirm a rebutted false positive (see *Judge every review comment on
-  merit*). Address its comments without being asked, folding each fix into the
-  commit it belongs to (rebase / `--fixup`) rather than tacking on an "address
+  are triggered automatically; you don't request them, except to confirm a
+  rebutted false positive (see *Judge every review comment on merit*), or where
+  *Read the Codex verdict* below says the `codex` status is still pending.
+  Address its comments without being asked, folding each fix into the commit
+  it belongs to (rebase / `--fixup`) rather than tacking on an "address
   review" commit — the one exception being a real finding that's genuinely out
   of scope for this PR, which you defer instead (see *Deferring a finding*
   below).
