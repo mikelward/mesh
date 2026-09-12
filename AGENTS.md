@@ -69,7 +69,8 @@ has stopped biting.
   product needs, that conflict is the maintainer's call, not one to settle
   either way yourself. Declining doesn't clear the required `codex` status:
   post the rebuttal, then `@codex review` once — a push does the same if the
-  rebuttal is up first. Escalate if it re-raises, or stays silent.
+  rebuttal is up first. Escalate if it re-raises, or if five minutes on
+  that review has not landed either.
 - **A second verified finding in the same mechanism is evidence about the
   design, not another bug.** Before fixing it, look for the same shape
   elsewhere and ask whether a different design would delete the class rather
@@ -85,7 +86,8 @@ has stopped biting.
   no thread (top-level comment or review body) still gets the `TODO.md` record,
   the push, and the reply — only the resolve is skipped. The push re-triggers
   Codex, so don't also poke it unless five minutes pass with nothing back;
-  escalate if the re-review re-raises it, or stays silent.
+  escalate if the re-review re-raises it, or is still missing five minutes
+  after the poke.
 - **Say what you did.** If you addressed it, reply describing the change and
   reference the commit (`Narrowed the claim in <sha>; it now says …`). If you
   disagree or are not making the change, reply explaining why — one or two
