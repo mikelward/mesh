@@ -22,7 +22,9 @@ has stopped biting.
 - **Codex is the automated reviewer on this repo** — not Copilot. Its
   reviews are triggered automatically; you don't request them, except when
   nothing has come back five minutes after a push — that means it never
-  picked the push up. Address its comments without being asked, folding each
+  picked the push up — or to confirm a rebutted false positive (see *Judge
+  every review comment on merit*). Address its comments without being asked,
+  folding each
   fix into the commit it belongs to (rebase / `--fixup`) rather than tacking
   on an "address review" commit — the one exception being a real finding
   that's genuinely out of scope for this PR, which you defer instead (see
@@ -66,7 +68,17 @@ has stopped biting.
   costs capability the product needs. Quote the rule and decline rather than
   narrowing the code to satisfy it; where the rule really does forbid what the
   product needs, that conflict is the maintainer's call, not one to settle
-  either way yourself.
+  either way yourself. A decline is not finished until Codex has re-read the
+  head *with the rebuttal already posted*: comment `@codex review` once so it
+  re-reads against your reasoning, and it either agrees — clearing its verdict
+  and the required `codex` status — or re-raises. A push you make anyway
+  re-triggers the review and can stand in for the poke, but only if the
+  rebuttal is up before it re-reads; the standing order (push the fix, then
+  reply citing the sha, then resolve) posts the reply *after* the push, so
+  either post the rebuttal before that push or still `@codex review` once the
+  reply has landed. Escalate to the maintainer (dismiss the check, or
+  admin-merge) only once Codex re-raises against a rebuttal it has actually
+  seen, never before it has had the chance to answer.
 - **A second verified finding in the same mechanism is evidence about the
   design, not another bug.** Before fixing it, look for the same shape
   elsewhere and ask whether a different design would delete the class rather
@@ -81,8 +93,7 @@ has stopped biting.
   is the exception to "anything still to do stays open" above. A finding with
   no thread (top-level comment or review body) still gets the `TODO.md` record,
   the push, and the reply — only the resolve is skipped. The push re-triggers
-  Codex; `@codex review` only for the five-minute-silence case. Escalate only
-  if the re-review re-raises it.
+  Codex, so don't also poke it; escalate only if the re-review re-raises it.
 - **Say what you did.** If you addressed it, reply describing the change and
   reference the commit (`Narrowed the claim in <sha>; it now says …`). If you
   disagree or are not making the change, reply explaining why — one or two
