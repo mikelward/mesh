@@ -363,7 +363,10 @@ impl Shell {
 /// fall back to the plain line reader. (A prompt on the controlling terminal
 /// even when stdout is redirected would need reedline to write to `/dev/tty`;
 /// that refinement is deferred.)
-pub fn run() -> ExitCode {
+pub fn run(version: &'static str) -> ExitCode {
+    // Before any reader — `--version` is parsed a few lines down, and a startup
+    // file can read `$sh.version` before the first prompt.
+    crate::version::set(version);
     // Before anything can recurse. Turns running off the end of the stack from an
     // abort into a diagnostic; see [`crate::stack`].
     crate::stack::install_fault_reporting();
@@ -681,7 +684,7 @@ impl StartupOptions {
                 }
                 "-V" | "--version" => {
                     options.invocation =
-                        Invocation::Print(format!("mesh {}\n", env!("MESH_VERSION")));
+                        Invocation::Print(format!("mesh {}\n", crate::version::get()));
                     return Ok(options);
                 }
                 "--rcfile" => {
