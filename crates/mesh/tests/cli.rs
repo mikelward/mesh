@@ -25958,7 +25958,7 @@ fn help_and_version_print_and_exit_successfully() {
 
 /// The version mesh prints, and where the parts of it come from.
 ///
-/// `crates/mesh-core/build.rs` derives it from the checkout: a clean commit on
+/// `crates/mesh/build.rs` derives it from the checkout: a clean commit on
 /// `main` reports the plain `0.0.N` that the release workflow tags that commit
 /// with, and every other build carries its branch, commit and dirty state after
 /// a `+` (`0.0.888+quoting.g1a2b3c4.dirty`), so a working copy is never mistaken for the

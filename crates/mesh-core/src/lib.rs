@@ -2,7 +2,9 @@
 //!
 //! The [`run`] entry point owns the read/tokenize/dispatch loop. The binary crate
 //! deliberately contains only process startup so other frontends and tests can
-//! use the shell implementation without depending on an executable crate.
+//! use the shell implementation without depending on an executable crate — that,
+//! and deriving the version it passes to [`run`], which [`crate::version`] says
+//! why it does not do here.
 
 /// Print a diagnostic line on stderr, dropping it if the write fails.
 ///
@@ -41,6 +43,7 @@ mod repl;
 mod stack;
 mod url;
 mod vars;
+mod version;
 mod whence;
 
 pub use repl::run;

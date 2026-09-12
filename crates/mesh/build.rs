@@ -19,6 +19,12 @@
 //! `MESH_BUILD_VERSION` overrides all of it, for a build from a source archive
 //! that knows its version but has no history to derive it from.
 //!
+//! **This lives with the binary rather than with `mesh-core`**, which is what
+//! reports the version. The stamp changes with every commit, so whichever crate
+//! bakes it in is recompiled on every commit — and `mesh-core` is the expensive
+//! one. Deriving it here leaves that crate untouched by a commit, and the binary
+//! hands the string to [`mesh_core::run`], which is the only way in.
+//!
 //! **The stamp describes the sources this crate was last compiled from**, not
 //! the working tree as it stands now. The `rerun-if-changed` lines cover what
 //! changes the answer — a commit, a branch switch, an edit under `crates/` —
@@ -395,7 +401,7 @@ fn branch_identifier() -> Option<String> {
 ///
 /// Sources unpacked from an archive — what `cargo install mesh` builds — inherit
 /// whatever repository they happen to sit under, and reporting *its* commit and
-/// dirty state would be a confident lie. A repository whose `crates/mesh-core`
+/// dirty state would be a confident lie. A repository whose `crates/mesh`
 /// is the directory being built is this one.
 fn is_this_workspace() -> bool {
     // Through the diagnosing helper: this is the *first* git call, so a
@@ -407,11 +413,11 @@ fn is_this_workspace() -> bool {
     };
     let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").unwrap_or_default();
     match (
-        Path::new(&toplevel).join("crates/mesh-core").canonicalize(),
+        Path::new(&toplevel).join("crates/mesh").canonicalize(),
         Path::new(&manifest_dir).canonicalize(),
     ) {
         (Ok(from_repo), Ok(building)) => from_repo == building,
-        // A repository with no `crates/mesh-core` of its own to resolve is
+        // A repository with no `crates/mesh` of its own to resolve is
         // precisely the case this guards: some other repository that these
         // sources were unpacked underneath.
         _ => false,

@@ -810,7 +810,7 @@ Delete an entry once you have agreed with it or reversed it.
       one unit, so a syntax error rejects the whole file; a missing script exits
       `127` and an unreadable one `126`. Shebangs work by way of `#` comments.
 - [x] `--help` and `--version`. The version is derived from the checkout at
-      build time (`crates/mesh-core/build.rs`) rather than read from the `0.0.0`
+      build time (`crates/mesh/build.rs`) rather than read from the `0.0.0`
       placeholder in `Cargo.toml`: a clean build of a commit on `main` reports
       the `0.0.COMMITS` number the release workflow tags that commit with, and
       any other build appends its branch, commit and dirty state
