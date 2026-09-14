@@ -53,15 +53,15 @@ has stopped biting.
   rebutted, or deferred (see *Deferring a finding* below); an acknowledgment
   is not an answer. A pending `codex` status is one of three things.
   Findings to address — address them. A clean review that left no reaction,
-  or a rebuttal it hasn't answered — poke `@codex review` once, now. Nothing
-  back at all — poke once, five minutes after the push. Escalate five
-  minutes after the poke rather than poking a second time.
-  Reading the verdict is a protocol, not a glance: a state
-  report draws on ALL the sources — the PR-body reactions, the reviews, the
-  review comments and issue comments to their last pages, and the `codex`
-  commit status where the ruleset requires it (a separate API surface from
-  check runs) — because the reaction is only the clean channel, and
-  `updated_at` moving without a reaction usually means unread findings.
+  or a rebuttal it hasn't answered — poke `@codex review` once, five minutes
+  after that review or rebuttal. Nothing back at all — poke once, five
+  minutes after the push. Escalate five minutes after the poke rather than
+  poking a second time. Reading the verdict is a protocol, not a glance: a
+  state report draws on ALL the sources — the PR-body reactions, the
+  reviews, the review comments and issue comments to their last pages, and
+  the `codex` commit status where the ruleset requires it (a separate API
+  surface from check runs) — because the reaction is only the clean channel,
+  and `updated_at` moving without a reaction usually means unread findings.
 - **Judge every review comment on merit, whoever wrote it.** Verify the claim
   before acting; if it doesn't hold up, reply saying why and decline. A comment
   citing a rule is a *reading* of that rule, not the rule — check what the rule
@@ -71,8 +71,8 @@ has stopped biting.
   narrowing the code to satisfy it; where the rule really does forbid what the
   product needs, that conflict is the maintainer's call, not one to settle
   either way yourself. Declining doesn't clear the required `codex` status:
-  post the rebuttal, then poke as *Read the Codex verdict* allows — a push
-  does the same if the rebuttal is up first. Escalate if it re-raises.
+  post the rebuttal, then poke as *Read the Codex verdict* allows — or let the
+  next push do it, if the rebuttal is up first. Escalate if it re-raises.
 - **A second verified finding in the same mechanism is evidence about the
   design, not another bug.** Before fixing it, look for the same shape
   elsewhere and ask whether a different design would delete the class rather
