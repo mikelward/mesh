@@ -167,19 +167,22 @@ jobs:
         run: cargo check --workspace --all-targets --target x86_64-unknown-freebsd
 
       - name: Install macOS target
-        run: rustup target add x86_64-apple-darwin
+        run: rustup target add aarch64-apple-darwin
 
       - name: Install cross compiler
         uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29  # v2.2.1
 
       # Zig compiles bundled C dependencies; `cargo check` then type-checks all
       # macOS Rust code without needing an Apple linker or a macOS runner.
+      # Apple Silicon is the arch every current Mac runs; the macOS-specific
+      # Rust is arch-independent (one `target_os = "macos"`), so checking the
+      # x86_64 target too would recompile the workspace for no extra coverage.
       - name: Check macOS
         env:
           # cc-rs spells this target `apple-macosx`, which Zig does not accept.
-          CC_x86_64_apple_darwin: zig cc -target x86_64-macos
+          CC_aarch64_apple_darwin: zig cc -target aarch64-macos
           CRATE_CC_NO_DEFAULTS: "1"
-        run: cargo check --workspace --all-targets --target x86_64-apple-darwin
+        run: cargo check --workspace --all-targets --target aarch64-apple-darwin
 
   msrv:
     name: msrv
