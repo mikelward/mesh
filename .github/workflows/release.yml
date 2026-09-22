@@ -54,7 +54,7 @@ jobs:
         run: cargo build --release --locked --target "$TARGET" -p mesh
 
       # The binary derives its own version from the checkout rather than being
-      # told (crates/mesh-core/build.rs), which is what lets a developer's clean
+      # told (crates/mesh/build.rs), which is what lets a developer's clean
       # build of a released commit report the released version. That leaves two
       # derivations of one number, so check them against each other here: a
       # disagreement fails the release instead of shipping a binary that

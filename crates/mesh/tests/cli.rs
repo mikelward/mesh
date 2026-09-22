@@ -25958,7 +25958,7 @@ fn help_and_version_print_and_exit_successfully() {
 
 /// The version mesh prints, and where the parts of it come from.
 ///
-/// `crates/mesh-core/build.rs` derives it from the checkout: a clean commit on
+/// `crates/mesh/build.rs` derives it from the checkout: a clean commit on
 /// `main` reports the plain `0.0.N` that the release workflow tags that commit
 /// with, and every other build carries its branch, commit and dirty state after
 /// a `+` (`0.0.888+quoting.g1a2b3c4.dirty`), so a working copy is never mistaken for the
@@ -36408,6 +36408,25 @@ fn a_long_expression_does_not_stall_the_branch_check() {
 /// was redefined. Only a disagreement visible in the text is reported.
 #[test]
 fn the_branch_check_stays_out_of_everything_it_cannot_see() {
+    // In a scratch directory, because two of these branches are globs and a
+    // glob in statement position is a command invocation: `*.rs` expands to
+    // whatever `.rs` files the shell's working directory holds and then runs the
+    // first as a command. Run from the suite's own package directory these cases
+    // assert silence only for as long as nothing puts a `.rs` file beside
+    // `Cargo.toml` — `build.rs` did exactly that. An empty directory makes them
+    // answer for the branch check rather than for the tree they ran in.
+    let dir = fresh_dir("branch_check_silence");
+    let run_here = |source: &str| {
+        let mut child = mesh_command()
+            .current_dir(&dir)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn mesh");
+        write_stdin(child.stdin.take(), source.as_bytes());
+        child.wait_with_output().expect("wait for mesh")
+    };
     for source in [
         // A statement `if` — the branches are effects, not a value.
         "if true { 7 } else { \"seven\" }\nputs after\n",
@@ -36788,7 +36807,7 @@ fn the_branch_check_stays_out_of_everything_it_cannot_see() {
         "p = false\nx = if $p { return 7 } else { \"s\" }\n",
         "p = false\nx = if $p { fail 3 } else { \"s\" }\n",
     ] {
-        let out = run_with_input(source);
+        let out = run_here(source);
         assert!(
             out.stderr.is_empty(),
             "expected silence for {source:?}, got: {}",
