@@ -6195,8 +6195,8 @@ fn a_key_that_edits_the_line_does_not_rerun_the_prompt_hooks() {
     await_pty_harness(harness);
 }
 
-/// Alt-. edits the line through a host command, which leaves `read_line` and
-/// comes back to the same line. Nothing was submitted, so the
+/// Ctrl-Backspace and Alt-. edit the line through a host command, which leaves
+/// `read_line` and comes back to the same line. Nothing was submitted, so the
 /// `preprompt` hook -- and the rest of the prompt's setup -- must not run again.
 fn line_edit_key_harness(exec: &MeshExec) -> i32 {
     let Some(shell) = start_pty_shell(exec, None) else {
@@ -6217,15 +6217,19 @@ fn line_edit_key_harness(exec: &MeshExec) -> i32 {
     if !pty_read_on_until(shell.master, &mut seen, INPUT_READY) {
         return 93;
     }
-    // Alt-. puts back the previous command's last argument, `pp`. It leaves
-    // `read_line` and comes back to the same line, and nothing in between may
-    // run the hook.
-    if !pty_write(shell.master, b"puts \x1b.") {
-        return 94;
+    // Ctrl-Backspace (^H) cuts the quoted word; Alt-. puts back the previous
+    // command's last argument, `pp`. Each leaves `read_line` and comes back to
+    // the same line, and nothing between the two may run the hook.
+    let mut edits = Vec::new();
+    for key in [&b"puts \"a b\"\x08"[..], b"\x1b."] {
+        if !pty_write(shell.master, key) {
+            return 94;
+        }
+        let Some(window) = pty_read_until_the_prompt_returns(shell.master) else {
+            return 95;
+        };
+        edits.extend_from_slice(&window);
     }
-    let Some(edits) = pty_read_until_the_prompt_returns(shell.master) else {
-        return 95;
-    };
     if occurrences(&edits, b"PREPROMPT\r\n") != 0 {
         return 96;
     }
@@ -6237,7 +6241,7 @@ fn line_edit_key_harness(exec: &MeshExec) -> i32 {
         return 98;
     };
     seen.extend_from_slice(&window);
-    // The line ran as Alt-. left it: `puts pp`.
+    // The line ran as the two keys left it: `puts pp`.
     if status != 0 || occurrences(&window, b"pp\r\n") != 1 {
         return 99;
     }

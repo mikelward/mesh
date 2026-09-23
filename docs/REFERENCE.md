@@ -977,6 +977,7 @@ have:
 | Up / Down, Ctrl-P / Ctrl-N | Open the **history list** — see [History and recall](#history-and-recall) |
 | Ctrl-R | Search history backwards |
 | Ctrl-W / Alt-D | Cut the word before / after the cursor |
+| Ctrl-Backspace | Cut the whole shell word before the cursor — a quoted string goes in one piece |
 | Ctrl-U / Ctrl-K | Cut to the start / end of the line |
 | Ctrl-Y | Paste what was cut |
 | Ctrl-Z / Ctrl-G | Undo / redo *while editing*; Ctrl-Z stops a **running** command instead |
