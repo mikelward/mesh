@@ -1345,6 +1345,23 @@ pub fn tokenize(source: &str) -> Result<Vec<Token>, ParseError> {
     Lexer::new(source).run().map(|(tokens, _)| tokens)
 }
 
+/// The tokens of a line still being typed, for the line editor's word motions.
+///
+/// Never fails. A bad escape in a string is text. Any other word that would not
+/// lex is unfinished and becomes one word token: an unclosed quote runs to the
+/// end of `source`, and anything else -- a capture in a string that does not
+/// parse yet, say -- to the end of its line. An unclosed bracket just leaves its
+/// closer missing. A comment's text comes back as word tokens, one per
+/// whitespace-separated chunk.
+pub fn tokenize_partial(source: &str) -> Vec<Token> {
+    let mut lexer = Lexer::new(source);
+    lexer.tolerant = true;
+    lexer
+        .lex(None)
+        .expect("a tolerant lex turns each of its errors into a token")
+        .0
+}
+
 /// Parse a buffered input unit. An open delimiter or trailing operator returns
 /// [`ParseOutcome::Incomplete`]; malformed complete input returns an error.
 pub fn parse(source: &str) -> Result<ParseOutcome, ParseError> {
@@ -1645,6 +1662,9 @@ struct Lexer<'a> {
     /// line is unfinished — the reader has to wait for the line it joins to,
     /// exactly as it waits for an unclosed brace.
     dangling_continuation: bool,
+    /// Lexing a line still being typed, for [`tokenize_partial`]: what would be
+    /// an error ends the lex instead.
+    tolerant: bool,
 }
 
 impl<'a> Lexer<'a> {
@@ -1654,6 +1674,7 @@ impl<'a> Lexer<'a> {
             position: 0,
             capture_depth: 0,
             dangling_continuation: false,
+            tolerant: false,
         }
     }
 
@@ -1708,11 +1729,35 @@ impl<'a> Lexer<'a> {
                 {
                     self.position += self.char_at(self.position).unwrap().len_utf8();
                 }
+                // Tolerant: a comment's words are words, so a line editor can cut
+                // them. Text, so a closer in one closes nothing.
+                if self.tolerant {
+                    let mut at = start;
+                    for chunk in self.source[start..self.position].split_whitespace() {
+                        let offset =
+                            at + self.source[at..].find(chunk).expect("a chunk of this text");
+                        at = offset + chunk.len();
+                        let mut pieces = Vec::new();
+                        push_text(&mut pieces, chunk, QuoteMode::Bare);
+                        tokens.push(Spanned {
+                            value: TokenKind::Word(Word {
+                                pieces,
+                                qualifiers: None,
+                            }),
+                            span: offset..at,
+                        });
+                    }
+                }
                 continue;
             }
             if c == '\n' {
                 self.position += 1;
-                self.consume_heredocs(&mut tokens, line_start, start)?;
+                // Tolerant: a heredoc still being typed is not an error.
+                if let Err(error) = self.consume_heredocs(&mut tokens, line_start, start)
+                    && !self.tolerant
+                {
+                    return Err(error);
+                }
                 tokens.push(Spanned {
                     value: TokenKind::Newline,
                     span: start..start + 1,
@@ -1745,208 +1790,45 @@ impl<'a> Lexer<'a> {
                 }
                 continue;
             }
-            let mut pieces = Vec::new();
-            while self.position < self.source.len() {
-                let here = self.char_at(self.position).unwrap();
-                if here.is_whitespace()
-                    || self.punctuation().is_some()
-                    || (here == '#' && pieces.is_empty())
-                {
-                    break;
-                }
-                if here == '\\' {
-                    self.position += 1;
-                    let Some(next) = self.char_at(self.position) else {
-                        push_text(&mut pieces, "\\", QuoteMode::Escaped);
-                        break;
-                    };
-                    push_text(&mut pieces, &next.to_string(), QuoteMode::Escaped);
-                    self.position += next.len_utf8();
-                    continue;
-                }
-                let raw = here == 'r'
-                    && pieces.is_empty()
-                    && matches!(self.char_at(self.position + 1), Some('\'' | '"'));
-                if matches!(here, '\'' | '"') || raw {
-                    let quote = if raw {
-                        self.position += 1;
-                        self.char_at(self.position).unwrap()
+            let pieces = match self.word() {
+                Ok(pieces) if !pieces.is_empty() => pieces,
+                // Tolerant: the word that would not lex is one word. An unclosed
+                // quote runs to the end of the source, since the lines after it
+                // are inside it; anything else (a bad escape, say) to the end of
+                // its line, and lexing picks up again on the next.
+                unfinished if self.tolerant => {
+                    let unclosed_quote = matches!(
+                        unfinished,
+                        Err(ParseError {
+                            kind: ParseErrorKind::Unterminated('"' | '\''),
+                            ..
+                        })
+                    );
+                    let end = if unclosed_quote {
+                        self.source.len()
                     } else {
-                        here
+                        self.source[start..]
+                            .find('\n')
+                            .map_or(self.source.len(), |newline| start + newline)
                     };
-                    // Where the quote itself is, kept for the unterminated case:
-                    // the word may have started columns earlier, and an escaped
-                    // copy of the same character may sit between the two.
-                    let quote_at = self.position;
-                    self.position += 1;
-                    let mode = if raw {
-                        QuoteMode::Raw
-                    } else if quote == '\'' {
-                        QuoteMode::Single
-                    } else {
-                        QuoteMode::Double
-                    };
-                    let mut closed = false;
-                    let piece_count = pieces.len();
-                    while self.position < self.source.len() {
-                        let inner = self.char_at(self.position).unwrap();
-                        if inner == quote {
-                            self.position += inner.len_utf8();
-                            closed = true;
-                            break;
-                        }
-                        if inner == '\\' && !raw {
-                            let escape_start = self.position;
-                            self.position += 1;
-                            let Some(escaped) = self.char_at(self.position) else {
-                                break;
-                            };
-                            let decoded = match escaped {
-                                'n' => '\n',
-                                't' => '\t',
-                                'r' => '\r',
-                                'e' => '\u{1b}',
-                                // `BEL`. Not for the bell: it is the terminator
-                                // every shell's title-setting idiom uses, so
-                                // `"\e]0;…\a"` is the form a prompt gets copied in
-                                // as. `\u{7}` spelled it before and still does.
-                                'a' => '\u{7}',
-                                // The rest of C's control escapes, so the set has
-                                // no arbitrary hole for someone to find one at a
-                                // time. `\0` is *not* among them: a NUL cannot
-                                // cross `execve` or the environment, both of which
-                                // mesh refuses it at, so the escape would only
-                                // build values that fail later.
-                                'b' => '\u{8}',
-                                'f' => '\u{c}',
-                                'v' => '\u{b}',
-                                '\\' => '\\',
-                                '\'' if quote == '\'' => '\'',
-                                '"' if quote == '"' => '"',
-                                '$' if quote == '"' => '$',
-                                'u' => {
-                                    let (value, end) = decode_unicode_escape(
-                                        self.source,
-                                        self.position + escaped.len_utf8(),
-                                    )
-                                    .ok_or_else(|| ParseError {
-                                        kind: ParseErrorKind::BadUnicodeEscape,
-                                        span: escape_start..self.position + 1,
-                                    })?;
-                                    self.position = end;
-                                    push_text(&mut pieces, &value.to_string(), mode);
-                                    continue;
-                                }
-                                other => {
-                                    return Err(ParseError {
-                                        kind: ParseErrorKind::UnknownEscape(other),
-                                        span: escape_start..self.position + other.len_utf8(),
-                                    });
-                                }
-                            };
-                            self.position += escaped.len_utf8();
-                            push_text(&mut pieces, &decoded.to_string(), mode);
-                        } else if inner == '$' && mode == QuoteMode::Double {
-                            // `"… $(cmd) …"` — a capture interpolates inside double
-                            // quotes, the same as `$name` does. It becomes a value
-                            // piece rather than text, so its output crosses whole:
-                            // quoted, so never split and never globbed.
-                            if self.source[self.position..].starts_with("$(") {
-                                let (expression, end) = capture_in_string(
-                                    self.source,
-                                    self.position,
-                                    self.capture_depth + 1,
-                                )?;
-                                pieces.push(WordPiece::Value {
-                                    expression: Box::new(Spanned {
-                                        value: expression,
-                                        span: self.position..end,
-                                    }),
-                                    quote: QuoteMode::Double,
-                                });
-                                self.position = end;
-                                continue;
-                            }
-                            // `"… ${ expr } …"` — a braced body that is not a plain
-                            // access is an expression, and needs the shell for the
-                            // same reason a capture does, so it rides in the same
-                            // value piece rather than through `expand`. A body whose
-                            // modifier takes arguments comes here too, still meaning
-                            // the binding its head names.
-                            if braced_is_access(self.source, self.position) == Some(false) {
-                                let (expression, end) = braced_expression_in_string(
-                                    self.source,
-                                    self.position,
-                                    self.capture_depth + 1,
-                                )?;
-                                // An access whose modifier took arguments is still
-                                // the *reference* reading, so its sigil-less head
-                                // names the binding rather than the word.
-                                let expression = if has_modifier_arguments(&expression) {
-                                    head_as_variable(expression)
-                                } else {
-                                    expression
-                                };
-                                pieces.push(WordPiece::Value {
-                                    expression: Box::new(Spanned {
-                                        value: expression,
-                                        span: self.position..end,
-                                    }),
-                                    quote: QuoteMode::Double,
-                                });
-                                self.position = end;
-                                continue;
-                            }
-                            let end = variable_end(self.source, self.position)?;
-                            if end == self.position + 1 {
-                                push_text(&mut pieces, "$", QuoteMode::Double);
-                            } else {
-                                push_variable(
-                                    &mut pieces,
-                                    &self.source[self.position..end],
-                                    QuoteMode::Double,
-                                );
-                            }
-                            self.position = end;
-                        } else {
-                            push_text(&mut pieces, &inner.to_string(), mode);
-                            self.position += inner.len_utf8();
-                        }
-                    }
-                    if !closed {
-                        return Err(ParseError {
-                            kind: ParseErrorKind::Unterminated(quote),
-                            span: quote_at..self.source.len(),
-                        });
-                    }
-                    if pieces.len() == piece_count {
-                        push_text(&mut pieces, "", mode);
-                    }
-                    continue;
-                }
-                if here == '$' {
-                    let end = variable_end(self.source, self.position)?;
-                    if end == self.position + 1 {
-                        push_text(&mut pieces, "$", QuoteMode::Bare);
-                    } else {
-                        push_variable(
-                            &mut pieces,
-                            &self.source[self.position..end],
-                            QuoteMode::Bare,
-                        );
-                    }
+                    tokens.push(Spanned {
+                        value: TokenKind::Word(Word {
+                            pieces: unfinished.unwrap_or_default(),
+                            qualifiers: None,
+                        }),
+                        span: start..end,
+                    });
                     self.position = end;
-                } else {
-                    push_text(&mut pieces, &here.to_string(), QuoteMode::Bare);
-                    self.position += here.len_utf8();
+                    continue;
                 }
-            }
-            if pieces.is_empty() {
-                return Err(ParseError {
-                    kind: ParseErrorKind::UnexpectedToken,
-                    span: start..start + c.len_utf8(),
-                });
-            }
+                Ok(_) => {
+                    return Err(ParseError {
+                        kind: ParseErrorKind::UnexpectedToken,
+                        span: start..start + c.len_utf8(),
+                    });
+                }
+                Err(error) => return Err(error),
+            };
             tokens.push(Spanned {
                 value: TokenKind::Word(Word {
                     pieces,
@@ -1977,6 +1859,238 @@ impl<'a> Lexer<'a> {
             });
         }
         Ok((tokens, self.position))
+    }
+
+    /// The pieces of the word starting at `self.position`, which ends at
+    /// whitespace, punctuation, or a comment.
+    fn word(&mut self) -> Result<Vec<WordPiece>, ParseError> {
+        let mut pieces = Vec::new();
+        while self.position < self.source.len() {
+            let here = self.char_at(self.position).unwrap();
+            if here.is_whitespace()
+                || self.punctuation().is_some()
+                || (here == '#' && pieces.is_empty())
+            {
+                break;
+            }
+            if here == '\\' {
+                self.position += 1;
+                let Some(next) = self.char_at(self.position) else {
+                    push_text(&mut pieces, "\\", QuoteMode::Escaped);
+                    break;
+                };
+                push_text(&mut pieces, &next.to_string(), QuoteMode::Escaped);
+                self.position += next.len_utf8();
+                continue;
+            }
+            let raw = here == 'r'
+                && pieces.is_empty()
+                && matches!(self.char_at(self.position + 1), Some('\'' | '"'));
+            if matches!(here, '\'' | '"') || raw {
+                let quote = if raw {
+                    self.position += 1;
+                    self.char_at(self.position).unwrap()
+                } else {
+                    here
+                };
+                // Where the quote itself is, kept for the unterminated case:
+                // the word may have started columns earlier, and an escaped
+                // copy of the same character may sit between the two.
+                let quote_at = self.position;
+                self.position += 1;
+                let mode = if raw {
+                    QuoteMode::Raw
+                } else if quote == '\'' {
+                    QuoteMode::Single
+                } else {
+                    QuoteMode::Double
+                };
+                let mut closed = false;
+                let piece_count = pieces.len();
+                while self.position < self.source.len() {
+                    let inner = self.char_at(self.position).unwrap();
+                    if inner == quote {
+                        self.position += inner.len_utf8();
+                        closed = true;
+                        break;
+                    }
+                    if inner == '\\' && !raw {
+                        let escape_start = self.position;
+                        self.position += 1;
+                        let Some(escaped) = self.char_at(self.position) else {
+                            break;
+                        };
+                        let decoded = match escaped {
+                            'n' => '\n',
+                            't' => '\t',
+                            'r' => '\r',
+                            'e' => '\u{1b}',
+                            // `BEL`. Not for the bell: it is the terminator
+                            // every shell's title-setting idiom uses, so
+                            // `"\e]0;…\a"` is the form a prompt gets copied in
+                            // as. `\u{7}` spelled it before and still does.
+                            'a' => '\u{7}',
+                            // The rest of C's control escapes, so the set has
+                            // no arbitrary hole for someone to find one at a
+                            // time. `\0` is *not* among them: a NUL cannot
+                            // cross `execve` or the environment, both of which
+                            // mesh refuses it at, so the escape would only
+                            // build values that fail later.
+                            'b' => '\u{8}',
+                            'f' => '\u{c}',
+                            'v' => '\u{b}',
+                            '\\' => '\\',
+                            '\'' if quote == '\'' => '\'',
+                            '"' if quote == '"' => '"',
+                            '$' if quote == '"' => '$',
+                            'u' => {
+                                let decoded = decode_unicode_escape(
+                                    self.source,
+                                    self.position + escaped.len_utf8(),
+                                );
+                                // Tolerant: a bad escape is text, so the string
+                                // still ends at its own closing quote.
+                                if decoded.is_none() && self.tolerant {
+                                    'u'
+                                } else {
+                                    let (value, end) = decoded.ok_or_else(|| ParseError {
+                                        kind: ParseErrorKind::BadUnicodeEscape,
+                                        span: escape_start..self.position + 1,
+                                    })?;
+                                    self.position = end;
+                                    push_text(&mut pieces, &value.to_string(), mode);
+                                    continue;
+                                }
+                            }
+                            other if self.tolerant => other,
+                            other => {
+                                return Err(ParseError {
+                                    kind: ParseErrorKind::UnknownEscape(other),
+                                    span: escape_start..self.position + other.len_utf8(),
+                                });
+                            }
+                        };
+                        self.position += escaped.len_utf8();
+                        push_text(&mut pieces, &decoded.to_string(), mode);
+                    } else if inner == '$' && mode == QuoteMode::Double {
+                        // `"… $(cmd) …"` — a capture interpolates inside double
+                        // quotes, the same as `$name` does. It becomes a value
+                        // piece rather than text, so its output crosses whole:
+                        // quoted, so never split and never globbed.
+                        if self.source[self.position..].starts_with("$(") {
+                            let (expression, end) = capture_in_string(
+                                self.source,
+                                self.position,
+                                self.capture_depth + 1,
+                            )?;
+                            pieces.push(WordPiece::Value {
+                                expression: Box::new(Spanned {
+                                    value: expression,
+                                    span: self.position..end,
+                                }),
+                                quote: QuoteMode::Double,
+                            });
+                            self.position = end;
+                            continue;
+                        }
+                        // `"… ${ expr } …"` — a braced body that is not a plain
+                        // access is an expression, and needs the shell for the
+                        // same reason a capture does, so it rides in the same
+                        // value piece rather than through `expand`. A body whose
+                        // modifier takes arguments comes here too, still meaning
+                        // the binding its head names.
+                        if braced_is_access(self.source, self.position) == Some(false) {
+                            let (expression, end) = braced_expression_in_string(
+                                self.source,
+                                self.position,
+                                self.capture_depth + 1,
+                            )?;
+                            // An access whose modifier took arguments is still
+                            // the *reference* reading, so its sigil-less head
+                            // names the binding rather than the word.
+                            let expression = if has_modifier_arguments(&expression) {
+                                head_as_variable(expression)
+                            } else {
+                                expression
+                            };
+                            pieces.push(WordPiece::Value {
+                                expression: Box::new(Spanned {
+                                    value: expression,
+                                    span: self.position..end,
+                                }),
+                                quote: QuoteMode::Double,
+                            });
+                            self.position = end;
+                            continue;
+                        }
+                        let end = variable_end(self.source, self.position)?;
+                        if end == self.position + 1 {
+                            push_text(&mut pieces, "$", QuoteMode::Double);
+                        } else {
+                            push_variable(
+                                &mut pieces,
+                                &self.source[self.position..end],
+                                QuoteMode::Double,
+                            );
+                        }
+                        self.position = end;
+                    } else {
+                        push_text(&mut pieces, &inner.to_string(), mode);
+                        self.position += inner.len_utf8();
+                    }
+                }
+                if !closed {
+                    return Err(ParseError {
+                        kind: ParseErrorKind::Unterminated(quote),
+                        span: quote_at..self.source.len(),
+                    });
+                }
+                if pieces.len() == piece_count {
+                    push_text(&mut pieces, "", mode);
+                }
+                continue;
+            }
+            if here == '$' {
+                let end = match variable_end(self.source, self.position) {
+                    Ok(end) => end,
+                    // Tolerant: a closed `${…}` that is not a valid access is
+                    // text, so the word still ends where it would have.
+                    Err(error)
+                        if self.tolerant && self.source[self.position..].starts_with("${") =>
+                    {
+                        let line = self.source[self.position..]
+                            .find('\n')
+                            .map_or(self.source.len(), |newline| self.position + newline);
+                        let Some(close) = self.source[self.position..line].find('}') else {
+                            return Err(error);
+                        };
+                        let end = self.position + close + 1;
+                        push_text(
+                            &mut pieces,
+                            &self.source[self.position..end],
+                            QuoteMode::Bare,
+                        );
+                        self.position = end;
+                        continue;
+                    }
+                    Err(error) => return Err(error),
+                };
+                if end == self.position + 1 {
+                    push_text(&mut pieces, "$", QuoteMode::Bare);
+                } else {
+                    push_variable(
+                        &mut pieces,
+                        &self.source[self.position..end],
+                        QuoteMode::Bare,
+                    );
+                }
+                self.position = end;
+            } else {
+                push_text(&mut pieces, &here.to_string(), QuoteMode::Bare);
+                self.position += here.len_utf8();
+            }
+        }
+        Ok(pieces)
     }
 
     fn consume_heredocs(
@@ -2211,6 +2325,7 @@ pub(crate) fn capture_in_string(
         position: dollar + 2,
         capture_depth: depth,
         dangling_continuation: false,
+        tolerant: false,
     }
     .capture_body()?;
     // The inner parse starts where the lexer left off rather than at zero, so a
@@ -2350,6 +2465,7 @@ fn braced_expression_in_string(
         position: dollar + 2,
         capture_depth: depth,
         dangling_continuation: false,
+        tolerant: false,
     }
     .braced_body()?;
     let mut parser = Parser {
@@ -9179,6 +9295,36 @@ mod tests {
                 Executable::Pipeline(_)
             ));
         }
+    }
+
+    #[test]
+    fn a_partial_tokenize_ends_an_unfinished_word_at_the_end_of_the_line() {
+        let spans = |source: &str| {
+            tokenize_partial(source)
+                .into_iter()
+                .map(|token| token.span)
+                .collect::<Vec<_>>()
+        };
+        // An unclosed quote and an unfinished capture in a string each make one
+        // word to the end, after the words before them; a bad escape is text.
+        assert_eq!(spans("echo \"a b"), [0..4, 5..9]);
+        assert_eq!(spans("echo \"\\q\" x"), [0..4, 5..9, 10..11]);
+        assert_eq!(spans("echo \"$(ls |\" x"), [0..4, 5..15]);
+        // An unclosed bracket just leaves its closer missing.
+        assert_eq!(spans("echo $(ls"), [0..4, 5..7, 7..9]);
+        // A comment's text is words, and a closer in it closes nothing.
+        assert_eq!(spans("$(a # b)"), [0..2, 2..3, 4..5, 6..8]);
+        // A bad escape is text, so the string still closes where it does.
+        assert_eq!(spans("\"\\q\" a\nb c"), [0..4, 5..6, 6..7, 7..8, 9..10]);
+        // So is a closed `${…}` that is not a valid access.
+        assert_eq!(spans("puts ${x y} next"), [0..4, 5..11, 12..16]);
+        // Any other error ends its word at the end of its line, and lexing
+        // picks up again on the next; only an unclosed quote runs past it.
+        assert_eq!(spans("${x y\nb"), [0..5, 5..6, 6..7]);
+        assert_eq!(spans("\"a\nb c").as_slice(), std::slice::from_ref(&(0..6)));
+        // The strict tokenizer still rejects all of these.
+        assert!(tokenize("echo \"a b").is_err());
+        assert!(tokenize("echo \"\\q\" x").is_err());
     }
 
     #[test]
