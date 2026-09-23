@@ -2183,6 +2183,39 @@ all under "Beyond M3 — External tool integration".
       `reedline` specifically to keep it (and its default-on `helix`
       feature) out of the build until there's a reason to want it.
 
+- [ ] **Word cuts in layouts only the parser knows.** `shell_words`
+      (`repl.rs`) reads words off `tokenize_partial`, but some grouping is
+      decided by the parser, and the word keys do not try to guess it. Known
+      gaps:
+      - A `/…/` regex literal is not recognized, so a `|`, `;`, `&` or space
+        inside one splits it like any other text: `if x ~ /a|b/` +
+        Alt-Backspace leaves `if x ~ /a|`. The parser reads a regex after
+        `~`/`!~`, in a match arm, and in the first argument of `:match`,
+        `:matches`, `:replaceall`, `:replacestart` and `:replaceend`. An
+        attempt to reconstruct those contexts in the line editor kept finding
+        new layouts (arms with guards, alternatives, `=>` on a later line,
+        escaped modifiers), so it was taken out rather than shipped partial.
+      - A list or group spanning lines (`x = [a,` then `b, c]`) is not one
+        word on its later lines: only a bracket opened on the cursor's line
+        joins what is inside it, which is what keeps a block's lines apart.
+      - An unfinished heredoc body (no terminator yet) is lexed as mesh
+        syntax, so a `(` or a quote in it groups; a finished body is cut a
+        whitespace word at a time. With two heredocs where only the second
+        is unfinished (`cat << A << B`), the first, finished body is lexed a
+        second time as syntax too, since the tolerant lex ignores the error
+        without moving past the bodies it already consumed.
+      - Malformed but closed input: a bad escape and a bad `${…}` are read
+        as text, but other errors still run the word to the end of its line,
+        e.g. a capture in a string that does not parse, `"$(x =)" next`.
+        Recovering at the construct's own closer would keep `next` apart.
+      - Only an unclosed quote runs past its line. An unclosed `$(` inside
+        an unclosed string (`puts "foo $(echo` then `bar baz`) is reported
+        as the capture, not the quote, so the next line is cut word by word
+        though it is still inside the string.
+      The class fix is a tolerant *parse* that reports regex, group and
+      heredoc spans for a half-typed buffer, rather than reconstruction in
+      the line editor.
+
 ## Beyond M3 — Navigation
 
 - [x] **`pwd()`, the value spelling** — *landed*. `pwd` printed and nothing else,
