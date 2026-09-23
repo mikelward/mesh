@@ -16400,40 +16400,137 @@ fn cut_shell_word_left(editor: &mut Reedline) {
     }
 }
 
+/// Cut the shell word after the cursor into the cut buffer, the forward twin of
+/// [`cut_shell_word_left`].
+fn cut_shell_word_right(editor: &mut Reedline) {
+    let cursor = editor.current_insertion_point();
+    let end = shell_word_end(editor.current_buffer_contents(), cursor);
+    if end > cursor {
+        editor.run_edit_commands(&[EditCommand::Cut {
+            target: MotionTarget::Position(end),
+            granularity: Granularity::CharWise,
+        }]);
+    }
+}
+
+/// Where the shell word after `cursor` ends, the way bash's shell-kill-word
+/// finds it: from inside a word, its end; from whitespace, the end of the next
+/// word, the whitespace going with it. The words are the whole buffer's -- see
+/// [`shell_words`] -- so a cursor inside a quoted string still reads it as one
+/// word, but the cut stops at the end of the cursor's line.
+fn shell_word_end(buffer: &str, cursor: usize) -> usize {
+    let line_end = buffer[cursor..]
+        .find('\n')
+        .map_or(buffer.len(), |newline| cursor + newline);
+    shell_words(buffer)
+        .into_iter()
+        .map(|word| word.end.min(line_end))
+        .find(|&end| end > cursor)
+        .unwrap_or(line_end)
+}
+
 /// Where the shell word before `cursor` starts, the way bash's
 /// shell-backward-kill-word finds it: whitespace between it and the cursor
-/// goes with it, and a quoted string is one word, quotes included. The word is
-/// the run of tokens that ends the line up to the cursor with nothing between
-/// them, so it reads the same in a command, an assignment or an expression;
-/// text that does not tokenize yet, such as an open quote, falls back to the
-/// previous whitespace.
+/// goes with it, and a quoted string is one word, quotes included. The words
+/// are those of the buffer up to the cursor -- see [`shell_words`] -- and the
+/// cut stops at the start of the cursor's line.
 fn shell_word_start(buffer: &str, cursor: usize) -> usize {
     let line_start = buffer[..cursor]
         .rfind('\n')
         .map_or(0, |newline| newline + 1);
-    let text = buffer[line_start..cursor].trim_end();
-    let start = last_token_run_start(text).unwrap_or_else(|| {
-        text.char_indices()
-            .rev()
-            .find(|(_, c)| c.is_whitespace())
-            .map_or(0, |(index, c)| index + c.len_utf8())
-    });
-    line_start + start
+    shell_words(&buffer[..cursor])
+        .last()
+        .map_or(line_start, |word| word.start.max(line_start))
 }
 
-/// The start of the run of adjacent tokens that ends `text`, or `None` when
-/// `text` does not tokenize or has no token at its end.
-fn last_token_run_start(text: &str) -> Option<usize> {
-    let tokens = parser::tokenize(text).ok()?;
-    let last = tokens.last().filter(|token| token.span.end == text.len())?;
-    let mut start = last.span.start;
-    for token in tokens.iter().rev().skip(1) {
-        if token.span.end != start {
-            break;
+/// The shell words of `source`, as byte spans, the way the word cuts read them.
+///
+/// Read off mesh's own lexer, so a word is what mesh would read: quotes,
+/// escapes, raw strings, captures and comments all follow its rules. Tokens
+/// that touch make one word, and so does everything inside a bracket opened
+/// on the same line, so `"a b"`, `$(echo a b)`, `('a b')` and `2>&1` are one
+/// word each. A command separator -- `;`, `&`, `|`, `&&`, `||`, `|&` -- is a
+/// word of its own, and so is a newline, so a block's lines keep their own
+/// words. A quoted string that spans lines is still one word, which the cuts
+/// clip to the cursor's line.
+///
+/// The lexer runs in its tolerant mode, since a line being typed is usually
+/// unfinished: an unclosed quote runs to the end, and so does a bracket left
+/// open on the last line.
+fn shell_words(source: &str) -> Vec<std::ops::Range<usize>> {
+    use parser::TokenKind;
+    let mut words: Vec<std::ops::Range<usize>> = Vec::new();
+    // The closers still owed, innermost last, each with where its opener is and
+    // whether what is inside is one word. A closer that is not the innermost
+    // one's closes nothing, as in the parser's `unclosed_opener`. Braces hold
+    // statements -- a block's words and separators are its own -- where a
+    // parenthesis, bracket or capture holds one value.
+    let mut open: Vec<(TokenKind, usize, bool)> = Vec::new();
+    // Just past the last newline scanned: only a bracket opened after it
+    // joins the tokens inside it into one word.
+    let mut line_start = 0;
+    let mut after_separator = false;
+    let mut bodies: Vec<std::ops::Range<usize>> = Vec::new();
+    for token in parser::tokenize_partial(source) {
+        // A heredoc's body is text, one token to the lexer, cut a word at a
+        // time like any other text.
+        // Kept apart until the end: the lexer hands a body over next to its
+        // own `<<`, ahead of any tokens later on that line.
+        if matches!(token.value, TokenKind::HeredocBody(_)) {
+            let mut at = token.span.start;
+            for chunk in source[token.span.clone()].split_whitespace() {
+                let offset = at + source[at..].find(chunk).expect("a chunk of this body");
+                at = offset + chunk.len();
+                bodies.push(offset..at);
+            }
+            // The line state too: the command line may still have tokens to
+            // come, and the newline after the body resets it anyway.
+            continue;
         }
-        start = token.span.start;
+        let inside = open.iter().any(|&(_, at, joins)| joins && at >= line_start);
+        match token.value {
+            TokenKind::LParen | TokenKind::CaptureStart => {
+                open.push((TokenKind::RParen, token.span.start, true));
+            }
+            TokenKind::LBracket => open.push((TokenKind::RBracket, token.span.start, true)),
+            TokenKind::LBrace => open.push((TokenKind::RBrace, token.span.start, false)),
+            ref closer if open.last().is_some_and(|(owed, _, _)| owed == closer) => {
+                open.pop();
+            }
+            _ => {}
+        }
+        let separator = token.value == TokenKind::Newline
+            || (!inside
+                && matches!(
+                    token.value,
+                    TokenKind::Semi
+                        | TokenKind::Amp
+                        | TokenKind::AndAnd
+                        | TokenKind::OrOr
+                        | TokenKind::Pipe
+                        | TokenKind::PipeBoth
+                ));
+        match words.last_mut() {
+            Some(word)
+                if !separator && !after_separator && (inside || word.end == token.span.start) =>
+            {
+                word.end = token.span.end;
+            }
+            _ => words.push(token.span.clone()),
+        }
+        after_separator = separator;
+        if let Some(newline) = source[token.span.clone()].rfind('\n') {
+            line_start = token.span.start + newline + 1;
+        }
     }
-    Some(start)
+    if open.iter().any(|&(_, at, joins)| joins && at >= line_start)
+        && let Some(word) = words.last_mut()
+    {
+        word.end = source.len();
+    }
+    words.extend(bodies);
+    words.sort_by_key(|word| word.start);
+    words
 }
 
 /// The source text of each word in the last pipeline stage of the last
@@ -17002,6 +17099,9 @@ fn run_interactive(options: &StartupOptions) -> ExitCode {
             Ok(Signal::HostCommand(command)) if command == CUT_SHELL_WORD_LEFT => {
                 cut_shell_word_left(&mut editor);
             }
+            Ok(Signal::HostCommand(command)) if command == CUT_SHELL_WORD_RIGHT => {
+                cut_shell_word_right(&mut editor);
+            }
             Ok(signal) => {
                 let mut rewritten = false;
                 // Reedline persists a raw row for every non-empty submitted line,
@@ -17093,9 +17193,14 @@ fn run_interactive(options: &StartupOptions) -> ExitCode {
 }
 
 const CUT_SHELL_WORD_LEFT: &str = "mesh:cut-shell-word-left";
+const CUT_SHELL_WORD_RIGHT: &str = "mesh:cut-shell-word-right";
 
 fn cut_shell_word_left_event() -> ReedlineEvent {
     ReedlineEvent::ExecuteHostCommand(CUT_SHELL_WORD_LEFT.to_owned())
+}
+
+fn cut_shell_word_right_event() -> ReedlineEvent {
+    ReedlineEvent::ExecuteHostCommand(CUT_SHELL_WORD_RIGHT.to_owned())
 }
 
 fn interactive_keybindings() -> Keybindings {
@@ -17105,16 +17210,23 @@ fn interactive_keybindings() -> Keybindings {
         KeyCode::Char('.'),
         ReedlineEvent::ExecuteHostCommand("mesh:recall-last-argument".to_owned()),
     );
-    // Ctrl-Backspace cuts a whole shell word, as bash's
+    // Ctrl-Backspace and Alt-Backspace cut a whole shell word, as bash's
     // shell-backward-kill-word does. Terminals without the kitty keyboard
-    // protocol send it as ^H, which arrives as Ctrl-H — reedline's one-character
-    // Backspace — so both keys take it.
+    // protocol send Ctrl-Backspace as ^H, which arrives as Ctrl-H — reedline's
+    // one-character Backspace — so that key takes it too.
     for (modifiers, code) in [
         (KeyModifiers::CONTROL, KeyCode::Backspace),
         (KeyModifiers::CONTROL, KeyCode::Char('h')),
+        (KeyModifiers::ALT, KeyCode::Backspace),
     ] {
         keybindings.add_binding(modifiers, code, cut_shell_word_left_event());
     }
+    // Ctrl-Delete cuts the shell word after the cursor, as shell-kill-word does.
+    keybindings.add_binding(
+        KeyModifiers::CONTROL,
+        KeyCode::Delete,
+        cut_shell_word_right_event(),
+    );
     // The history list, on the four keys that walked history one line at a
     // time. A completion menu already open keeps the arrow (`MenuUp`); the
     // reverse search ignores `Menu` and takes the plain walk after it.
@@ -17510,14 +17622,19 @@ impl EditMode for EscapePrefix {
         };
         let parsed = self.steer_list(parsed);
         // A reverse search edits its query, not the line behind it, and takes
-        // only Backspace as a query edit -- so there the key shrinks the query
-        // by one, as Ctrl-H always did, rather than cutting the hidden line.
-        let parsed =
-            if self.searching.load(Ordering::Relaxed) && parsed == cut_shell_word_left_event() {
-                ReedlineEvent::Edit(vec![EditCommand::Backspace])
-            } else {
-                parsed
-            };
+        // only Backspace as a query edit -- so there a backward cut shrinks the
+        // query by one, as Ctrl-H always did, and a forward cut is reedline's
+        // own word delete, which ends the search as it always has. Neither cuts
+        // the hidden line.
+        let parsed = if !self.searching.load(Ordering::Relaxed) {
+            parsed
+        } else if parsed == cut_shell_word_left_event() {
+            ReedlineEvent::Edit(vec![EditCommand::Backspace])
+        } else if parsed == cut_shell_word_right_event() {
+            ReedlineEvent::Edit(vec![EditCommand::DeleteWord])
+        } else {
+            parsed
+        };
         if enters_history_search(&parsed) {
             self.searching.store(true, Ordering::Relaxed);
         } else if self.searching.load(Ordering::Relaxed) && leaves_history_search(&parsed) {
@@ -19199,8 +19316,8 @@ mod tests {
         interruptible_task, last_argument, list_down, list_up, mark_sequence, needs_more_input,
         open_history, path_completions_sync, persist_logical_history, prepare_history_path,
         read_recent_ghost_candidates, run_hooks, run_line, run_source, segment_completions,
-        shell_word_start, strip_type_marker, title_sequence, title_text, variable_completions,
-        vscode_escaped, walk,
+        shell_word_end, shell_word_start, strip_type_marker, title_sequence, title_text,
+        variable_completions, vscode_escaped, walk,
     };
 
     /// One debt per dialect, however many titles were written.
@@ -19313,19 +19430,159 @@ mod tests {
         // Not only commands: an assignment's or expression's value too.
         assert_eq!(after_cut_word_left("name = \"two words\""), "name = ");
         assert_eq!(after_cut_word_left("puts ('a b')"), "puts ");
-        // Tokens with nothing between them are one word, as whitespace reads it.
+        // Anything between whitespace is one word, spaces in brackets or
+        // escaped by a backslash included.
         assert_eq!(after_cut_word_left("puts key:2"), "puts ");
         assert_eq!(after_cut_word_left("ls >out"), "ls ");
+        assert_eq!(after_cut_word_left("puts $(echo a b)"), "puts ");
+        assert_eq!(after_cut_word_left("puts [1, 2]"), "puts ");
+        assert_eq!(after_cut_word_left("ls a\\ b"), "ls ");
+        // A redirection's `&` or `|` stays in its word.
+        assert_eq!(after_cut_word_left("cmd 2>&1"), "cmd ");
+        assert_eq!(after_cut_word_left("cmd &>out"), "cmd ");
+        // mesh has no `>|`: that `|` is a pipe.
+        assert_eq!(after_cut_word_left("cmd >|out"), "cmd >|");
+        // An escaped `>` is text, so the `&` after it separates.
+        assert_eq!(after_cut_word_left("echo foo\\>&next"), "echo foo\\>&");
+        // But a command separator is a word of its own, touching or not.
         assert_eq!(after_cut_word_left("ls |"), "ls ");
+        assert_eq!(after_cut_word_left("echo;next"), "echo;");
+        assert_eq!(after_cut_word_left("a&&b"), "a&&");
+        assert_eq!(after_cut_word_left("a|&b"), "a|&");
+        assert_eq!(after_cut_word_left("echo;"), "echo");
     }
 
     #[test]
-    fn ctrl_backspace_falls_back_to_whitespace_words() {
-        // An open quote does not tokenize yet, so the previous whitespace bounds
-        // it.
-        assert_eq!(after_cut_word_left("echo \"foo bar"), "echo \"foo ");
-        // Multi-byte text is cut on a character boundary.
-        assert_eq!(after_cut_word_left("echo \"é ü"), "echo \"é ");
+    fn ctrl_backspace_takes_an_unclosed_quote_or_bracket_whole() {
+        // The string still being typed is one word, spaces and all.
+        assert_eq!(after_cut_word_left("echo \"foo bar"), "echo ");
+        assert_eq!(after_cut_word_left("echo $(ls -l"), "echo ");
+        // A comment inside the bracket hides its closer.
+        assert_eq!(after_cut_word_left("echo $(echo # hi) tail"), "echo ");
+        assert_eq!(after_cut_word_right("$(echo # hi) tail", 0), "");
+        // A `#` inside a word is text.
+        assert_eq!(after_cut_word_right("$(echo a#b) tail", 0), " tail");
+        assert_eq!(after_cut_word_left("echo \"é ü"), "echo ");
+        // A closed quote before it is its own word.
+        assert_eq!(after_cut_word_left("echo \"a b\" 'c d"), "echo \"a b\" ");
+    }
+
+    /// What Ctrl-Delete leaves of `line` with the cursor at byte `cursor`.
+    fn after_cut_word_right(line: &str, cursor: usize) -> String {
+        format!(
+            "{}{}",
+            &line[..cursor],
+            &line[shell_word_end(line, cursor)..]
+        )
+    }
+
+    #[test]
+    fn ctrl_delete_cuts_the_whole_shell_word_after_the_cursor() {
+        assert_eq!(after_cut_word_right("\"foo bar\" baz", 0), " baz");
+        // Whitespace before the word goes with it, as in bash.
+        assert_eq!(after_cut_word_right("echo \"foo bar\" baz", 4), "echo baz");
+        assert_eq!(after_cut_word_right("x = \"a b\" c", 3), "x = c");
+        assert_eq!(after_cut_word_right("ls src/foo.c", 2), "ls");
+        assert_eq!(after_cut_word_right("puts key:2 x", 4), "puts x");
+        // Only whitespace, or nothing, after the cursor.
+        assert_eq!(after_cut_word_right("ls   ", 2), "ls");
+        assert_eq!(after_cut_word_right("ls", 2), "ls");
+        // From inside a word, to that word's end -- a quoted string's too.
+        assert_eq!(after_cut_word_right("echo \"foo bar\" x", 7), "echo \"f x");
+        assert_eq!(
+            after_cut_word_right("puts $(echo a b) tail", 4),
+            "puts tail"
+        );
+        // A command separator is a word of its own, touching or not.
+        assert_eq!(after_cut_word_right("echo;next", 0), ";next");
+        assert_eq!(after_cut_word_right("echo;next", 4), "echonext");
+        assert_eq!(after_cut_word_right("a|b", 0), "|b");
+        assert_eq!(after_cut_word_right("echo foo>|next", 4), "echo|next");
+        assert_eq!(after_cut_word_right("echo foo\\>&next", 4), "echo&next");
+        // Something unfinished further along does not cost the word its quotes,
+        // with whitespace before it or a separator.
+        assert_eq!(
+            after_cut_word_right("\"foo bar\" \"unterminated", 0),
+            " \"unterminated"
+        );
+        assert_eq!(
+            after_cut_word_right("echo;\"unterminated", 0),
+            ";\"unterminated"
+        );
+        assert_eq!(after_cut_word_right("echo;$(ls", 0), ";$(ls");
+        assert_eq!(after_cut_word_right("echo $(ls -l", 0), " $(ls -l");
+        // An unclosed quote attached to the word runs to the end of the line.
+        assert_eq!(after_cut_word_right("echo\"unterminated tail", 0), "");
+        // A line below the cursor's is not reached.
+        assert_eq!(after_cut_word_right("puts a\nputs b", 4), "puts\nputs b");
+    }
+
+    #[test]
+    fn word_cuts_read_quotes_as_mesh_does() {
+        // A backslash escapes inside single quotes too, but not in a raw string.
+        assert_eq!(
+            after_cut_word_right("puts 'can\\'t stop' tail", 4),
+            "puts tail"
+        );
+        assert_eq!(after_cut_word_left("puts 'can\\'t stop'"), "puts ");
+        assert_eq!(after_cut_word_right("puts r'a\\' b", 4), "puts b");
+        assert_eq!(after_cut_word_left("puts r\"a\\\" b"), "puts r\"a\\\" ");
+        // Only at the start of a piece: `car'…'` is not raw.
+        assert_eq!(after_cut_word_right("puts car'a\\' b' c", 4), "puts c");
+        // A token already begun is not raw, however it began.
+        assert_eq!(
+            after_cut_word_right("puts foo-r'can\\'t stop' tail", 4),
+            "puts tail"
+        );
+        assert_eq!(
+            after_cut_word_right("puts \\=r'can\\'t stop' tail", 4),
+            "puts tail"
+        );
+        assert_eq!(after_cut_word_right("puts x=r'a\\' b", 4), "puts b");
+        assert_eq!(after_cut_word_right("a!~r'x\\' y", 0), " y");
+        // A variable access keeps the word going, so the quote after it is not raw.
+        assert_eq!(
+            after_cut_word_right("puts $x.r'can\\'t stop' tail", 4),
+            "puts tail"
+        );
+        // A `/…/` regex is the parser's, not the lexer's, so a `|` in one
+        // separates as it would anywhere else (see TODO.md).
+        assert_eq!(after_cut_word_left("if x ~ /a|b/"), "if x ~ /a|");
+        // A block's words and separators are its own, on one line too.
+        assert_eq!(
+            after_cut_word_right("if true { puts one two; puts three }", 14),
+            "if true { puts two; puts three }"
+        );
+        assert_eq!(
+            after_cut_word_left("if true { puts one two; puts three"),
+            "if true { puts one two; puts "
+        );
+        // A bad escape leaves the string's word where the string ends.
+        assert_eq!(after_cut_word_right("puts \"bad\\q\" next", 4), "puts next");
+        assert_eq!(
+            after_cut_word_left("puts \"bad\\q\" next"),
+            "puts \"bad\\q\" "
+        );
+        // So does a closed but malformed `${…}`.
+        assert_eq!(after_cut_word_right("puts ${x y} next", 4), "puts next");
+        // A closer that is not the innermost opener's closes nothing.
+        assert_eq!(after_cut_word_right("puts (a ] ; next", 4), "puts");
+        assert_eq!(after_cut_word_left("puts (a ] ; next"), "puts ");
+        // A comment's words are cut one at a time.
+        assert_eq!(after_cut_word_left("echo hi # foo bar"), "echo hi # foo ");
+        // A capture or braced expression inside double quotes nests, its own
+        // quotes included.
+        assert_eq!(
+            after_cut_word_right("puts \"[$(puts \"a b\")]\" tail", 4),
+            "puts tail"
+        );
+        assert_eq!(after_cut_word_left("puts \"[$(puts \"a b\")]\""), "puts ");
+        assert_eq!(
+            after_cut_word_right("puts \"${f(\"a b\")}\" tail", 4),
+            "puts tail"
+        );
+        // Single quotes do not interpolate.
+        assert_eq!(after_cut_word_right("puts '$(' \"a b\"", 4), "puts \"a b\"");
     }
 
     #[test]
@@ -19344,12 +19601,53 @@ mod tests {
     }
 
     #[test]
+    fn word_cuts_read_the_whole_buffer_but_keep_to_the_line() {
+        // A quoted string spanning lines is one word; the cut keeps to the line.
+        let buffer = "puts \"foo\nbar baz\" tail";
+        let line = buffer.find('\n').unwrap() + 1;
+        assert_eq!(shell_word_end(buffer, line), line + "bar baz\"".len());
+        let end = line + "bar baz\"".len();
+        assert_eq!(shell_word_start(buffer, end), line);
+        // A block's lines keep their own words.
+        let buffer = "if true {\n  puts a b";
+        assert_eq!(
+            &buffer[..shell_word_start(buffer, buffer.len())],
+            "if true {\n  puts a "
+        );
+        // A heredoc's body is cut a word at a time.
+        let buffer = "cat << END\nhello world\nEND";
+        let body = buffer.find("hello").unwrap();
+        assert_eq!(shell_word_end(buffer, body), body + "hello".len());
+        let end = body + "hello world".len();
+        assert_eq!(&buffer[shell_word_start(buffer, end)..end], "world");
+        // Two heredocs on one line keep their words in order.
+        let buffer = "cat << A << B\none two\nA\nthree four\nB";
+        let second = buffer.rfind("<<").unwrap();
+        assert_eq!(shell_word_end(buffer, second), second + "<<".len());
+        let body = buffer.find("three").unwrap();
+        assert_eq!(shell_word_end(buffer, body), body + "three".len());
+        // A bad escape on one line leaves the lines after it their own words.
+        let buffer = "if true {\n puts \"bad\\q\"\n echo one two\n}";
+        let one = buffer.find("one").unwrap();
+        assert_eq!(shell_word_end(buffer, one), one + "one".len());
+        // A heredoc body handed over early leaves the command line's groups
+        // alone.
+        let buffer = "cat << A $(echo one two) << B\nx\nA\ny\nB";
+        let capture = buffer.find("$(").unwrap();
+        assert_eq!(
+            shell_word_end(buffer, capture),
+            buffer.find(" << B").unwrap()
+        );
+    }
+
+    #[test]
     fn ctrl_backspace_and_ctrl_h_cut_a_shell_word() {
         // Without the kitty keyboard protocol, Ctrl-Backspace arrives as ^H.
         let keys = interactive_keybindings();
         for (modifiers, code) in [
             (KeyModifiers::CONTROL, KeyCode::Backspace),
             (KeyModifiers::CONTROL, KeyCode::Char('h')),
+            (KeyModifiers::ALT, KeyCode::Backspace),
         ] {
             assert_eq!(
                 keys.find_binding(modifiers, code),
@@ -19359,6 +19657,12 @@ mod tests {
                 "{code:?}"
             );
         }
+        assert_eq!(
+            keys.find_binding(KeyModifiers::CONTROL, KeyCode::Delete),
+            Some(ReedlineEvent::ExecuteHostCommand(
+                super::CUT_SHELL_WORD_RIGHT.to_owned()
+            ))
+        );
         // Plain Backspace still deletes one character.
         assert_eq!(
             keys.find_binding(KeyModifiers::NONE, KeyCode::Backspace),
@@ -21585,6 +21889,7 @@ mod tests {
         for (modifiers, code) in [
             (KeyModifiers::CONTROL, KeyCode::Backspace),
             (KeyModifiers::CONTROL, KeyCode::Char('h')),
+            (KeyModifiers::ALT, KeyCode::Backspace),
         ] {
             assert_eq!(
                 press(&mut mode, code, modifiers),
@@ -21611,6 +21916,7 @@ mod tests {
         for (modifiers, code) in [
             (KeyModifiers::CONTROL, KeyCode::Backspace),
             (KeyModifiers::CONTROL, KeyCode::Char('h')),
+            (KeyModifiers::ALT, KeyCode::Backspace),
         ] {
             assert_eq!(
                 press(&mut mode, code, modifiers),
@@ -21622,6 +21928,17 @@ mod tests {
                 "still searching"
             );
         }
+        // A forward cut is reedline's own word delete there, which ends the
+        // search as it always did, rather than cutting the hidden line.
+        assert_eq!(
+            press(&mut mode, KeyCode::Delete, KeyModifiers::CONTROL),
+            ReedlineEvent::Edit(vec![EditCommand::DeleteWord])
+        );
+        assert!(
+            !mode.search_state().load(Ordering::Relaxed),
+            "left the search"
+        );
+        press(&mut mode, KeyCode::Char('r'), KeyModifiers::CONTROL);
         // Out of the search, the key cuts a shell word again.
         press(&mut mode, KeyCode::Esc, KeyModifiers::NONE);
         assert_eq!(
@@ -21656,9 +21973,16 @@ mod tests {
             on_typed_line(vec![to_end.clone(), EditCommand::Backspace]),
             "led past the engine's close-on-Backspace"
         );
+        // Alt-Backspace cuts a shell word, as Ctrl-Backspace does -- see
+        // `ctrl_backspace_edits_the_filter_rather_than_the_selection`.
         assert_eq!(
             press(&mut mode, KeyCode::Backspace, KeyModifiers::ALT),
-            on_typed_line(vec![to_end.clone(), EditCommand::BackspaceWord])
+            ReedlineEvent::Multiple(vec![
+                ReedlineEvent::MenuLeft,
+                ReedlineEvent::Edit(Vec::new()),
+                ReedlineEvent::Edit(vec![to_end.clone()]),
+                super::cut_shell_word_left_event(),
+            ])
         );
         assert_eq!(
             press(&mut mode, KeyCode::Char('w'), KeyModifiers::CONTROL),
