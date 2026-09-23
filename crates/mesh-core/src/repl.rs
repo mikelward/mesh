@@ -23,12 +23,13 @@ use std::time::{Duration, Instant};
 
 use crossterm::event::Event;
 use reedline::{
-    Color, ColumnarMenu, Completer, CompletionResult, EditCommand, EditMode, Emacs, Highlighter,
-    Hinter, History, HistoryItem, HistoryItemId, HistorySessionId, KeyCode, KeyModifiers,
-    Keybindings, MenuBuilder, Osc133Markers, Osc633Markers, Prompt, PromptEditMode,
-    PromptHistorySearch, PromptKind, Reedline, ReedlineEvent, ReedlineMenu, ReedlineRawEvent,
-    SearchDirection, SearchQuery, SemanticPromptMarkers, Signal, SimpleMatchHighlighter, Span,
-    SqliteBackedHistory, StyledText, Suggestion, default_emacs_keybindings,
+    Color, ColumnarMenu, Completer, CompletionResult, EditCommand, EditMode, Emacs, Granularity,
+    Highlighter, Hinter, History, HistoryItem, HistoryItemId, HistorySessionId, KeyCode,
+    KeyModifiers, Keybindings, MenuBuilder, MotionTarget, Osc133Markers, Osc633Markers, Prompt,
+    PromptEditMode, PromptHistorySearch, PromptKind, Reedline, ReedlineEvent, ReedlineMenu,
+    ReedlineRawEvent, SearchDirection, SearchQuery, SemanticPromptMarkers, Signal,
+    SimpleMatchHighlighter, Span, SqliteBackedHistory, StyledText, Suggestion,
+    default_emacs_keybindings,
 };
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
@@ -16386,6 +16387,55 @@ fn last_argument(line: &str) -> Option<String> {
     command_words(line)?.get(1..)?.last().cloned()
 }
 
+/// Cut the shell word before the cursor into the cut buffer, so Ctrl-Y puts it
+/// back.
+fn cut_shell_word_left(editor: &mut Reedline) {
+    let cursor = editor.current_insertion_point();
+    let start = shell_word_start(editor.current_buffer_contents(), cursor);
+    if start < cursor {
+        editor.run_edit_commands(&[EditCommand::Cut {
+            target: MotionTarget::Position(start),
+            granularity: Granularity::CharWise,
+        }]);
+    }
+}
+
+/// Where the shell word before `cursor` starts, the way bash's
+/// shell-backward-kill-word finds it: whitespace between it and the cursor
+/// goes with it, and a quoted string is one word, quotes included. The word is
+/// the run of tokens that ends the line up to the cursor with nothing between
+/// them, so it reads the same in a command, an assignment or an expression;
+/// text that does not tokenize yet, such as an open quote, falls back to the
+/// previous whitespace.
+fn shell_word_start(buffer: &str, cursor: usize) -> usize {
+    let line_start = buffer[..cursor]
+        .rfind('\n')
+        .map_or(0, |newline| newline + 1);
+    let text = buffer[line_start..cursor].trim_end();
+    let start = last_token_run_start(text).unwrap_or_else(|| {
+        text.char_indices()
+            .rev()
+            .find(|(_, c)| c.is_whitespace())
+            .map_or(0, |(index, c)| index + c.len_utf8())
+    });
+    line_start + start
+}
+
+/// The start of the run of adjacent tokens that ends `text`, or `None` when
+/// `text` does not tokenize or has no token at its end.
+fn last_token_run_start(text: &str) -> Option<usize> {
+    let tokens = parser::tokenize(text).ok()?;
+    let last = tokens.last().filter(|token| token.span.end == text.len())?;
+    let mut start = last.span.start;
+    for token in tokens.iter().rev().skip(1) {
+        if token.span.end != start {
+            break;
+        }
+        start = token.span.start;
+    }
+    Some(start)
+}
+
 /// The source text of each word in the last pipeline stage of the last
 /// statement, command word first. Backs last-argument recall and the
 /// `!^` / `!$` / `!*` history designators, which slice this list.
@@ -16890,10 +16940,10 @@ fn run_interactive(options: &StartupOptions) -> ExitCode {
     let mut pending = String::new();
     let mut gate = HeredocGate::default();
     let mut pending_history_rows = 0;
-    // Whether this read resumes the one a key's host command (Alt-.)
-    // interrupted to edit the line. Nothing was submitted, so the prompt's side
-    // effects -- hooks, job notices, the cwd report -- are not due again; they
-    // wait for the line to be submitted, as they would have.
+    // Whether this read resumes the one a key's host command (Alt-.,
+    // Ctrl-Backspace) interrupted to edit the line. Nothing was submitted, so the
+    // prompt's side effects -- hooks, job notices, the cwd report -- are not due
+    // again; they wait for the line to be submitted, as they would have.
     let mut resumed = false;
     loop {
         // Where `[N] Done` is printed, so the hook fires exactly when the shell
@@ -16948,6 +16998,9 @@ fn run_interactive(options: &StartupOptions) -> ExitCode {
         match read {
             Ok(Signal::HostCommand(command)) if command == "mesh:recall-last-argument" => {
                 argument_recall.insert(&mut editor);
+            }
+            Ok(Signal::HostCommand(command)) if command == CUT_SHELL_WORD_LEFT => {
+                cut_shell_word_left(&mut editor);
             }
             Ok(signal) => {
                 let mut rewritten = false;
@@ -17039,6 +17092,12 @@ fn run_interactive(options: &StartupOptions) -> ExitCode {
     }
 }
 
+const CUT_SHELL_WORD_LEFT: &str = "mesh:cut-shell-word-left";
+
+fn cut_shell_word_left_event() -> ReedlineEvent {
+    ReedlineEvent::ExecuteHostCommand(CUT_SHELL_WORD_LEFT.to_owned())
+}
+
 fn interactive_keybindings() -> Keybindings {
     let mut keybindings = default_emacs_keybindings();
     keybindings.add_binding(
@@ -17046,6 +17105,16 @@ fn interactive_keybindings() -> Keybindings {
         KeyCode::Char('.'),
         ReedlineEvent::ExecuteHostCommand("mesh:recall-last-argument".to_owned()),
     );
+    // Ctrl-Backspace cuts a whole shell word, as bash's
+    // shell-backward-kill-word does. Terminals without the kitty keyboard
+    // protocol send it as ^H, which arrives as Ctrl-H — reedline's one-character
+    // Backspace — so both keys take it.
+    for (modifiers, code) in [
+        (KeyModifiers::CONTROL, KeyCode::Backspace),
+        (KeyModifiers::CONTROL, KeyCode::Char('h')),
+    ] {
+        keybindings.add_binding(modifiers, code, cut_shell_word_left_event());
+    }
     // The history list, on the four keys that walked history one line at a
     // time. A completion menu already open keeps the arrow (`MenuUp`); the
     // reverse search ignores `Menu` and takes the plain walk after it.
@@ -17370,6 +17439,15 @@ impl EscapePrefix {
                 ReedlineEvent::Edit(Vec::new()),
                 ReedlineEvent::Esc,
             ])
+        } else if event == cut_shell_word_left_event() {
+            // A filter edit, like Backspace: back to the typed line and cut from
+            // its end, rather than accepting the selection and cutting that.
+            ReedlineEvent::Multiple(vec![
+                ReedlineEvent::MenuLeft,
+                ReedlineEvent::Edit(Vec::new()),
+                ReedlineEvent::Edit(vec![EditCommand::MoveToLineEnd { select: false }]),
+                event,
+            ])
         } else if let Some(edit) = filter_edit(&event) {
             edit
         } else if passes_through_open_list(&event) {
@@ -17431,6 +17509,15 @@ impl EditMode for EscapePrefix {
             event => self.forward(event),
         };
         let parsed = self.steer_list(parsed);
+        // A reverse search edits its query, not the line behind it, and takes
+        // only Backspace as a query edit -- so there the key shrinks the query
+        // by one, as Ctrl-H always did, rather than cutting the hidden line.
+        let parsed =
+            if self.searching.load(Ordering::Relaxed) && parsed == cut_shell_word_left_event() {
+                ReedlineEvent::Edit(vec![EditCommand::Backspace])
+            } else {
+                parsed
+            };
         if enters_history_search(&parsed) {
             self.searching.store(true, Ordering::Relaxed);
         } else if self.searching.load(Ordering::Relaxed) && leaves_history_search(&parsed) {
@@ -19112,7 +19199,8 @@ mod tests {
         interruptible_task, last_argument, list_down, list_up, mark_sequence, needs_more_input,
         open_history, path_completions_sync, persist_logical_history, prepare_history_path,
         read_recent_ghost_candidates, run_hooks, run_line, run_source, segment_completions,
-        strip_type_marker, title_sequence, title_text, variable_completions, vscode_escaped, walk,
+        shell_word_start, strip_type_marker, title_sequence, title_text, variable_completions,
+        vscode_escaped, walk,
     };
 
     /// One debt per dialect, however many titles were written.
@@ -19201,6 +19289,81 @@ mod tests {
         std::env::temp_dir()
             .join(format!("mesh-repl-test-{}-{unique}", std::process::id()))
             .join(name)
+    }
+
+    /// What Ctrl-Backspace leaves of `line` with the cursor at its end.
+    fn after_cut_word_left(line: &str) -> &str {
+        &line[..shell_word_start(line, line.len())]
+    }
+
+    #[test]
+    fn ctrl_backspace_cuts_a_whole_shell_word() {
+        // A quoted string goes whole, quotes and all, where an alphanumeric word
+        // would stop inside it.
+        assert_eq!(after_cut_word_left("echo \"foo bar\""), "echo ");
+        assert_eq!(after_cut_word_left("echo 'a b'/'c d'"), "echo ");
+        assert_eq!(after_cut_word_left("ls src/foo.c"), "ls ");
+        assert_eq!(after_cut_word_left("puts first second"), "puts first ");
+        assert_eq!(after_cut_word_left("puts"), "");
+        // Trailing whitespace goes with the word before it, as in bash.
+        assert_eq!(after_cut_word_left("echo \"foo bar\"   "), "echo ");
+        assert_eq!(after_cut_word_left("   "), "");
+        assert_eq!(after_cut_word_left(""), "");
+        assert_eq!(after_cut_word_left("ls | grep \"a b\""), "ls | grep ");
+        // Not only commands: an assignment's or expression's value too.
+        assert_eq!(after_cut_word_left("name = \"two words\""), "name = ");
+        assert_eq!(after_cut_word_left("puts ('a b')"), "puts ");
+        // Tokens with nothing between them are one word, as whitespace reads it.
+        assert_eq!(after_cut_word_left("puts key:2"), "puts ");
+        assert_eq!(after_cut_word_left("ls >out"), "ls ");
+        assert_eq!(after_cut_word_left("ls |"), "ls ");
+    }
+
+    #[test]
+    fn ctrl_backspace_falls_back_to_whitespace_words() {
+        // An open quote does not tokenize yet, so the previous whitespace bounds
+        // it.
+        assert_eq!(after_cut_word_left("echo \"foo bar"), "echo \"foo ");
+        // Multi-byte text is cut on a character boundary.
+        assert_eq!(after_cut_word_left("echo \"é ü"), "echo \"é ");
+    }
+
+    #[test]
+    fn ctrl_backspace_stays_on_its_own_line() {
+        // A continuation line's words are its own; the line above is not cut.
+        let buffer = "if true {\n  puts \"a b\"";
+        assert_eq!(
+            &buffer[..shell_word_start(buffer, buffer.len())],
+            "if true {\n  puts "
+        );
+        let buffer = "if true {\n   ";
+        assert_eq!(
+            &buffer[..shell_word_start(buffer, buffer.len())],
+            "if true {\n"
+        );
+    }
+
+    #[test]
+    fn ctrl_backspace_and_ctrl_h_cut_a_shell_word() {
+        // Without the kitty keyboard protocol, Ctrl-Backspace arrives as ^H.
+        let keys = interactive_keybindings();
+        for (modifiers, code) in [
+            (KeyModifiers::CONTROL, KeyCode::Backspace),
+            (KeyModifiers::CONTROL, KeyCode::Char('h')),
+        ] {
+            assert_eq!(
+                keys.find_binding(modifiers, code),
+                Some(ReedlineEvent::ExecuteHostCommand(
+                    super::CUT_SHELL_WORD_LEFT.to_owned()
+                )),
+                "{code:?}"
+            );
+        }
+        // Plain Backspace still deletes one character.
+        assert_eq!(
+            keys.find_binding(KeyModifiers::NONE, KeyCode::Backspace),
+            Some(ReedlineEvent::Edit(vec![EditCommand::Backspace]))
+        );
     }
 
     #[test]
@@ -21410,6 +21573,60 @@ mod tests {
         assert!(
             mode.search_state().load(Ordering::Relaxed),
             "and the search mirror still sees the search begin"
+        );
+    }
+
+    #[test]
+    fn ctrl_backspace_edits_the_filter_rather_than_the_selection() {
+        let (mut mode, flag) = escape_prefix_with_list();
+        flag.store(true, Ordering::Relaxed);
+        // Back to the typed line and cut from its end, as Backspace does --
+        // not the default for other keys, which accepts the selection first.
+        for (modifiers, code) in [
+            (KeyModifiers::CONTROL, KeyCode::Backspace),
+            (KeyModifiers::CONTROL, KeyCode::Char('h')),
+        ] {
+            assert_eq!(
+                press(&mut mode, code, modifiers),
+                ReedlineEvent::Multiple(vec![
+                    ReedlineEvent::MenuLeft,
+                    ReedlineEvent::Edit(Vec::new()),
+                    ReedlineEvent::Edit(vec![EditCommand::MoveToLineEnd { select: false }]),
+                    super::cut_shell_word_left_event(),
+                ]),
+                "{code:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn ctrl_backspace_shrinks_a_reverse_search_query() {
+        let mut mode = escape_prefix();
+        assert_eq!(
+            press(&mut mode, KeyCode::Char('r'), KeyModifiers::CONTROL),
+            ReedlineEvent::SearchHistory
+        );
+        // Backspace is the one edit the search applies to its query; the host
+        // command would cut the hidden line instead.
+        for (modifiers, code) in [
+            (KeyModifiers::CONTROL, KeyCode::Backspace),
+            (KeyModifiers::CONTROL, KeyCode::Char('h')),
+        ] {
+            assert_eq!(
+                press(&mut mode, code, modifiers),
+                ReedlineEvent::Edit(vec![EditCommand::Backspace]),
+                "{code:?}"
+            );
+            assert!(
+                mode.search_state().load(Ordering::Relaxed),
+                "still searching"
+            );
+        }
+        // Out of the search, the key cuts a shell word again.
+        press(&mut mode, KeyCode::Esc, KeyModifiers::NONE);
+        assert_eq!(
+            press(&mut mode, KeyCode::Char('h'), KeyModifiers::CONTROL),
+            super::cut_shell_word_left_event()
         );
     }
 
