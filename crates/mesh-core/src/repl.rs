@@ -16890,6 +16890,11 @@ fn run_interactive(options: &StartupOptions) -> ExitCode {
     let mut pending = String::new();
     let mut gate = HeredocGate::default();
     let mut pending_history_rows = 0;
+    // Whether this read resumes the one a key's host command (Alt-.)
+    // interrupted to edit the line. Nothing was submitted, so the prompt's side
+    // effects -- hooks, job notices, the cwd report -- are not due again; they
+    // wait for the line to be submitted, as they would have.
+    let mut resumed = false;
     loop {
         // Where `[N] Done` is printed, so the hook fires exactly when the shell
         // says it noticed — one call per job, in the order they were reported.
@@ -16900,9 +16905,11 @@ fn run_interactive(options: &StartupOptions) -> ExitCode {
         // it lists, and so does the shell before a pipeline stage that can look
         // at the table, so a job can be reported and removed before this line
         // runs. Draining the table collects those too.
-        shell.jobs.reap();
-        run_jobdone_hooks(&mut shell);
-        if pending.is_empty() {
+        if !resumed {
+            shell.jobs.reap();
+            run_jobdone_hooks(&mut shell);
+        }
+        if pending.is_empty() && !resumed {
             run_hooks(HookEvent::PrePrompt, Vec::new(), &mut shell);
             // Again, because a `preprompt` handler can report a job itself — it
             // need only run `jobs`, which reaps before it lists. Without this the
@@ -16924,6 +16931,7 @@ fn run_interactive(options: &StartupOptions) -> ExitCode {
             custom: shell.prompt.text.clone(),
         };
         let read = editor.read_line(&prompt);
+        resumed = matches!(read, Ok(Signal::HostCommand(_)));
         // Every way out of `read_line` puts the engine back in regular input
         // except a host command, which suspends a search and resumes it on the
         // next read. Re-converge the meta prefix's search mirror here: the

@@ -6185,6 +6185,99 @@ fn blank_line_harness(exec: &MeshExec) -> i32 {
 }
 
 #[test]
+fn a_key_that_edits_the_line_does_not_rerun_the_prompt_hooks() {
+    let exec = MeshExec::new(isolated_config_home());
+    let harness = unsafe { libc::fork() };
+    assert!(harness >= 0);
+    if harness == 0 {
+        unsafe { libc::_exit(line_edit_key_harness(&exec)) };
+    }
+    await_pty_harness(harness);
+}
+
+/// Alt-. edits the line through a host command, which leaves `read_line` and
+/// comes back to the same line. Nothing was submitted, so the
+/// `preprompt` hook -- and the rest of the prompt's setup -- must not run again.
+fn line_edit_key_harness(exec: &MeshExec) -> i32 {
+    let Some(shell) = start_pty_shell(exec, None) else {
+        return 90;
+    };
+    let mut seen = shell.startup.clone();
+    for line in ["func pp() { puts PREPROMPT }\n", "on preprompt p pp\n"] {
+        if !pty_write(shell.master, line.as_bytes()) {
+            return 91;
+        }
+        let Some((window, _)) = pty_read_until_command_done(shell.master) else {
+            return 92;
+        };
+        seen.extend_from_slice(&window);
+    }
+    // Wait for the prompt after the hook went in -- which runs it once -- so its
+    // output cannot land in the windows below.
+    if !pty_read_on_until(shell.master, &mut seen, INPUT_READY) {
+        return 93;
+    }
+    // Alt-. puts back the previous command's last argument, `pp`. It leaves
+    // `read_line` and comes back to the same line, and nothing in between may
+    // run the hook.
+    if !pty_write(shell.master, b"puts \x1b.") {
+        return 94;
+    }
+    let Some(edits) = pty_read_until_the_prompt_returns(shell.master) else {
+        return 95;
+    };
+    if occurrences(&edits, b"PREPROMPT\r\n") != 0 {
+        return 96;
+    }
+    seen.extend_from_slice(&edits);
+    if !pty_write(shell.master, b"\n") {
+        return 97;
+    }
+    let Some((window, status)) = pty_read_until_command_done(shell.master) else {
+        return 98;
+    };
+    seen.extend_from_slice(&window);
+    // The line ran as Alt-. left it: `puts pp`.
+    if status != 0 || occurrences(&window, b"pp\r\n") != 1 {
+        return 99;
+    }
+    // Positive control: the submitted line does run the hook before the next
+    // prompt, so a shell that had stopped running it at all fails here rather
+    // than passing the zero above.
+    if !pty_read_on_until(shell.master, &mut seen, b"PREPROMPT\r\n") {
+        return 100;
+    }
+    if !stop_pty_shell(shell) {
+        return 101;
+    }
+    0
+}
+
+/// Keep reading into `seen` until what arrived after its last command-done mark
+/// contains `marker`, answering cursor queries on the way.
+fn pty_read_on_until(master: RawFd, seen: &mut Vec<u8>, marker: &[u8]) -> bool {
+    let since_done = |seen: &[u8]| {
+        let from = seen
+            .windows(COMMAND_DONE.len())
+            .rposition(|part| part == COMMAND_DONE)
+            .unwrap_or(0);
+        seen[from..]
+            .windows(marker.len())
+            .any(|part| part == marker)
+    };
+    if since_done(seen) {
+        return true;
+    }
+    match pty_read_until_one_of(master, &[marker]) {
+        Some(window) => {
+            seen.extend_from_slice(&window);
+            true
+        }
+        None => false,
+    }
+}
+
+#[test]
 fn a_jobdone_hook_fires_where_the_done_notice_prints() {
     let exec = MeshExec::new(isolated_config_home());
     // No space in the tag: these paths are written into `sh -c '…'` command
