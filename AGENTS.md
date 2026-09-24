@@ -234,12 +234,13 @@ has stopped biting.
   flight together, each merged only once every lower-numbered active PR has.
   Waiting holds only the merge: keep driving a queued PR — review comments,
   CI, rebases — so it is green with Codex's `+1` the moment it is the lowest.
-  Merge by hand, never auto-merge, rechecking the lower PRs just before. A
-  merge can leave the next one `dirty` or `behind` — rebase it per the
-  `dirty`/`behind` rule and merge on its new verdict. Active means open, not a
-  draft, and either green with a `+1` and only waiting its turn, or opened, pushed to,
-  reviewed or commented on in the last 30 minutes; say which lower PRs you
-  skipped as stale.
+  Merge by hand, never auto-merge (disarm any already armed), rechecking the
+  lower PRs just before. Each merge moves the base, so rebase the next one per
+  the `dirty`/`behind` rule even where the ruleset allows `behind`, and merge
+  on its new verdict. Active means open, not a draft, and either green with a
+  `+1` and only waiting its turn, or opened, reopened, pushed to, reviewed or
+  commented on in the last 30 minutes; say which lower PRs you skipped as
+  stale.
 ## Git workflow
 
 - **Sync before you start** — skipping it bases the whole task on a stale tree.
