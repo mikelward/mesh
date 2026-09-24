@@ -16422,7 +16422,7 @@ fn shell_word_end(buffer: &str, cursor: usize) -> usize {
     let line_end = buffer[cursor..]
         .find('\n')
         .map_or(buffer.len(), |newline| cursor + newline);
-    shell_words(buffer, &parser::regex_spans(buffer))
+    shell_words(buffer, &parser::word_layout(buffer))
         .into_iter()
         .map(|word| word.end.min(line_end))
         .find(|&end| end > cursor)
@@ -16433,13 +16433,13 @@ fn shell_word_end(buffer: &str, cursor: usize) -> usize {
 /// shell-backward-kill-word finds it: whitespace between it and the cursor
 /// goes with it, and a quoted string is one word, quotes included. The words
 /// are those of the buffer up to the cursor -- see [`shell_words`] -- and the
-/// cut stops at the start of the cursor's line. Regex literals are the whole
-/// buffer's, since only a literal's closing `/` makes it one.
+/// cut stops at the start of the cursor's line. The parser's layout is the
+/// whole buffer's, since only a literal's closing `/` makes it one.
 fn shell_word_start(buffer: &str, cursor: usize) -> usize {
     let line_start = buffer[..cursor]
         .rfind('\n')
         .map_or(0, |newline| newline + 1);
-    shell_words(&buffer[..cursor], &parser::regex_spans(buffer))
+    shell_words(&buffer[..cursor], &parser::word_layout(buffer))
         .last()
         .map_or(line_start, |word| word.start.max(line_start))
 }
@@ -16450,24 +16450,32 @@ fn shell_word_start(buffer: &str, cursor: usize) -> usize {
 /// escapes, raw strings, captures and comments all follow its rules. Tokens
 /// that touch make one word, and so does everything inside a bracket opened
 /// on the same line, so `"a b"`, `$(echo a b)`, `('a b')` and `2>&1` are one
-/// word each, and so is each of the `regexes` -- `/…/` literals, as
-/// [`parser::regex_spans`] reports them -- `|` and all. A command separator --
-/// `;`, `&`, `|`, `&&`, `||`, `|&` -- is a word of its own, and so is a
-/// newline, so a block's lines keep their own words. A quoted string that
-/// spans lines is still one word, which the cuts clip to the cursor's line.
+/// word each. The parser's [`parser::WordLayout`] adds what the tokens do not
+/// say: a `/…/` regex literal is one word, `|` and all, and so is a bracket
+/// holding values -- a list, a group, a call's arguments -- even across lines.
+/// A command separator -- `;`, `&`, `|`, `&&`, `||`, `|&` -- is a word of its
+/// own, and so is any other newline, so a block's lines keep their own words.
+/// A word that spans lines, a quoted string or a list, is still one word,
+/// which the cuts clip to the cursor's line.
 ///
 /// The lexer runs in its tolerant mode, since a line being typed is usually
 /// unfinished: an unclosed quote runs to the end, and so does a bracket left
 /// open on the last line.
-fn shell_words(source: &str, regexes: &[std::ops::Range<usize>]) -> Vec<std::ops::Range<usize>> {
+fn shell_words(source: &str, layout: &parser::WordLayout) -> Vec<std::ops::Range<usize>> {
     use parser::TokenKind;
     let mut words: Vec<std::ops::Range<usize>> = Vec::new();
-    // The closers still owed, innermost last, each with where its opener is and
-    // whether what is inside is one word. A closer that is not the innermost
-    // one's closes nothing, as in the parser's `unclosed_opener`. Braces hold
-    // statements -- a block's words and separators are its own -- where a
-    // parenthesis, bracket or capture holds one value.
-    let mut open: Vec<(TokenKind, usize, bool)> = Vec::new();
+    // The closers still owed, innermost last, each with where its opener is,
+    // whether what is inside is one word, and whether it is one word across
+    // lines too. A closer that is not the innermost one's closes nothing, as
+    // in the parser's `unclosed_opener`. Braces hold statements -- a block's
+    // words and separators are its own -- where a parenthesis, bracket or
+    // capture holds one value on its line. Only a bracket the parser read as
+    // holding values holds one across lines: a capture holds statements.
+    let mut open: Vec<(TokenKind, usize, bool, bool)> = Vec::new();
+    // Inside a bracket holding values, innermost, so a newline is layout.
+    let spans_lines = |open: &[(TokenKind, usize, bool, bool)]| {
+        open.last().is_some_and(|&(_, _, _, lines)| lines)
+    };
     // Just past the last newline scanned: only a bracket opened after it
     // joins the tokens inside it into one word.
     let mut line_start = 0;
@@ -16491,23 +16499,33 @@ fn shell_words(source: &str, regexes: &[std::ops::Range<usize>]) -> Vec<std::ops
         }
         // A regex's tokens are pattern: they join, and a bracket among them
         // -- `/[(]/` -- opens nothing.
-        let in_regex = regexes
+        let in_regex = layout
+            .regexes
             .iter()
             .any(|regex| regex.start < token.span.start && token.span.start < regex.end);
-        let inside = in_regex || open.iter().any(|&(_, at, joins)| joins && at >= line_start);
+        let layout_newline = spans_lines(&open);
+        let inside = in_regex
+            || layout_newline
+            || open
+                .iter()
+                .any(|&(_, at, joins, _)| joins && at >= line_start);
+        let values = layout.brackets.contains(&token.span.start);
         match token.value {
             _ if in_regex => {}
-            TokenKind::LParen | TokenKind::CaptureStart => {
-                open.push((TokenKind::RParen, token.span.start, true));
+            TokenKind::LParen => open.push((TokenKind::RParen, token.span.start, true, values)),
+            TokenKind::CaptureStart => {
+                open.push((TokenKind::RParen, token.span.start, true, false));
             }
-            TokenKind::LBracket => open.push((TokenKind::RBracket, token.span.start, true)),
-            TokenKind::LBrace => open.push((TokenKind::RBrace, token.span.start, false)),
-            ref closer if open.last().is_some_and(|(owed, _, _)| owed == closer) => {
+            TokenKind::LBracket => {
+                open.push((TokenKind::RBracket, token.span.start, true, values));
+            }
+            TokenKind::LBrace => open.push((TokenKind::RBrace, token.span.start, false, false)),
+            ref closer if open.last().is_some_and(|(owed, _, _, _)| owed == closer) => {
                 open.pop();
             }
             _ => {}
         }
-        let separator = token.value == TokenKind::Newline
+        let separator = (token.value == TokenKind::Newline && !layout_newline)
             || (!inside
                 && matches!(
                     token.value,
@@ -16531,7 +16549,10 @@ fn shell_words(source: &str, regexes: &[std::ops::Range<usize>]) -> Vec<std::ops
             line_start = token.span.start + newline + 1;
         }
     }
-    if open.iter().any(|&(_, at, joins)| joins && at >= line_start)
+    if (spans_lines(&open)
+        || open
+            .iter()
+            .any(|&(_, at, joins, _)| joins && at >= line_start))
         && let Some(word) = words.last_mut()
     {
         word.end = source.len();
@@ -19636,6 +19657,33 @@ mod tests {
         assert_eq!(
             &buffer[..shell_word_start(buffer, buffer.len())],
             "if true {\n"
+        );
+    }
+
+    #[test]
+    fn word_cuts_take_a_list_spanning_lines_whole() {
+        // A list, group or call's arguments is one word on each of its lines,
+        // as a quoted string is, and the cut keeps to the cursor's line.
+        assert_eq!(after_cut_word_left("x = [a,\n  b, c"), "x = [a,\n");
+        assert_eq!(after_cut_word_left("x = [a,\n  b, c]"), "x = [a,\n");
+        assert_eq!(after_cut_word_left("puts (1 +\n  2 + 3)"), "puts (1 +\n");
+        assert_eq!(after_cut_word_left("y = f(a,\n  b c"), "y = f(a,\n");
+        assert_eq!(after_cut_word_right("x = [a,\n  b, c]", 8), "x = [a,\n");
+        // Past its closer, words are their own again.
+        assert_eq!(after_cut_word_left("x = [a,\n  b] + c"), "x = [a,\n  b] + ");
+        // A capture and a block hold statements, so their lines keep their
+        // own words, inside a list or not.
+        assert_eq!(
+            after_cut_word_left("x = $(\n  echo a b"),
+            "x = $(\n  echo a "
+        );
+        assert_eq!(
+            after_cut_word_left("x = [$(\n  echo a b"),
+            "x = [$(\n  echo a "
+        );
+        assert_eq!(
+            after_cut_word_left("if $x {\n  echo a b"),
+            "if $x {\n  echo a "
         );
     }
 
