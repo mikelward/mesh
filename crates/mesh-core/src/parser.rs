@@ -1362,15 +1362,27 @@ pub fn tokenize_partial(source: &str) -> Vec<Token> {
         .0
 }
 
-/// Where the `/…/` regex literals of a line still being typed are, for the
-/// line editor's word motions: a `|` or a space in one is pattern, not a
-/// separator.
+/// What the parser knows about a line still being typed that its tokens do
+/// not say, for the line editor's word motions. See [`word_layout`].
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct WordLayout {
+    /// Each `/…/` regex literal: a `|` or a space in one is pattern, not a
+    /// separator.
+    pub regexes: Vec<Span>,
+    /// Where each `(` or `[` that holds values rather than statements opens --
+    /// a group, a list or map, a call's arguments, an index -- so a newline
+    /// in one is layout rather than the end of a command.
+    pub brackets: Vec<usize>,
+}
+
+/// The [`WordLayout`] of a line still being typed.
 ///
-/// A regex is not a token -- the parser reads one where a slot asks for it --
-/// so this parses [`tokenize_partial`]'s tokens. A half-typed line usually
-/// fails to parse at its end, after the literals before it have been read;
-/// one that fails earlier reports only those read before the failure.
-pub fn regex_spans(source: &str) -> Vec<Span> {
+/// A regex is not a token, and a bracket does not say what it holds -- the
+/// parser decides both from where they are -- so this parses
+/// [`tokenize_partial`]'s tokens. A half-typed line usually fails to parse at
+/// its end, after the constructs before it have been read; one that fails
+/// earlier reports only those read before the failure.
+pub fn word_layout(source: &str) -> WordLayout {
     let mut parser = Parser {
         tokens: tokenize_partial(source),
         position: 0,
@@ -1381,10 +1393,14 @@ pub fn regex_spans(source: &str) -> Vec<Span> {
         grouped: 0,
         argument: false,
         regexes: Vec::new(),
+        brackets: Vec::new(),
     };
-    // Ignored: the spans read before a failure are still right.
+    // Ignored: what was read before a failure is still right.
     let _ = parser.source(None);
-    parser.regexes.into_iter().map(|(_, span)| span).collect()
+    WordLayout {
+        regexes: parser.regexes.into_iter().map(|(_, span)| span).collect(),
+        brackets: parser.brackets.into_iter().map(|(_, at)| at).collect(),
+    }
 }
 
 /// Parse a buffered input unit. An open delimiter or trailing operator returns
@@ -1468,6 +1484,7 @@ pub fn parse(source: &str) -> Result<ParseOutcome, ParseError> {
         grouped: 0,
         argument: false,
         regexes: Vec::new(),
+        brackets: Vec::new(),
     };
     match parser.source(None) {
         Ok(tree) => Ok(ParseOutcome::Complete(tree)),
@@ -1599,6 +1616,7 @@ pub(crate) fn params_prefix_status(list: &str) -> PrefixStatus {
         grouped: 0,
         argument: false,
         regexes: Vec::new(),
+        brackets: Vec::new(),
     }
     .parameters_prefix()
 }
@@ -2368,6 +2386,7 @@ pub(crate) fn capture_in_string(
         grouped: 0,
         argument: false,
         regexes: Vec::new(),
+        brackets: Vec::new(),
     };
     Ok((Expr::Capture(parser.source(Some(TokenKind::RParen))?), end))
 }
@@ -2511,6 +2530,7 @@ fn braced_expression_in_string(
         grouped: 1,
         argument: false,
         regexes: Vec::new(),
+        brackets: Vec::new(),
     };
     parser.newlines();
     let expression = parser.expression()?;
@@ -3376,9 +3396,12 @@ struct Parser<'a> {
     /// [`Parser::postfix`] for the operands beside it.
     argument: bool,
     /// Each `/…/` literal read so far, with the token position it starts at,
-    /// for [`regex_spans`]. [`Parser::rewind`] drops the ones a reading it
+    /// for [`word_layout`]. [`Parser::rewind`] drops the ones a reading it
     /// backs out of had recorded.
     regexes: Vec<(usize, Span)>,
+    /// Each `(` or `[` read as holding values, with its token position and
+    /// byte offset, for [`word_layout`]; dropped by a rewind the same way.
+    brackets: Vec<(usize, usize)>,
 }
 
 /// How deep a nesting the parser accepts before reporting [`ParseErrorKind::TooDeep`].
@@ -6063,6 +6086,7 @@ impl Parser<'_> {
                         .peek()
                         .is_some_and(|token| token.span.start == self.previous_end()))
             {
+                self.value_bracket();
                 self.position += 1;
                 self.newlines();
                 // Counted, for the same reason the `else if` arm is: `primary`
@@ -6090,6 +6114,7 @@ impl Parser<'_> {
                     .peek()
                     .is_some_and(|token| token.span.start == self.previous_end())
             {
+                self.value_bracket();
                 self.position += 1;
                 self.newlines();
                 let index = self.deeper(Self::expression)?;
@@ -6130,6 +6155,7 @@ impl Parser<'_> {
                         .peek()
                         .is_some_and(|token| token.span.start == self.previous_end())
                 {
+                    self.value_bracket();
                     self.position += 1;
                     // The first argument of the replace family is a **regex match
                     // slot** (`DESIGN.md` §"String"), so a bare `/…/` there reads as
@@ -6657,7 +6683,9 @@ impl Parser<'_> {
             self.position += 2;
             return Ok(Expr::ModifierRef(name));
         }
-        if self.eat(&TokenKind::LParen).is_some() {
+        if self.same(&TokenKind::LParen) {
+            self.value_bracket();
+            self.position += 1;
             self.newlines();
             // One expression, so every newline in here is layout — including one
             // that lands mid-expression, which is the case `newlines` on its own
@@ -6670,7 +6698,9 @@ impl Parser<'_> {
             self.expect(&TokenKind::RParen, "`)`")?;
             return Ok(Expr::Group(Box::new(value)));
         }
-        if self.eat(&TokenKind::LBracket).is_some() {
+        if self.same(&TokenKind::LBracket) {
+            self.value_bracket();
+            self.position += 1;
             self.newlines();
             return self.collection();
         }
@@ -7913,11 +7943,21 @@ impl Parser<'_> {
     fn at_end(&self) -> bool {
         self.position == self.tokens.len()
     }
-    /// Move to token `position`, forgetting any regex literal read at or past
-    /// it: going back means the reading that found it has been abandoned.
+    /// Move to token `position`, forgetting any regex literal or bracket read
+    /// at or past it: going back means the reading that found it has been
+    /// abandoned.
     fn rewind(&mut self, position: usize) {
         self.position = position;
         self.regexes.retain(|&(at, _)| at < position);
+        self.brackets.retain(|&(at, _)| at < position);
+    }
+    /// Note that the `(` or `[` about to be consumed holds values, for
+    /// [`word_layout`].
+    fn value_bracket(&mut self) {
+        if let Some(token) = self.peek() {
+            let at = token.span.start;
+            self.brackets.push((self.position, at));
+        }
     }
     fn previous_end(&self) -> usize {
         self.position
@@ -8472,6 +8512,7 @@ mod tests {
                 grouped: 0,
                 argument: false,
                 regexes: Vec::new(),
+                brackets: Vec::new(),
             };
             // The whole source, which is what the value parse would consume here.
             let end = parser.tokens.len();
@@ -9339,21 +9380,28 @@ mod tests {
     }
 
     #[test]
-    fn regex_spans_are_those_of_the_reading_that_stands() {
-        let spans = |source: &str| {
-            regex_spans(source)
+    fn word_layout_is_that_of_the_reading_that_stands() {
+        let regexes = |source: &str| {
+            word_layout(source)
+                .regexes
                 .into_iter()
                 .map(|span| (span.start, span.end))
                 .collect::<Vec<_>>()
         };
-        assert_eq!(spans("if $x ~ /a|b/"), [(8, 13)]);
+        assert_eq!(regexes("if $x ~ /a|b/"), [(8, 13)]);
         // Every probe that backs out drops what it read, so a literal read
         // on the way to the command reading is not reported, and one read
         // again after a probe is reported once.
-        assert_eq!(spans("$x ~ /a|b/ foo"), []);
-        assert_eq!(spans("${x} ~ /a|b/"), [(7, 12)]);
+        assert_eq!(regexes("$x ~ /a|b/ foo"), Vec::<(usize, usize)>::new());
+        assert_eq!(regexes("${x} ~ /a|b/"), [(7, 12)]);
         // A failure keeps what was read before it.
-        assert_eq!(spans("$x ~ /a|b/ == y"), [(5, 10)]);
+        assert_eq!(regexes("$x ~ /a|b/ == y"), [(5, 10)]);
+        // Brackets holding values, and not those holding statements or
+        // arguments to a command.
+        let brackets = |source: &str| word_layout(source).brackets;
+        assert_eq!(brackets("x = [a, (b), f(c), g()[0]"), [4, 8, 14, 20, 22]);
+        assert_eq!(brackets("x = $(ls)"), Vec::<usize>::new());
+        assert_eq!(brackets("ls [a b]"), Vec::<usize>::new());
     }
 
     #[test]

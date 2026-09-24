@@ -2187,9 +2187,6 @@ all under "Beyond M3 — External tool integration".
       (`repl.rs`) reads words off `tokenize_partial`, but some grouping is
       decided by the parser, and the word keys do not try to guess it. Known
       gaps:
-      - A list or group spanning lines (`x = [a,` then `b, c]`) is not one
-        word on its later lines: only a bracket opened on the cursor's line
-        joins what is inside it, which is what keeps a block's lines apart.
       - An unfinished heredoc body (no terminator yet) is lexed as mesh
         syntax, so a `(` or a quote in it groups; a finished body is cut a
         whitespace word at a time. With two heredocs where only the second
@@ -2204,10 +2201,9 @@ all under "Beyond M3 — External tool integration".
         an unclosed string (`puts "foo $(echo` then `bar baz`) is reported
         as the capture, not the quote, so the next line is cut word by word
         though it is still inside the string.
-      For the multi-line group, the fix is the one regex literals already
-      have: the parser reports the spans (`parser::regex_spans`, read off a
-      parse of the half-typed buffer), rather than the line editor
-      reconstructing them. The other three are the tolerant lexer's to fix.
+      All three are the tolerant lexer's to fix; what only the parser knows
+      (regex literals, brackets holding values) already comes from
+      `parser::word_layout`.
 
 ## Beyond M3 — Navigation
 
