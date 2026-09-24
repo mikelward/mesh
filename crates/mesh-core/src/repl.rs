@@ -19728,6 +19728,29 @@ mod tests {
     }
 
     #[test]
+    fn word_cuts_read_an_unfinished_heredoc_body_as_text() {
+        // No terminator yet: the body is still text, so a bracket or a quote
+        // in it groups nothing.
+        assert_eq!(
+            after_cut_word_left("cat << END\nfoo (bar baz"),
+            "cat << END\nfoo (bar "
+        );
+        assert_eq!(
+            after_cut_word_left("cat << END\nsay \"a b"),
+            "cat << END\nsay \"a "
+        );
+        let buffer = "cat << END\n(one two";
+        let body = buffer.find('(').unwrap();
+        assert_eq!(shell_word_end(buffer, body), body + "(one".len());
+        // A finished body before it stays finished, rather than being read
+        // again as syntax.
+        let buffer = "cat << A << B\n(one two\nA\nthree";
+        let body = buffer.find('(').unwrap();
+        assert_eq!(shell_word_end(buffer, body), body + "(one".len());
+        assert_eq!(after_cut_word_left(buffer), "cat << A << B\n(one two\nA\n");
+    }
+
+    #[test]
     fn ctrl_backspace_and_ctrl_h_cut_a_shell_word() {
         // Without the kitty keyboard protocol, Ctrl-Backspace arrives as ^H.
         let keys = interactive_keybindings();

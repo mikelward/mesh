@@ -1351,8 +1351,9 @@ pub fn tokenize(source: &str) -> Result<Vec<Token>, ParseError> {
 /// lex is unfinished and becomes one word token: an unclosed quote runs to the
 /// end of `source`, and anything else -- a capture in a string that does not
 /// parse yet, say -- to the end of its line. An unclosed bracket just leaves its
-/// closer missing. A comment's text comes back as word tokens, one per
-/// whitespace-separated chunk.
+/// closer missing. A heredoc whose terminator has not been typed yet has a
+/// body to the end of `source`. A comment's text comes back as word tokens,
+/// one per whitespace-separated chunk.
 pub fn tokenize_partial(source: &str) -> Vec<Token> {
     let mut lexer = Lexer::new(source);
     lexer.tolerant = true;
@@ -1797,7 +1798,9 @@ impl<'a> Lexer<'a> {
             }
             if c == '\n' {
                 self.position += 1;
-                // Tolerant: a heredoc still being typed is not an error.
+                // Tolerant: a heredoc still being typed is not an error -- its
+                // body runs to the end, and a delimiter it cannot use yet is
+                // left alone.
                 if let Err(error) = self.consume_heredocs(&mut tokens, line_start, start)
                     && !self.tolerant
                 {
@@ -2206,11 +2209,17 @@ impl<'a> Lexer<'a> {
                 }
                 scan = line_end + 1;
             }
-            let Some((closing_start, closing_end)) = closing else {
-                return Err(ParseError {
-                    kind: ParseErrorKind::UnterminatedHeredoc(delimiter.to_owned()),
-                    span: body_start..self.source.len(),
-                });
+            let (closing_start, closing_end) = match closing {
+                Some(closing) => closing,
+                // Tolerant: a body still being typed runs to the end, as text,
+                // and the bodies before it stay consumed.
+                None if self.tolerant => (self.source.len(), self.source.len()),
+                None => {
+                    return Err(ParseError {
+                        kind: ParseErrorKind::UnterminatedHeredoc(delimiter.to_owned()),
+                        span: body_start..self.source.len(),
+                    });
+                }
             };
             tokens.insert(
                 delimiter_index + 1 + inserted,
