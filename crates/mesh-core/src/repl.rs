@@ -16422,7 +16422,7 @@ fn shell_word_end(buffer: &str, cursor: usize) -> usize {
     let line_end = buffer[cursor..]
         .find('\n')
         .map_or(buffer.len(), |newline| cursor + newline);
-    shell_words(buffer)
+    shell_words(buffer, &parser::regex_spans(buffer))
         .into_iter()
         .map(|word| word.end.min(line_end))
         .find(|&end| end > cursor)
@@ -16433,12 +16433,13 @@ fn shell_word_end(buffer: &str, cursor: usize) -> usize {
 /// shell-backward-kill-word finds it: whitespace between it and the cursor
 /// goes with it, and a quoted string is one word, quotes included. The words
 /// are those of the buffer up to the cursor -- see [`shell_words`] -- and the
-/// cut stops at the start of the cursor's line.
+/// cut stops at the start of the cursor's line. Regex literals are the whole
+/// buffer's, since only a literal's closing `/` makes it one.
 fn shell_word_start(buffer: &str, cursor: usize) -> usize {
     let line_start = buffer[..cursor]
         .rfind('\n')
         .map_or(0, |newline| newline + 1);
-    shell_words(&buffer[..cursor])
+    shell_words(&buffer[..cursor], &parser::regex_spans(buffer))
         .last()
         .map_or(line_start, |word| word.start.max(line_start))
 }
@@ -16449,15 +16450,16 @@ fn shell_word_start(buffer: &str, cursor: usize) -> usize {
 /// escapes, raw strings, captures and comments all follow its rules. Tokens
 /// that touch make one word, and so does everything inside a bracket opened
 /// on the same line, so `"a b"`, `$(echo a b)`, `('a b')` and `2>&1` are one
-/// word each. A command separator -- `;`, `&`, `|`, `&&`, `||`, `|&` -- is a
-/// word of its own, and so is a newline, so a block's lines keep their own
-/// words. A quoted string that spans lines is still one word, which the cuts
-/// clip to the cursor's line.
+/// word each, and so is each of the `regexes` -- `/…/` literals, as
+/// [`parser::regex_spans`] reports them -- `|` and all. A command separator --
+/// `;`, `&`, `|`, `&&`, `||`, `|&` -- is a word of its own, and so is a
+/// newline, so a block's lines keep their own words. A quoted string that
+/// spans lines is still one word, which the cuts clip to the cursor's line.
 ///
 /// The lexer runs in its tolerant mode, since a line being typed is usually
 /// unfinished: an unclosed quote runs to the end, and so does a bracket left
 /// open on the last line.
-fn shell_words(source: &str) -> Vec<std::ops::Range<usize>> {
+fn shell_words(source: &str, regexes: &[std::ops::Range<usize>]) -> Vec<std::ops::Range<usize>> {
     use parser::TokenKind;
     let mut words: Vec<std::ops::Range<usize>> = Vec::new();
     // The closers still owed, innermost last, each with where its opener is and
@@ -16487,8 +16489,14 @@ fn shell_words(source: &str) -> Vec<std::ops::Range<usize>> {
             // come, and the newline after the body resets it anyway.
             continue;
         }
-        let inside = open.iter().any(|&(_, at, joins)| joins && at >= line_start);
+        // A regex's tokens are pattern: they join, and a bracket among them
+        // -- `/[(]/` -- opens nothing.
+        let in_regex = regexes
+            .iter()
+            .any(|regex| regex.start < token.span.start && token.span.start < regex.end);
+        let inside = in_regex || open.iter().any(|&(_, at, joins)| joins && at >= line_start);
         match token.value {
+            _ if in_regex => {}
             TokenKind::LParen | TokenKind::CaptureStart => {
                 open.push((TokenKind::RParen, token.span.start, true));
             }
@@ -19450,6 +19458,37 @@ mod tests {
         assert_eq!(after_cut_word_left("a&&b"), "a&&");
         assert_eq!(after_cut_word_left("a|&b"), "a|&");
         assert_eq!(after_cut_word_left("echo;"), "echo");
+    }
+
+    #[test]
+    fn word_cuts_take_a_regex_literal_whole() {
+        // Where the parser reads a regex, a `|` or space in it is pattern.
+        assert_eq!(after_cut_word_left("if $x ~ /a|b/"), "if $x ~ ");
+        assert_eq!(after_cut_word_left("if $x !~ /a b/"), "if $x !~ ");
+        assert_eq!(after_cut_word_left("puts ($x ~ /a;b/)"), "puts ");
+        assert_eq!(after_cut_word_left("puts $x:match(/a|b/)"), "puts ");
+        assert_eq!(after_cut_word_left("match $x {\n  /a|b/"), "match $x {\n  ");
+        assert_eq!(after_cut_word_left("y = $x ~ /a|b/:i"), "y = $x ~ ");
+        // A bracket in a literal is pattern too, and closes nothing it opens.
+        assert_eq!(
+            after_cut_word_left("y = $x ~ /a|[(]/ tail"),
+            "y = $x ~ /a|[(]/ "
+        );
+        assert_eq!(after_cut_word_left("y = $x ~ /a|[(]/"), "y = $x ~ ");
+        assert_eq!(after_cut_word_right("$x ~ /a|b/ && y", 5), "$x ~  && y");
+        // From inside a literal, it is still one: its closer is after the
+        // cursor, so the backward cut reads the whole buffer to find it.
+        let buffer = "$x ~ /a|b/";
+        let cursor = buffer.len() - 1;
+        assert_eq!(&buffer[..shell_word_start(buffer, cursor)], "$x ~ ");
+        assert_eq!(after_cut_word_right(buffer, "$x ~ /a|".len()), "$x ~ /a|");
+        // Words before the regex, and after it, keep their own.
+        assert_eq!(after_cut_word_left("if $x ~ /a|b/ {"), "if $x ~ /a|b/ ");
+        // Anywhere else a slash is a path, and `|` still a pipe: with a bare
+        // `x`, `x ~ /a|b/` is a command piped into `b/`.
+        assert_eq!(after_cut_word_left("x ~ /a|b/"), "x ~ /a|");
+        assert_eq!(after_cut_word_left("ls /a|b/"), "ls /a|");
+        assert_eq!(after_cut_word_left("echo /a b/"), "echo /a ");
     }
 
     #[test]

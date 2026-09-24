@@ -2187,14 +2187,6 @@ all under "Beyond M3 — External tool integration".
       (`repl.rs`) reads words off `tokenize_partial`, but some grouping is
       decided by the parser, and the word keys do not try to guess it. Known
       gaps:
-      - A `/…/` regex literal is not recognized, so a `|`, `;`, `&` or space
-        inside one splits it like any other text: `if x ~ /a|b/` +
-        Alt-Backspace leaves `if x ~ /a|`. The parser reads a regex after
-        `~`/`!~`, in a match arm, and in the first argument of `:match`,
-        `:matches`, `:replaceall`, `:replacestart` and `:replaceend`. An
-        attempt to reconstruct those contexts in the line editor kept finding
-        new layouts (arms with guards, alternatives, `=>` on a later line,
-        escaped modifiers), so it was taken out rather than shipped partial.
       - A list or group spanning lines (`x = [a,` then `b, c]`) is not one
         word on its later lines: only a bracket opened on the cursor's line
         joins what is inside it, which is what keeps a block's lines apart.
@@ -2212,9 +2204,10 @@ all under "Beyond M3 — External tool integration".
         an unclosed string (`puts "foo $(echo` then `bar baz`) is reported
         as the capture, not the quote, so the next line is cut word by word
         though it is still inside the string.
-      The class fix is a tolerant *parse* that reports regex, group and
-      heredoc spans for a half-typed buffer, rather than reconstruction in
-      the line editor.
+      For the multi-line group, the fix is the one regex literals already
+      have: the parser reports the spans (`parser::regex_spans`, read off a
+      parse of the half-typed buffer), rather than the line editor
+      reconstructing them. The other three are the tolerant lexer's to fix.
 
 ## Beyond M3 — Navigation
 

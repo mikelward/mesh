@@ -1362,6 +1362,31 @@ pub fn tokenize_partial(source: &str) -> Vec<Token> {
         .0
 }
 
+/// Where the `/…/` regex literals of a line still being typed are, for the
+/// line editor's word motions: a `|` or a space in one is pattern, not a
+/// separator.
+///
+/// A regex is not a token -- the parser reads one where a slot asks for it --
+/// so this parses [`tokenize_partial`]'s tokens. A half-typed line usually
+/// fails to parse at its end, after the literals before it have been read;
+/// one that fails earlier reports only those read before the failure.
+pub fn regex_spans(source: &str) -> Vec<Span> {
+    let mut parser = Parser {
+        tokens: tokenize_partial(source),
+        position: 0,
+        source,
+        source_len: source.len(),
+        depth: 0,
+        regex_slot: false,
+        grouped: 0,
+        argument: false,
+        regexes: Vec::new(),
+    };
+    // Ignored: the spans read before a failure are still right.
+    let _ = parser.source(None);
+    parser.regexes.into_iter().map(|(_, span)| span).collect()
+}
+
 /// Parse a buffered input unit. An open delimiter or trailing operator returns
 /// [`ParseOutcome::Incomplete`]; malformed complete input returns an error.
 pub fn parse(source: &str) -> Result<ParseOutcome, ParseError> {
@@ -1442,6 +1467,7 @@ pub fn parse(source: &str) -> Result<ParseOutcome, ParseError> {
         regex_slot: false,
         grouped: 0,
         argument: false,
+        regexes: Vec::new(),
     };
     match parser.source(None) {
         Ok(tree) => Ok(ParseOutcome::Complete(tree)),
@@ -1572,6 +1598,7 @@ pub(crate) fn params_prefix_status(list: &str) -> PrefixStatus {
         regex_slot: false,
         grouped: 0,
         argument: false,
+        regexes: Vec::new(),
     }
     .parameters_prefix()
 }
@@ -2340,6 +2367,7 @@ pub(crate) fn capture_in_string(
         regex_slot: false,
         grouped: 0,
         argument: false,
+        regexes: Vec::new(),
     };
     Ok((Expr::Capture(parser.source(Some(TokenKind::RParen))?), end))
 }
@@ -2482,6 +2510,7 @@ fn braced_expression_in_string(
         // while `$( … )` and a bare group both took it.
         grouped: 1,
         argument: false,
+        regexes: Vec::new(),
     };
     parser.newlines();
     let expression = parser.expression()?;
@@ -3346,6 +3375,10 @@ struct Parser<'a> {
     /// nested expression is back to the ordinary rule, and put back by
     /// [`Parser::postfix`] for the operands beside it.
     argument: bool,
+    /// Each `/…/` literal read so far, with the token position it starts at,
+    /// for [`regex_spans`]. [`Parser::rewind`] drops the ones a reading it
+    /// backs out of had recorded.
+    regexes: Vec<(usize, Span)>,
 }
 
 /// How deep a nesting the parser accepts before reporting [`ParseErrorKind::TooDeep`].
@@ -3554,7 +3587,7 @@ impl Parser<'_> {
                 let value = self.expression()?;
                 return Ok(negate(Executable::EnvAssignment { key, append, value }));
             }
-            self.position = assignment_start;
+            self.rewind(assignment_start);
         }
         // Ahead of both place parsers, since a slice is not one for either of them,
         // and ahead of the value the assignment carries — refusing it here is what
@@ -3606,7 +3639,7 @@ impl Parser<'_> {
                     global: false,
                 }));
             }
-            self.position = assignment_start;
+            self.rewind(assignment_start);
         }
         // `_ = …`. The probe below cannot see it — `word_text_at` answers only for a
         // *name*, and `_` deliberately is not one — so without this it falls past
@@ -3644,7 +3677,7 @@ impl Parser<'_> {
                     value,
                 }));
             }
-            self.position = assignment_start;
+            self.rewind(assignment_start);
         }
         // Unreachable with a negation: `command_negations` gives the run back when a
         // value follows, so `negations` is zero here and `negate` is the identity.
@@ -4518,7 +4551,7 @@ impl Parser<'_> {
         // would blame the `(` instead.
         let head = self.parameter_head()?;
         if head.has_default {
-            self.position = saved;
+            self.rewind(saved);
             return Err(self.error(ParseErrorKind::ModifierSubjectDefault(head.name)));
         }
         let kind = match head.class {
@@ -4528,7 +4561,7 @@ impl Parser<'_> {
             // none of them: it is supplied by the call site's `$x:`, which cannot
             // be absent and cannot be named.
             _ => {
-                self.position = saved;
+                self.rewind(saved);
                 return Err(self.error(ParseErrorKind::ModifierSubjectDefault(head.name)));
             }
         };
@@ -4780,7 +4813,7 @@ impl Parser<'_> {
                 ElseBranch::Block(self.block()?)
             })
         } else {
-            self.position = before_else_trivia;
+            self.rewind(before_else_trivia);
             None
         };
         Ok(IfExpr {
@@ -4932,7 +4965,7 @@ impl Parser<'_> {
             }
         }
         let prefix = sound && !self.at_command_end();
-        self.position = start;
+        self.rewind(start);
         Ok(prefix)
     }
 
@@ -4948,7 +4981,7 @@ impl Parser<'_> {
         // A command has to follow, on this line. At the end of a statement the
         // run was an assignment after all, so hand the tokens back untouched.
         if self.at_command_end() {
-            self.position = start;
+            self.rewind(start);
             return Ok(Vec::new());
         }
         Ok(bindings)
@@ -5620,7 +5653,7 @@ impl Parser<'_> {
         if continues(self) {
             return true;
         }
-        self.position = newline;
+        self.rewind(newline);
         false
     }
 
@@ -5760,7 +5793,7 @@ impl Parser<'_> {
             ) && !self.value_start_in(in_condition)
         };
         if !negates {
-            self.position = start;
+            self.rewind(start);
             return 0;
         }
         negations
@@ -5776,7 +5809,7 @@ impl Parser<'_> {
                 self.peek().map(|token| &token.value),
                 Some(TokenKind::Equal | TokenKind::PlusEqual)
             );
-        self.position = start;
+        self.rewind(start);
         follows
     }
 
@@ -5824,7 +5857,7 @@ impl Parser<'_> {
                     value: self.expression()?,
                 });
             }
-            self.position = start;
+            self.rewind(start);
         }
         if self.condition_value_start() {
             return Ok(Executable::Expression {
@@ -6484,7 +6517,7 @@ impl Parser<'_> {
             self.position += 1;
         }
         if self.previous_end() != close + 1 {
-            self.position = saved;
+            self.rewind(saved);
             // The literal is well formed in the source and the tokens do not
             // cover it, which means the lexer consumed part of it without
             // emitting anything — a comment. Reported rather than declined: a
@@ -6496,6 +6529,7 @@ impl Parser<'_> {
                 span: start..close + 1,
             });
         }
+        self.regexes.push((saved, start..close + 1));
         // A `/…/` in a match slot is a pattern **value**, and a `:name` after it is
         // the ordinary postfix chain on that pattern — resolved when it runs, like
         // every other chain. Shape decides and vocabulary does not, so this no
@@ -7274,7 +7308,7 @@ impl Parser<'_> {
             Err(error) if matches!(error.kind, ParseErrorKind::KeywordFuncRef(_)) => true,
             Err(_) => false,
         };
-        self.position = saved;
+        self.rewind(saved);
         claims
     }
 
@@ -7292,7 +7326,7 @@ impl Parser<'_> {
         if self.is_one_command_word(start, self.position) {
             return false;
         }
-        self.position = start;
+        self.rewind(start);
         // Only the leading operand, which is all `outranks_a_command` reads: a bare word
         // keeps the command reading, while an integer, boolean, quoted word, variable,
         // list, group, or capture has no command spelling to keep.
@@ -7473,7 +7507,7 @@ impl Parser<'_> {
         let saved = self.position;
         self.position += 1;
         let viable = self.expression().is_ok() && self.at_command_end();
-        self.position = saved;
+        self.rewind(saved);
         viable
     }
     fn terminators(&mut self) -> usize {
@@ -7579,7 +7613,7 @@ impl Parser<'_> {
                     global: true,
                 });
             }
-            self.position = member_start;
+            self.rewind(member_start);
         }
         // `global` on its own governs an assignment; anything else is a mistake
         // worth naming, since `global f` reads like a call but cannot be one.
@@ -7878,6 +7912,12 @@ impl Parser<'_> {
     }
     fn at_end(&self) -> bool {
         self.position == self.tokens.len()
+    }
+    /// Move to token `position`, forgetting any regex literal read at or past
+    /// it: going back means the reading that found it has been abandoned.
+    fn rewind(&mut self, position: usize) {
+        self.position = position;
+        self.regexes.retain(|&(at, _)| at < position);
     }
     fn previous_end(&self) -> usize {
         self.position
@@ -8431,6 +8471,7 @@ mod tests {
                 regex_slot: false,
                 grouped: 0,
                 argument: false,
+                regexes: Vec::new(),
             };
             // The whole source, which is what the value parse would consume here.
             let end = parser.tokens.len();
@@ -9295,6 +9336,24 @@ mod tests {
                 Executable::Pipeline(_)
             ));
         }
+    }
+
+    #[test]
+    fn regex_spans_are_those_of_the_reading_that_stands() {
+        let spans = |source: &str| {
+            regex_spans(source)
+                .into_iter()
+                .map(|span| (span.start, span.end))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(spans("if $x ~ /a|b/"), [(8, 13)]);
+        // Every probe that backs out drops what it read, so a literal read
+        // on the way to the command reading is not reported, and one read
+        // again after a probe is reported once.
+        assert_eq!(spans("$x ~ /a|b/ foo"), []);
+        assert_eq!(spans("${x} ~ /a|b/"), [(7, 12)]);
+        // A failure keeps what was read before it.
+        assert_eq!(spans("$x ~ /a|b/ == y"), [(5, 10)]);
     }
 
     #[test]
