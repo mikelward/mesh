@@ -2183,21 +2183,24 @@ all under "Beyond M3 — External tool integration".
       `reedline` specifically to keep it (and its default-on `helix`
       feature) out of the build until there's a reason to want it.
 
-- [ ] **Word cuts in layouts only the parser knows.** `shell_words`
-      (`repl.rs`) reads words off `tokenize_partial`, but some grouping is
-      decided by the parser, and the word keys do not try to guess it. Known
-      gaps:
-      - Malformed but closed input: a bad escape and a bad `${…}` are read
-        as text, but other errors still run the word to the end of its line,
-        e.g. a capture in a string that does not parse, `"$(x =)" next`.
-        Recovering at the construct's own closer would keep `next` apart.
-      - Only an unclosed quote runs past its line. An unclosed `$(` inside
-        an unclosed string (`puts "foo $(echo` then `bar baz`) is reported
-        as the capture, not the quote, so the next line is cut word by word
-        though it is still inside the string.
-      Both are the tolerant lexer's to fix; what only the parser knows
-      (regex literals, brackets holding values) already comes from
-      `parser::word_layout`.
+- [ ] **Word cuts in malformed `$(…)` and `${…}` bodies.** The tolerant
+      lexer finds where a body that does not parse ends by lexing it, and
+      only the grammar knows some of what decides that, so a few malformed
+      bodies end early:
+      - `Lexer::lex` counts parentheses (and, for `${…}`, braces) without
+        telling them apart, so a stray closer of another kind ends a body:
+        in `puts ${ { ) } tail }` the `)` cancels the inner `{`, and in
+        `puts ${ [ } ] tail }` the `}` inside the list ends it.
+      - A `)` in a regex literal is text only to the parser, so in a
+        capture that does not parse, `"$(if $x ~ /a)b/ echo "t u" })"`,
+        it closes the capture, and the quote after it is taken for the
+        string's.
+      Only malformed input is affected -- the word cuts split it, and the
+      strict parse errors either way. Tracking bracket kinds in the lexer
+      was tried and taken out: a `[` or `{` can be a command's argument
+      (`$(echo [)`, `${func() { echo [ }}`), so a lexer-level rule rejected
+      valid input. The fix is recovery that knows the grammar, not a
+      smarter bracket count.
 
 ## Beyond M3 — Navigation
 

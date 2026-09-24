@@ -19513,6 +19513,74 @@ mod tests {
     }
 
     #[test]
+    fn word_cuts_read_a_capture_in_a_string_by_where_it_ends() {
+        // A capture that closes but does not parse is text: the string goes
+        // on after it, and the word after the string is its own.
+        assert_eq!(
+            after_cut_word_left("puts \"$(x =)\" next"),
+            "puts \"$(x =)\" "
+        );
+        assert_eq!(
+            after_cut_word_right("puts \"$(x =)\" next", 5),
+            "puts  next"
+        );
+        assert_eq!(after_cut_word_left("puts \"a $(x =) b\""), "puts ");
+        // Nothing else in a string ends it short of its quote either, so a
+        // bad `${…}` in one, even inside a capture, cannot hide a closer.
+        assert_eq!(
+            after_cut_word_left("puts \"${x y}\" next"),
+            "puts \"${x y}\" "
+        );
+        assert_eq!(
+            after_cut_word_left("puts \"$(echo \"${x y}\")\" next"),
+            "puts \"$(echo \"${x y}\")\" "
+        );
+        assert_eq!(
+            after_cut_word_left("puts \"a ${x\" next"),
+            "puts \"a ${x\" "
+        );
+        // Its `}` is found the way a capture's `)` is, so a quote in it is
+        // not the string's.
+        assert_eq!(
+            after_cut_word_left("puts \"${x = \"inner text\"} tail\""),
+            "puts "
+        );
+        // A bare one too, even inside a capture in a string, so a quoted `}`
+        // in it closes nothing.
+        assert_eq!(
+            after_cut_word_left("puts ${x \"}\"} next"),
+            "puts ${x \"}\"} "
+        );
+        let buffer = "puts \"$(echo ${x \"}\"} )\" next\nputs later words";
+        assert_eq!(
+            after_cut_word_left(buffer),
+            &buffer[..buffer.len() - "words".len()]
+        );
+        // A `[` can be a command's argument, in a capture or in a block in
+        // a `${…}`, so it does not hold either open.
+        assert_eq!(
+            after_cut_word_left("puts \"$(echo [)\" next"),
+            "puts \"$(echo [)\" "
+        );
+        assert_eq!(
+            after_cut_word_left("puts \"${func() { echo [ }}\" next"),
+            "puts \"${func() { echo [ }}\" "
+        );
+        for source in ["puts \"$(echo [)\"", "puts \"${func() { echo [ }}\""] {
+            assert!(
+                matches!(parser::parse(source), Ok(parser::ParseOutcome::Complete(_))),
+                "{source:?}"
+            );
+        }
+        // One that never closes leaves the string unclosed, so its later
+        // lines are still inside it.
+        assert_eq!(
+            after_cut_word_left("puts \"foo $(echo\nbar baz"),
+            "puts \"foo $(echo\n"
+        );
+    }
+
+    #[test]
     fn ctrl_backspace_takes_an_unclosed_quote_or_bracket_whole() {
         // The string still being typed is one word, spaces and all.
         assert_eq!(after_cut_word_left("echo \"foo bar"), "echo ");

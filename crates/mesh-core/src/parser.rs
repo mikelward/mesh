@@ -1347,13 +1347,15 @@ pub fn tokenize(source: &str) -> Result<Vec<Token>, ParseError> {
 
 /// The tokens of a line still being typed, for the line editor's word motions.
 ///
-/// Never fails. A bad escape in a string is text. Any other word that would not
-/// lex is unfinished and becomes one word token: an unclosed quote runs to the
-/// end of `source`, and anything else -- a capture in a string that does not
-/// parse yet, say -- to the end of its line. An unclosed bracket just leaves its
-/// closer missing. A heredoc whose terminator has not been typed yet has a
-/// body to the end of `source`. A comment's text comes back as word tokens,
-/// one per whitespace-separated chunk.
+/// Never fails. Nothing in a string ends it short of its closing quote: a bad
+/// escape or a `$` interpolation that would not lex is text, and a capture
+/// that does not parse is lexed to its `)`. A capture that never closes leaves
+/// the string unclosed. Any other word that would not lex is unfinished and becomes
+/// one word token: an unclosed quote runs to the end of `source`, and anything
+/// else -- a bad `${` with no `}`, say -- to the end of its line. An unclosed
+/// bracket just leaves its closer missing. A heredoc whose terminator has not
+/// been typed yet has a body to the end of `source`. A comment's text comes
+/// back as word tokens, one per whitespace-separated chunk.
 pub fn tokenize_partial(source: &str) -> Vec<Token> {
     let mut lexer = Lexer::new(source);
     lexer.tolerant = true;
@@ -2026,11 +2028,45 @@ impl<'a> Lexer<'a> {
                         // piece rather than text, so its output crosses whole:
                         // quoted, so never split and never globbed.
                         if self.source[self.position..].starts_with("$(") {
-                            let (expression, end) = capture_in_string(
+                            let (expression, end) = match capture_in_string(
                                 self.source,
                                 self.position,
                                 self.capture_depth + 1,
-                            )?;
+                            ) {
+                                Ok(capture) => capture,
+                                // Tolerant: one that does not parse yet is
+                                // still a capture, found by lexing to its `)`,
+                                // and the string goes on after it. It stays a
+                                // value, not text, so the parse of the line
+                                // around it reads it as a capture. One that
+                                // never closes leaves the string unclosed.
+                                Err(_) if self.tolerant => {
+                                    let depth = self.capture_depth + 1;
+                                    let body = (depth <= MAX_DEPTH)
+                                        .then(|| {
+                                            Lexer {
+                                                source: self.source,
+                                                position: self.position + 2,
+                                                capture_depth: depth,
+                                                dangling_continuation: false,
+                                                tolerant: true,
+                                            }
+                                            .capture_body()
+                                            .ok()
+                                        })
+                                        .flatten();
+                                    let Some((_, end)) = body else {
+                                        self.position = self.source.len();
+                                        break;
+                                    };
+                                    let empty = Source {
+                                        statements: Vec::new(),
+                                        span: self.position + 2..end - 1,
+                                    };
+                                    (Expr::Capture(empty), end)
+                                }
+                                Err(error) => return Err(error),
+                            };
                             pieces.push(WordPiece::Value {
                                 expression: Box::new(Spanned {
                                     value: expression,
@@ -2048,11 +2084,21 @@ impl<'a> Lexer<'a> {
                         // modifier takes arguments comes here too, still meaning
                         // the binding its head names.
                         if braced_is_access(self.source, self.position) == Some(false) {
-                            let (expression, end) = braced_expression_in_string(
+                            let braced = braced_expression_in_string(
                                 self.source,
                                 self.position,
                                 self.capture_depth + 1,
-                            )?;
+                            );
+                            let (expression, end) = match braced {
+                                Ok(braced) => braced,
+                                Err(_) if self.tolerant => {
+                                    let end = self.interpolation_as_text();
+                                    push_text(&mut pieces, &self.source[self.position..end], mode);
+                                    self.position = end;
+                                    continue;
+                                }
+                                Err(error) => return Err(error),
+                            };
                             // An access whose modifier took arguments is still
                             // the *reference* reading, so its sigil-less head
                             // names the binding rather than the word.
@@ -2071,7 +2117,16 @@ impl<'a> Lexer<'a> {
                             self.position = end;
                             continue;
                         }
-                        let end = variable_end(self.source, self.position)?;
+                        let end = match variable_end(self.source, self.position) {
+                            Ok(end) => end,
+                            Err(_) if self.tolerant => {
+                                let end = self.interpolation_as_text();
+                                push_text(&mut pieces, &self.source[self.position..end], mode);
+                                self.position = end;
+                                continue;
+                            }
+                            Err(error) => return Err(error),
+                        };
                         if end == self.position + 1 {
                             push_text(&mut pieces, "$", QuoteMode::Double);
                         } else {
@@ -2102,17 +2157,18 @@ impl<'a> Lexer<'a> {
                 let end = match variable_end(self.source, self.position) {
                     Ok(end) => end,
                     // Tolerant: a closed `${…}` that is not a valid access is
-                    // text, so the word still ends where it would have.
+                    // text, so the word still ends where it would have. Its
+                    // `}` is found as one in a string is, so a quoted `}` in
+                    // it is not the closer; one on a later line is not either.
                     Err(error)
                         if self.tolerant && self.source[self.position..].starts_with("${") =>
                     {
-                        let line = self.source[self.position..]
-                            .find('\n')
-                            .map_or(self.source.len(), |newline| self.position + newline);
-                        let Some(close) = self.source[self.position..line].find('}') else {
+                        let end = self.interpolation_as_text();
+                        if end == self.position + 1
+                            || self.source[self.position..end].contains('\n')
+                        {
                             return Err(error);
-                        };
-                        let end = self.position + close + 1;
+                        }
                         push_text(
                             &mut pieces,
                             &self.source[self.position..end],
@@ -2235,6 +2291,30 @@ impl<'a> Lexer<'a> {
         }
         self.position = scan;
         Ok(())
+    }
+
+    /// Tolerant: where a `$` interpolation that would not lex ends, read as text
+    /// instead, bare or in a string. A `${` runs to the `}` that closes it,
+    /// found by a tolerant lex of its body as a capture's `)` is, so quotes and
+    /// nesting in it count; one with no closer is the `$` alone. Either way the
+    /// string goes on to its own closing quote, so nothing in it can hide the
+    /// closer of a capture it sits in.
+    fn interpolation_as_text(&self) -> usize {
+        let depth = self.capture_depth + 1;
+        let braced = (self.source[self.position..].starts_with("${") && depth <= MAX_DEPTH)
+            .then(|| {
+                Lexer {
+                    source: self.source,
+                    position: self.position + 2,
+                    capture_depth: depth,
+                    dangling_continuation: false,
+                    tolerant: true,
+                }
+                .braced_body()
+                .ok()
+            })
+            .flatten();
+        braced.map_or(self.position + 1, |(_, end)| end)
     }
 
     fn char_at(&self, byte: usize) -> Option<char> {
@@ -9405,6 +9485,13 @@ mod tests {
         assert_eq!(regexes("${x} ~ /a|b/"), [(7, 12)]);
         // A failure keeps what was read before it.
         assert_eq!(regexes("$x ~ /a|b/ == y"), [(5, 10)]);
+        // A capture in a string stays a capture, parsed or not, so a computed
+        // alias name does not stop the parse short of what follows it.
+        for alias in ["alias \"$(puts foo)\" = echo", "alias \"$(x =)\" = echo"] {
+            let source = format!("{alias}\nif $x ~ /a|b/ {{ puts yes }}");
+            let start = source.find("/a").unwrap();
+            assert_eq!(regexes(&source), [(start, start + 5)], "{source:?}");
+        }
         // Brackets holding values, and not those holding statements or
         // arguments to a command.
         let brackets = |source: &str| word_layout(source).brackets;
@@ -9426,6 +9513,8 @@ mod tests {
         assert_eq!(spans("echo \"a b"), [0..4, 5..9]);
         assert_eq!(spans("echo \"\\q\" x"), [0..4, 5..9, 10..11]);
         assert_eq!(spans("echo \"$(ls |\" x"), [0..4, 5..15]);
+        // A closed capture in a string is text, whether or not it parses.
+        assert_eq!(spans("echo \"$(x =)\" y"), [0..4, 5..13, 14..15]);
         // An unclosed bracket just leaves its closer missing.
         assert_eq!(spans("echo $(ls"), [0..4, 5..7, 7..9]);
         // A comment's text is words, and a closer in it closes nothing.
