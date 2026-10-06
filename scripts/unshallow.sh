@@ -11,7 +11,36 @@
 # afterwards is the real one.
 set -eu
 
-if [ "$(git rev-parse --is-shallow-repository 2>/dev/null || echo false)" != "true" ]; then
+# Print the repository's shallow flag ("true"/"false"), or report the failure
+# and return non-zero if git cannot be asked -- a missing git, the wrong
+# directory, or a corrupt repo must not be reported as a complete (or a
+# deepened) history, since callers run this as a precondition before trusting
+# commit counts and blame. One helper for both the initial and the post-fetch
+# probe so neither can mask an inspection failure. The session-start hook runs
+# this best-effort (`... || true`), so a non-zero exit there is swallowed and
+# never blocks startup.
+#
+# The flag is stdout alone: a diagnostic git prints on success (GIT_TRACE, a
+# config warning) must not turn "true" into something the caller reads as
+# "not shallow". git's stderr goes straight through to ours, so its own
+# account of a failure still reaches the reader. Anything but true/false is
+# an inspection failure too.
+report_shallow() {
+  if ! _flag=$(git rev-parse --is-shallow-repository); then
+    echo "unshallow: cannot inspect the repository (git's error is above)" >&2
+    return 1
+  fi
+  case "$_flag" in
+    true | false) printf '%s\n' "$_flag" ;;
+    *)
+      echo "unshallow: cannot inspect the repository: unexpected shallow flag '$_flag'" >&2
+      return 1
+      ;;
+  esac
+}
+
+is_shallow=$(report_shallow) || exit 1
+if test "$is_shallow" != "true"; then
   echo "unshallow: already complete"
   exit 0
 fi
@@ -24,8 +53,8 @@ fi
 # missing the fetch is simply tried again, which is the behavior without
 # the stamp, not a hang.
 stamp="$(git rev-parse --git-dir)/unshallow-failed"
-if [ -f "$stamp" ] && command -v find >/dev/null 2>&1 \
-  && [ -n "$(find "$stamp" -mmin -30 2>/dev/null)" ]; then
+if test -f "$stamp" && command -v find >/dev/null 2>&1 \
+  && test -n "$(find "$stamp" -mmin -30 2>/dev/null)"; then
   echo "unshallow: skipped — a fetch failed within the last 30 minutes; remove $stamp to retry now" >&2
   exit 0
 fi
@@ -96,7 +125,15 @@ trap 'rm -f "$tmp" 2>/dev/null || true' EXIT
 # truncate the file and keep its mode. Builtins only, as everywhere in this
 # script.
 ( umask 077; : > "$tmp" )
+# A non-positive or non-numeric deadline would disable the bound entirely
+# (perl `alarm 0` cancels the alarm; GNU `timeout 0` means "no timeout"),
+# letting a stalled fetch hang the session -- the opposite of best-effort. Fall
+# back to the default for anything that is not a positive integer.
 deadline="${UNSHALLOW_TIMEOUT:-120}"
+case "$deadline" in
+  '' | *[!0-9]*) deadline=120 ;;
+esac
+test "$deadline" -ge 1 2>/dev/null || deadline=120
 # `main` by explicit refspec. A bare fetch follows the clone's configured
 # refspec, and a single-branch clone of a feature branch configures only that
 # branch — so `origin/main`, which a count of main's history reads, would
@@ -141,7 +178,7 @@ fi
 # Builtins only, and an `if` rather than an `&&` list: `sed` is not reachable
 # on a PATH narrow enough to have hidden `timeout`, and under `set -e` a
 # failed `[ -s ]` would end the script on the ordinary quiet-success path.
-if [ -s "$tmp" ]; then
+if test -s "$tmp"; then
   while IFS= read -r line; do
     echo "unshallow: $line" >&2
   done < "$tmp"
@@ -149,11 +186,12 @@ fi
 # Not silent: the outcome check below reports the *state*, which is what
 # matters, but a reader debugging a slow start needs to know the fetch was
 # tried and how it ended. 124 is `timeout`'s "deadline hit".
-if [ "$status" -ne 0 ]; then
+if test "$status" -ne 0; then
   echo "unshallow: fetch did not complete (exit $status)" >&2
 fi
 
-if [ "$(git rev-parse --is-shallow-repository 2>/dev/null || echo false)" = "true" ]; then
+is_shallow=$(report_shallow) || exit 1
+if test "$is_shallow" = "true"; then
   echo "unshallow: WARNING still shallow — commit counts and blame will be wrong" >&2
   # A write, not just a create, so a repeat failure moves the mtime on.
   echo "$$" > "$stamp" 2>/dev/null || echo "unshallow: could not record the failure, so the next hook run retries" >&2
@@ -163,4 +201,11 @@ fi
 # a stale stamp only delays a retry, and a complete clone never needs one.
 rm -f "$stamp" 2>/dev/null || true
 
-echo "unshallow: deepened to $(git rev-list --count HEAD) commits"
+# The deepening succeeded; the count is cosmetic, so a rev-list that somehow
+# fails here is reported rather than printed as "deepened to  commits". Stdout
+# alone, for the same reason as the shallow flag; git's stderr passes through.
+if ! count=$(git rev-list --count HEAD); then
+  echo "unshallow: deepened, but could not count commits (git's error is above)" >&2
+  exit 0
+fi
+echo "unshallow: deepened to $count commits"
