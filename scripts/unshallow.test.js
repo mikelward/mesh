@@ -398,6 +398,50 @@ describe('unshallow', () => {
     expect(result.stderr).toMatch(/rev-list exploded[\s\S]*deepened, but could not count commits/);
   });
 
+  it('does not call a fetch that deepened but could not write origin/main a success', () => {
+    // A stale origin/main/<x> ref blocks the refspec's destination: git
+    // removes the shallow boundary, exits non-zero, and leaves origin/main
+    // missing -- which is what a count of main's history reads.
+    const { origin, root } = fixture({ commits: 3, depth: 1 });
+    git(origin, 'checkout', '--quiet', '-b', 'feature');
+    const clone = join(root, 'feature-clone');
+    execFileSync('git', ['clone', '--quiet', '--depth', '1', '--single-branch', '--branch', 'feature', `file://${origin}`, clone]);
+    git(clone, 'update-ref', 'refs/remotes/origin/main/stale', 'HEAD');
+
+    const result = spawnSync('sh', [SCRIPT], { cwd: clone, encoding: 'utf8' });
+
+    expect(result.status).toBe(0);
+    expect(isShallow(clone)).toBe(false);
+    expect(result.stdout).not.toMatch(/deepened to/);
+    expect(result.stderr).toMatch(/history is complete, but the fetch failed/);
+  });
+
+  it('treats a fetch killed by a signal as failed, not as a success', () => {
+    // perl's `$? >> 8` is 0 for a signaled child. The stub deepens for real,
+    // then dies on TERM before returning, as an OOM kill or a cancel might.
+    if (!PERL) return;
+    const { clone, root } = fixture({ commits: 3, depth: 1 });
+    const bin = join(root, 'bin');
+    execFileSync('mkdir', ['-p', bin]);
+    writeFileSync(
+      join(bin, 'git'),
+      '#!/bin/sh\n'
+      + 'for a in "$@"; do [ "$a" = fetch ] && { "$REAL_GIT" "$@"; kill -TERM $$; }; done\n'
+      + 'exec "$REAL_GIT" "$@"\n',
+      { mode: 0o755 },
+    );
+    const result = spawnSync('sh', [SCRIPT], {
+      cwd: clone,
+      encoding: 'utf8',
+      env: { ...process.env, PATH: `${bin}:${process.env.PATH}`, REAL_GIT: which('git') },
+    });
+
+    expect(result.status).toBe(0);
+    expect(isShallow(clone)).toBe(false);
+    expect(result.stderr).toMatch(/fetch did not complete \(exit 143\)/);
+    expect(result.stdout).not.toMatch(/deepened to/);
+  });
+
   it('fails loudly outside a repository rather than calling it complete', () => {
     // A shallow flag git could not report is not a complete history; callers
     // trust the result before counting commits.

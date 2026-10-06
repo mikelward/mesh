@@ -159,7 +159,11 @@ if command -v perl >/dev/null 2>&1; then
     $SIG{ALRM} = sub { kill "TERM", -$pid; sleep 5; kill "KILL", -$pid; exit 124 };
     alarm $limit;
     waitpid($pid, 0);
-    exit($? >> 8);
+    # A signaled child has its signal in the low bits and zero above them,
+    # so `$? >> 8` alone would turn a killed fetch into a success. 128+N is
+    # the shell convention, and a non-zero status is what reaches the
+    # fetch-failure report below.
+    exit($? & 127 ? 128 + ($? & 127) : $? >> 8);
   ' "$deadline" git fetch --unshallow --quiet origin "$refspec" >"$tmp" 2>&1 || status=$?
 elif command -v timeout >/dev/null 2>&1; then
   # Fallback for a host with coreutils but no perl. `-k 5` escalates to KILL
@@ -200,6 +204,16 @@ fi
 # Deepened, so nothing is left to retry. `rm` may be missing on a narrow PATH;
 # a stale stamp only delays a retry, and a complete clone never needs one.
 rm -f "$stamp" 2>/dev/null || true
+
+# Complete is not the same as succeeded. The fetch can bring in the whole
+# history and still fail to write origin/main -- a stale origin/main/<x> ref
+# blocks it, and git says so above -- and origin/main is what a count of
+# main's history reads. Report it rather than "deepened"; no later run can
+# repair a ref conflict on its own, so the warning names what to look at.
+if test "$status" -ne 0; then
+  echo "unshallow: WARNING history is complete, but the fetch failed, so origin/main may be missing or stale — see git's error above" >&2
+  exit 0
+fi
 
 # The deepening succeeded; the count is cosmetic, so a rev-list that somehow
 # fails here is reported rather than printed as "deepened to  commits". Stdout
