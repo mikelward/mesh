@@ -1,6 +1,6 @@
 // @vitest-environment node
 import { execFileSync } from 'node:child_process';
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from './vitest-shim.mjs';
@@ -302,6 +302,40 @@ describe('unshallow', () => {
     execFileSync('sh', [SCRIPT], { cwd: clone, encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'], env });
 
     expect(readFileSync(seen, 'utf8').trim()).toBe('600');
+  });
+
+  it('waits out a failed fetch rather than paying the deadline on every hook run', () => {
+    // SessionStart fires on resume, clear and compaction too, so without a
+    // memory of the failure an unreachable origin costs the full deadline
+    // each time. The second run must not attempt the fetch at all.
+    const { clone, bin, tried } = hangingGit({ commits: 3 });
+    const path = `${bin}:${process.env.PATH}`;
+
+    runWith(clone, path);
+    expect(existsSync(tried)).toBe(true);
+    expect(existsSync(join(clone, '.git', 'unshallow-failed'))).toBe(true);
+
+    rmSync(tried);
+    const started = Date.now();
+    runWith(clone, path);
+
+    expect(Date.now() - started).toBeLessThan(5_000);
+    expect(existsSync(tried)).toBe(false);
+    expect(isShallow(clone)).toBe(true);
+  }, 25_000);
+
+  it('clears the failure stamp once a later fetch deepens the clone', () => {
+    const { clone } = fixture({ commits: 4, depth: 1 });
+    const stamp = join(clone, '.git', 'unshallow-failed');
+    // An hour old, so outside the window: the fetch runs and succeeds.
+    writeFileSync(stamp, '1\n');
+    // Node's own API, not `touch -d @1`: that epoch form is GNU-only.
+    utimesSync(stamp, 1, 1);
+
+    run(clone);
+
+    expect(isShallow(clone)).toBe(false);
+    expect(existsSync(stamp)).toBe(false);
   });
 
   it('warns and exits 0 when the remote is gone, rather than failing the session', () => {
