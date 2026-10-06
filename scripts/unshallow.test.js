@@ -1,5 +1,5 @@
 // @vitest-environment node
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawnSync } from 'node:child_process';
 import { existsSync, mkdtempSync, readFileSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -336,6 +336,81 @@ describe('unshallow', () => {
 
     expect(isShallow(clone)).toBe(false);
     expect(existsSync(stamp)).toBe(false);
+  });
+
+  it('reads the shallow flag from stdout alone, so a trace on stderr cannot hide it', () => {
+    // GIT_TRACE writes to stderr on a successful rev-parse. Folded into the
+    // flag, "true" stops matching and a shallow clone reads as complete.
+    const { clone } = fixture({ commits: 3, depth: 1 });
+
+    const out = execFileSync('sh', [SCRIPT], {
+      cwd: clone, encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'], env: { ...process.env, GIT_TRACE: '1' },
+    });
+
+    expect(out).toMatch(/deepened to 3 commits/);
+    expect(isShallow(clone)).toBe(false);
+  });
+
+  for (const bad of ['0', 'abc']) {
+    it(`keeps the fetch bounded when UNSHALLOW_TIMEOUT is ${JSON.stringify(bad)}`, () => {
+      // perl `alarm 0` and GNU `timeout 0` both mean "no deadline", so an
+      // invalid value must fall back to the default rather than reach them.
+      // The stub perl records the deadline it was handed and runs nothing.
+      const { clone, root } = fixture({ commits: 3, depth: 1 });
+      const bin = join(root, 'bin');
+      const seen = join(root, 'seen');
+      execFileSync('mkdir', ['-p', bin]);
+      writeFileSync(join(bin, 'perl'), `#!/bin/sh\necho "$3" > ${seen}\nexit 1\n`, { mode: 0o755 });
+
+      execFileSync('sh', [SCRIPT], {
+        cwd: clone,
+        encoding: 'utf8',
+        stdio: ['pipe', 'pipe', 'pipe'],
+        env: { ...process.env, PATH: `${bin}:${process.env.PATH}`, UNSHALLOW_TIMEOUT: bad },
+      });
+
+      expect(readFileSync(seen, 'utf8').trim()).toBe('120');
+    });
+  }
+
+  it('reports a failed commit count rather than printing a blank one', () => {
+    // The deepen worked, so the session is fine; the count is cosmetic and
+    // must not come out as "deepened to  commits".
+    const { clone, root } = fixture({ commits: 3, depth: 1 });
+    const bin = join(root, 'bin');
+    execFileSync('mkdir', ['-p', bin]);
+    writeFileSync(
+      join(bin, 'git'),
+      '#!/bin/sh\n'
+      + '[ "$1" = rev-list ] && { echo "rev-list exploded" >&2; exit 1; }\n'
+      + 'exec "$REAL_GIT" "$@"\n',
+      { mode: 0o755 },
+    );
+    const result = spawnSync('sh', [SCRIPT], {
+      cwd: clone,
+      encoding: 'utf8',
+      env: { ...process.env, PATH: `${bin}:${process.env.PATH}`, REAL_GIT: which('git') },
+    });
+
+    expect(result.status).toBe(0);
+    expect(isShallow(clone)).toBe(false);
+    expect(result.stdout).not.toMatch(/deepened to/);
+    expect(result.stderr).toMatch(/rev-list exploded[\s\S]*deepened, but could not count commits/);
+  });
+
+  it('fails loudly outside a repository rather than calling it complete', () => {
+    // A shallow flag git could not report is not a complete history; callers
+    // trust the result before counting commits.
+    const dir = mkdtempSync(join(tmpdir(), 'unshallow-norepo-'));
+    roots.push(dir);
+    let error;
+    try {
+      execFileSync('sh', [SCRIPT], { cwd: dir, encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'], env: { ...process.env, GIT_CEILING_DIRECTORIES: tmpdir() } });
+    } catch (e) {
+      error = e;
+    }
+    expect(error?.status).toBe(1);
+    expect(error?.stderr).toMatch(/cannot inspect the repository/);
   });
 
   it('warns and exits 0 when the remote is gone, rather than failing the session', () => {
