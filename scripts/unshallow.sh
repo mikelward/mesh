@@ -16,6 +16,20 @@ if [ "$(git rev-parse --is-shallow-repository 2>/dev/null || echo false)" != "tr
   exit 0
 fi
 
+# Once per failure window, not once per hook run. SessionStart also fires on
+# resume, clear and compaction, so an origin this session cannot reach would
+# otherwise cost the full deadline again on every one of them. A failed
+# attempt leaves a stamp; for the next 30 minutes the script says so and
+# returns at once. `find -mmin` is what reads the age, and where `find` is
+# missing the fetch is simply tried again, which is the behavior without
+# the stamp, not a hang.
+stamp="$(git rev-parse --git-dir)/unshallow-failed"
+if [ -f "$stamp" ] && command -v find >/dev/null 2>&1 \
+  && [ -n "$(find "$stamp" -mmin -30 2>/dev/null)" ]; then
+  echo "unshallow: skipped — a fetch failed within the last 30 minutes; remove $stamp to retry now" >&2
+  exit 0
+fi
+
 # Best-effort has to mean *bounded*. This runs at session start, so a fetch
 # that waits on an unreachable remote — or sits at a credential or host-key
 # prompt with no terminal to answer it — delays or blocks the whole session,
@@ -141,7 +155,12 @@ fi
 
 if [ "$(git rev-parse --is-shallow-repository 2>/dev/null || echo false)" = "true" ]; then
   echo "unshallow: WARNING still shallow — commit counts and blame will be wrong" >&2
+  # A write, not just a create, so a repeat failure moves the mtime on.
+  echo "$$" > "$stamp" 2>/dev/null || echo "unshallow: could not record the failure, so the next hook run retries" >&2
   exit 0
 fi
+# Deepened, so nothing is left to retry. `rm` may be missing on a narrow PATH;
+# a stale stamp only delays a retry, and a complete clone never needs one.
+rm -f "$stamp" 2>/dev/null || true
 
 echo "unshallow: deepened to $(git rev-list --count HEAD) commits"
