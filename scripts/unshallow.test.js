@@ -109,6 +109,27 @@ describe('unshallow', () => {
     expect(out).toMatch(/deepened to 4 commits/);
   });
 
+  it('fetches main too, from a single-branch clone of another branch', () => {
+    // A bare `git fetch` follows the configured refspec, which a single-branch
+    // clone narrows to its own branch: HEAD would deepen and `origin/main`
+    // would stay missing, so anything counting main's history reads nothing.
+    const { origin, root } = fixture({ commits: 2, depth: 1 });
+    git(origin, 'checkout', '--quiet', '-b', 'feature');
+    git(origin, 'commit', '--quiet', '--allow-empty', '-m', 'feature 0');
+    git(origin, 'commit', '--quiet', '--allow-empty', '-m', 'feature 1');
+    git(origin, 'checkout', '--quiet', 'main');
+    git(origin, 'commit', '--quiet', '--allow-empty', '-m', 'main 2');
+    const clone = join(root, 'feature-clone');
+    execFileSync('git', ['clone', '--quiet', '--depth', '1', '--single-branch', '--branch', 'feature', `file://${origin}`, clone]);
+    expect(git(clone, 'for-each-ref', 'refs/remotes/origin/main')).toBe('');
+
+    run(clone);
+
+    expect(isShallow(clone)).toBe(false);
+    expect(git(clone, 'rev-list', '--count', 'HEAD')).toBe('4');
+    expect(git(clone, 'rev-list', '--count', 'origin/main')).toBe('3');
+  });
+
   it('is a no-op on a complete clone', () => {
     const { origin } = fixture();
     expect(run(origin)).toMatch(/already complete/);

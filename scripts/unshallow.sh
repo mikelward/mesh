@@ -83,6 +83,12 @@ trap 'rm -f "$tmp" 2>/dev/null || true' EXIT
 # script.
 ( umask 077; : > "$tmp" )
 deadline="${UNSHALLOW_TIMEOUT:-120}"
+# `main` by explicit refspec. A bare fetch follows the clone's configured
+# refspec, and a single-branch clone of a feature branch configures only that
+# branch — so `origin/main`, which a count of main's history reads, would
+# stay missing or stale. Unshallowing through `main` completes the whole
+# repository, HEAD's history included.
+refspec=+refs/heads/main:refs/remotes/origin/main
 status=0
 if command -v perl >/dev/null 2>&1; then
   # Perl first even where coreutils exists, because it is the only branch
@@ -103,16 +109,16 @@ if command -v perl >/dev/null 2>&1; then
     alarm $limit;
     waitpid($pid, 0);
     exit($? >> 8);
-  ' "$deadline" git fetch --unshallow --quiet >"$tmp" 2>&1 || status=$?
+  ' "$deadline" git fetch --unshallow --quiet origin "$refspec" >"$tmp" 2>&1 || status=$?
 elif command -v timeout >/dev/null 2>&1; then
   # Fallback for a host with coreutils but no perl. `-k 5` escalates to KILL
   # for a direct child that ignores TERM (short form: BusyBox rejects the
   # long one). A transport grandchild that outlives git is an accepted
   # residual here — it holds only the log file, never the session — on a
   # host shape that is already unusual.
-  timeout -k 5 "$deadline" git fetch --unshallow --quiet >"$tmp" 2>&1 || status=$?
+  timeout -k 5 "$deadline" git fetch --unshallow --quiet origin "$refspec" >"$tmp" 2>&1 || status=$?
 elif command -v gtimeout >/dev/null 2>&1; then
-  gtimeout -k 5 "$deadline" git fetch --unshallow --quiet >"$tmp" 2>&1 || status=$?
+  gtimeout -k 5 "$deadline" git fetch --unshallow --quiet origin "$refspec" >"$tmp" 2>&1 || status=$?
 else
   echo "unshallow: nothing here can bound the fetch, so skipping it rather than risk hanging the session" >&2
   status=127
