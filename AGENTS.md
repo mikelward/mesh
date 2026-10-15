@@ -43,13 +43,13 @@ has stopped biting.
   `threadId`. A comment's `PRRC_*` node ID fails; they're different objects.
   Order of operations: push the fix commit first, then reply citing the new
   sha, then resolve.
-- **Report each review in chat, and what it said.** Name the commit it read and
-  the finding count — say so when that commit is no longer the head — then one
-  bullet per finding: review
-  comment, top-level comment or review body alike, most blocking first — what
-  it claims, where, and what you did about it, or the options where it's the
-  maintainer's call. Summarize them all in that one reply, ahead of *keep
-  replies short*; ask only the most blocking question.
+- **Report each review in the next message you send, and what it said.** Name
+  the commit it read and the finding count — say so when that commit is no
+  longer the head — then one bullet per finding: review comment, top-level
+  comment or review body alike, most blocking first — what it claims, where,
+  and what you did about it, or the options where it's the maintainer's call.
+  Summarize them all in that one reply, ahead of *keep replies short*; ask only
+  the most blocking question.
 - **Read the Codex verdict, don't infer it.** It reacts to the PR body
   (`issue_read` → `reactions`), not to a review thread, whose `Useful?` bar
   reads true on any PR it has commented on. `eyes` means reading, `+1` means
@@ -448,15 +448,14 @@ reply, no offer to correct it. It is not a finding.
   addressed in your very next output, before any further tool call, even if
   it's one sentence. A merge cue is the exception — its hygiene runs first,
   and announcing the switch is that answer.
-- **Don't narrate routine machinery.** A check run flipping, a re-run, a scheduled check
-  re-arming, a webhook echo, a resolved thread — act on those silently; the noise buries
-  the one line that matters. Reports another rule requires stand (each review and its
-  findings, a CI timing regression).
-- **Don't report your own caught-and-fixed mistakes.** A wrong turn you noticed
-  and corrected before it reached anything is not news — no "one thing worth
-  flagging", no narration of the recovery. Say it only when it left something
-  the user has to act on: work actually lost, a bad push someone may have
-  pulled, a decision they would make differently knowing it.
+- **Message only when the user needs to see it** (maintainer, 2026-10-15): each one
+  notifies their phone. Work and listen in silence; speak up for a question or blocker,
+  something to merge or act on, a merge, an autopilot decision (to review when seen,
+  never waited on), or a change from the plan or their instructions, a review-prompted
+  one included. Never for progress (a client's nudge doesn't count), a review or a push
+  alone (its report rides the next message), routine machinery, or a mistake caught and
+  fixed before it reached the repo. The session-start `AGENTS.md` line still opens every
+  session.
 - **Keep replies short — don't dump a full page.** Lead with the single most
   important point and stop. If there's more, say the first point and ask whether
   they're ready for the next one rather than emptying everything at once.
