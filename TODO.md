@@ -392,6 +392,13 @@ Delete an entry once you have agreed with it or reversed it.
 
 ## Build and toolchain
 
+- [ ] **Nothing fails CI when `AGENTS.md` outgrows Antigravity's 24 KB cap**
+      (mikelward/stopdash#932). Antigravity silently truncates rule files past
+      24,000 bytes, so a rule appended at the tail stops reaching that client
+      with no error anywhere. Add `test "$(wc -c < AGENTS.md)" -lt 24000` as a
+      `ci.yml` step that runs on the docs lane too, since an `AGENTS.md`-only
+      change is exactly what `classify` skips the heavy jobs for. Seconds, $0.
+
 - [ ] **Nothing nags when the pinned Rust release falls behind.**
       `rust-toolchain.toml` now pins an exact release rather than floating on
       `stable`, which is what makes a months-old container install a working
