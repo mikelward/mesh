@@ -41,8 +41,9 @@ has stopped biting.
 - **`resolve_review_thread` works — pass the `PRRT_*` thread node ID** from
   `pull_request_read` / `get_review_comments` (`review_threads[].id`) as
   `threadId`. A comment's `PRRC_*` node ID fails; they're different objects.
-  Order of operations: push the fix commit first, then reply citing the new
-  sha, then resolve.
+  Without the MCP tools, `gh api graphql` `resolveReviewThread` takes the same
+  `PRRT_*` ID. Order of operations: push the fix commit first, then reply
+  citing the new sha, then resolve.
 - **Report each review in the next message you send, and what it said.** Name
   the commit it read and the finding count — say so when that commit is no
   longer the head — then one bullet per finding: review comment, top-level
@@ -133,13 +134,15 @@ has stopped biting.
 - **If a scheduler or GitHub call prompts, say so once and carry on.**
   Permissions load at session start, so writing a settings file mid-session
   can't fix the session you're in.
-- **Watch your own PRs by subscription, plus one scheduled check.** Have a
-  subscription — Claude Code makes one when you open a PR; where a client
-  doesn't, call `subscribe_pr_activity`. It delivers reviews, comments and CI
-  failures. It cannot deliver CI *success*, a push, the merge, Codex's clean
-  verdict (a reaction), or Codex never answering at all — so keep exactly one
-  check armed for as long as the PR is open (each event and each check costs
-  a model turn). Under drive, arm auto-merge at PR open too — but only where
+- **Watch your own PRs by subscription, plus one scheduled check.** Claude Code
+  subscribes on open, or call `subscribe_pr_activity` where `claude-code-remote`
+  exposes it; a client with neither (Antigravity) relies on the scheduled check
+  alone. A subscription delivers reviews, comments and CI failures. It cannot deliver CI
+  *success*, a push, the merge, Codex's clean verdict (a reaction), or Codex
+  never answering at all — so keep exactly one check armed for as long as the
+  PR is open (each event and each check costs a model turn): `send_later` in
+  Claude Code, `schedule` with `DurationSeconds` in Antigravity (cancel it with
+  `manage_task` `kill`). Under drive, arm auto-merge at PR open too — but only where
   the ruleset makes the Codex verdict a required check AND requires
   conversations resolved: where CI is the only requirement it merges before
   Codex has answered, and an open review comment holds nothing back on its own.
@@ -188,7 +191,8 @@ has stopped biting.
     cleanly with it (`git merge-tree --write-tree`, Git 2.38 or later,
     exits 1). Any exit but 0 or 1 from either is a failure to report, not
     an answer. Your own rules decide the rebase from there. Skip a PR with
-    no session URL, and don't retry a failed send; its own scheduled check
+    no session URL, or when your client can only message local subagents,
+    and don't retry a failed send; its own scheduled check
     is the fallback.
   - Merged or closed, take one last reply-or-resolve pass — a review can
     land after the merge — then cancel it and unsubscribe. `list_triggers`
@@ -235,9 +239,10 @@ has stopped biting.
 
 ## Pull requests
 
-- Prefer the `mcp__github__*` MCP tools for GitHub operations; the `gh` CLI is
-  not installed here. If your client exposes neither, say so rather than
-  guessing at the outcome of an operation you couldn't perform.
+- Prefer the `mcp__github__*` MCP tools for GitHub operations where they're
+  mounted (Claude Code requires them); otherwise fall back to the `gh` CLI. If
+  your client has neither, say so rather than guessing at the outcome of an
+  operation you couldn't perform.
 - **Open pull requests ready for review**, not as drafts.
 - **Never open a PR on a commit that already carried one.** The `codex`
   status belongs to the commit, not the PR, and records nothing about which
@@ -314,8 +319,8 @@ has stopped biting.
   sandbox can't fetch one. Say the follow-up needs a fresh sandbox or a synced
   checkout rather than branching off a `HEAD` whose commits just landed upstream.
 - **Branch naming.** Feature branches are prefixed with the agent's own short
-  name: `<agent>/<short-topic>` (`claude/...` for Claude Code, `codex/...` for
-  Codex, and so on). One topic per branch; never commit to `main`. The
+  name: `<agent>/<short-topic>` (`claude/...` for Claude Code, `gemini/...` for
+  Gemini / Antigravity, `codex/...` for Codex, and so on). One topic per branch; never commit to `main`. The
   placeholder `<agent>` stands in for whichever prefix you use — don't
   hard-code `claude/` unless you *are* Claude Code.
 - **Merge cue (`merged` / `I merged` / `landed` / merge webhook) runs hygiene
@@ -357,6 +362,9 @@ reply, no offer to correct it. It is not a finding.
   Claude Code sessions get this automatically — `scripts/unshallow.sh` runs from
   the session-start hook — but the hook is Claude-only, so in any other
   environment run that script (or `git fetch --unshallow`) yourself first. The
+  same hook brings a remote container's Rust toolchain up to the workspace's
+  `rust-version`; elsewhere, if cargo refuses the toolchain, run
+  `CLAUDE_CODE_REMOTE=true .claude/hooks/session-start.sh`. The
   sandbox clones shallow, so `git rev-list --count`, `git log` past the shallow
   boundary, and blame return wrong answers without warning; where no remote is
   reachable (Codex cloud), say the history is truncated rather than quoting a
@@ -390,6 +398,11 @@ reply, no offer to correct it. It is not a finding.
   (≤ ~70 chars, prefix included) and free of internal jargon.
 - Put the mechanism, the bug fixed, and file:line detail in the body, after a
   blank line — the body is not size-constrained.
+- **No model identifier** — never name the coding agent's model or version
+  (`Opus 4.8`, `Sonnet`, `Gemini …`, `claude-*`, `gemini-*`) in a commit, PR,
+  comment, or pushed artifact; keep it to chat. Generic attribution
+  (`Co-Authored-By: Claude` / `Gemini`, `Claude-Session:`, "Generated with
+  Claude Code") is fine.
 - **Prefix a subject that does not change what mesh does.** A bare subject
   means the language, the CLI, or the runtime behaves differently after this
   commit. Anything else takes one of these, lowercase, followed by the
