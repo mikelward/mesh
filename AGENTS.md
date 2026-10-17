@@ -1,7 +1,7 @@
 ---
 trigger: always_on
 alwaysApply: true
-last_modified: 2026-10-16
+last_modified: 2026-10-17
 ---
 
 # AGENTS.md
@@ -216,9 +216,8 @@ has stopped biting.
   each guess in `TODO.md` under a `Decisions needing review` heading — what
   was decided, what the alternative was, and why it's reversible — creating
   the heading if it isn't there, so nothing guessed silently becomes
-  permanent. While autopilot is in effect it outranks "ask in plain text,
-  then end the turn and wait for the answer"; that rule governs everywhere
-  else. The carve-out is for destructive or irreversible actions *outside*
+  permanent. While autopilot is in effect it outranks "ask, then end the turn
+  and wait for the answer"; that rule governs everywhere else. The carve-out is for destructive or irreversible actions *outside*
   the loop — rewriting shared history, deleting work, anything reaching a
   system beyond this repo — which still wait for a real answer. Resetting a
   pinned merged branch waits too, even though it is inside the loop: the
@@ -438,10 +437,9 @@ reply, no offer to correct it. It is not a finding.
 
 - **Do not use `apt-get` / `apt`** to install tools. Use direct binary downloads
   (e.g. from GitHub releases) or `cargo install`.
-- **Do not use Claude's `AskUserQuestion` tool** — its multiple-choice prompt is
-  broken on mobile, so the question never becomes answerable. Ask in plain
-  message text instead, then end the turn and wait for the answer; do not pick a
-  default and carry on.
+- **Ask in plain chat or your client's question tool** (`AskUserQuestion` in
+  Claude Code, `ask_question` in Antigravity), then end the turn and wait for the
+  answer; do not pick a default and carry on.
 
 ## Talking to the user
 
