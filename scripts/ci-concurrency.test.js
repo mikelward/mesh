@@ -9,8 +9,6 @@ import { describe, expect, it } from './vitest-shim.mjs';
 // block is there at all, so a renamed key can't pass by matching nothing.
 
 const workflow = readFileSync(new URL('../.github/workflows/ci.yml', import.meta.url), 'utf8');
-const MAIN =
-  "(github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'))";
 const block = workflow.match(/^concurrency:\n((?: {2}.*\n)+)/m);
 
 describe('ci.yml concurrency', () => {
@@ -19,17 +17,17 @@ describe('ci.yml concurrency', () => {
     expect(workflow.match(/^concurrency:/gm).length).toBe(1);
   });
 
-  it('groups a pull request by its number, a dispatch by the PR it names, and main by commit', () => {
+  it('groups a pull request by its number, every dispatch by the PR it names, and a push to main by commit', () => {
     expect(block[1]).toContain(
-      `  group: ci-\${{ ${MAIN} && format('main-{0}', github.sha) || github.event.pull_request.number || inputs.pr || github.ref }}\n`,
+      "  group: ci-${{ github.event_name == 'push' && format('main-{0}', github.sha) || github.event.pull_request.number || inputs.pr || github.ref }}\n",
     );
   });
 
-  it('cancels on a push, open or reopen, never on main or an edit', () => {
+  it('cancels on a push, open or reopen, never on a push to main or an edit', () => {
     // An `edited` run carries the head as of the edit, and GitHub doesn't
     // promise to start runs in event order, so a canceling edit could cancel
     // the only run on a newer head; it queues instead.
-    expect(block[1]).toContain(`  cancel-in-progress: \${{ !${MAIN} && github.event.action != 'edited' }}\n`);
+    expect(block[1]).toContain("  cancel-in-progress: ${{ github.event_name != 'push' && github.event.action != 'edited' }}\n");
   });
 
   it('still runs on an edit and a push, so a retarget re-runs the lane', () => {
