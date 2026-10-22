@@ -1,7 +1,7 @@
 ---
 trigger: always_on
 alwaysApply: true
-last_modified: 2026-10-17
+last_modified: 2026-10-22
 ---
 
 # AGENTS.md
@@ -44,11 +44,12 @@ append; delete rules that have stopped biting.
   `get_reviews` to the last page, oldest first — block the merge until fixed, rebutted,
   or deferred; an acknowledgment is not an answer. A pending `codex` status means
   findings to address; or a clean review with no reaction, or an unanswered rebuttal —
-  poke `@codex review` once, five minutes later; or nothing back — poke once, five
-  minutes after the push. Escalate five minutes after a poke, never poke twice. A state
-  report reads ALL sources, including the `codex` commit status where the ruleset
-  requires it (separate from check runs): `updated_at` moving without a reaction
-  usually means unread findings.
+  poke `@codex review` five minutes later; or a hung review, nothing back five minutes
+  after the push or stuck at running (👀) ten minutes on — poke. A poke that hangs the
+  same way gets a second an hour later; escalate only if that one hangs too, never
+  after one (maintainer, 2026-10-22). A state report reads ALL sources, including the
+  `codex` commit status where the ruleset requires it (separate from check runs):
+  `updated_at` moving without a reaction usually means unread findings.
 - **Once Codex has +1'd a PR's head, make no unnecessary change without asking**
   (maintainer, 2026-10-13): a to-do, tidy-up or extra fix waits for a yes or a
   follow-up PR. A necessary change goes ahead unasked — a rebase for `dirty`, or
