@@ -1,7 +1,7 @@
 ---
 trigger: always_on
 alwaysApply: true
-last_modified: 2026-10-22
+last_modified: 2026-10-23
 ---
 
 # AGENTS.md
@@ -238,8 +238,12 @@ append; delete rules that have stopped biting.
 
 ## Commit messages
 
-- A plain-English, sentence-case subject, ≤ ~70 chars including any prefix, free of
-  internal jargon; mechanism, the bug fixed and file:line detail go in the body.
+- **Title like a changelog line** (maintainer, 2026-10-23): after any prefix, an imperative
+  verb, then the change as someone writing mesh sees it, plain English, sentence case,
+  ≤ ~70 chars including the prefix, e.g. `Fix …` for what was broken, `Improve …` for
+  what got better, `Add …` for what's new; an optional parenthetical says how. Never the
+  scenario or the mechanism: those, the bug fixed and file:line go in the body. PR titles
+  match.
 - **No model identifier** — never name the coding agent's model or version (`Opus 4.8`,
   `Sonnet`, `Gemini …`, `claude-*`, `gemini-*`) in a commit, PR, comment, or pushed
   artifact; keep it to chat. Generic attribution (`Co-Authored-By: Claude` / `Gemini`,
