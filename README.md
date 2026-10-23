@@ -70,7 +70,10 @@ comparisons ignore.
 Release assets contain the binary, README, and license files in
 `mesh-VERSION-x86_64-unknown-linux-gnu.tar.gz`, together with a SHA-256
 checksum. The `0.0.0` workspace version in `Cargo.toml` is a source-tree
-placeholder that nothing reports. Commit counts are calculated from a full
+placeholder that mesh itself never reports — but cargo does, in the
+`Compiling mesh v0.0.0` lines a build prints, since it reads the manifest before
+any build script runs. A build's real version is what `mesh --version` says.
+Commit counts are calculated from a full
 clone, and rewriting `main` history is avoided so release versions remain unique
 and increasing.
 
