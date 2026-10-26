@@ -263,9 +263,13 @@ publishes the Linux x86-64 binary for every push to `main`, versioned by commit
 count (see the README's *Releases*).
 
 The binary is not told that version — it derives its own, in
-[`crates/mesh-core/build.rs`](crates/mesh-core/build.rs), from the checkout it is
+[`crates/mesh/build.rs`](crates/mesh/build.rs), from the checkout it is
 built from, which is what lets your own clean build of a released commit report
-the released number rather than the `0.0.0` placeholder in `Cargo.toml`. The
+the released number rather than the `0.0.0` placeholder in `Cargo.toml`. It
+derives it in the *binary* crate and hands it to `mesh_core::run`, rather than
+in `mesh-core` where `--version` and `$sh.version` read it: the stamp changes
+with every commit, and whichever crate bakes it in is recompiled on every
+commit, so putting it here leaves the expensive crate alone. The
 release job checks the two derivations against each other before publishing, so
 a disagreement fails the release instead of shipping a binary that misreports
 which release it is. Setting `MESH_BUILD_VERSION` overrides the derivation
