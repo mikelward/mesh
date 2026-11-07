@@ -17954,29 +17954,30 @@ struct CompletionState {
     man_pages: OnceLock<Vec<String>>,
 }
 
+/// The programs a `PATH` value reaches, sorted and deduplicated.
+///
+/// **Symlinks are followed**, as running one would: `/usr/bin/python3` is
+/// usually a link, and uutils installs every coreutils name as a link to one
+/// binary, so a check on the link itself loses `true`, `ls` and the rest.
+fn programs_on(path: &std::ffi::OsStr) -> Vec<String> {
+    let mut programs: Vec<String> = std::env::split_paths(path)
+        .filter_map(|dir| std::fs::read_dir(dir).ok())
+        .flat_map(|entries| entries.flatten())
+        .filter(|entry| whence::is_executable_file(&entry.path()))
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .collect();
+    programs.sort();
+    programs.dedup();
+    programs
+}
+
 impl CompletionState {
     fn from_shell(shell: &Shell) -> Self {
-        let mut programs: Vec<String> = Vec::new();
         // The **same** search the lookup performs, `execvp`'s fallback included:
         // with `PATH` unset a command is still found and run, so scanning nothing
         // would offer no candidate for a word `whence` reports on and `command`
         // can reach.
-        {
-            let path = std::env::var_os("PATH").unwrap_or_else(whence::default_path);
-            for dir in std::env::split_paths(&path) {
-                let Ok(entries) = std::fs::read_dir(dir) else {
-                    continue;
-                };
-                programs.extend(entries.flatten().filter_map(|entry| {
-                    use std::os::unix::fs::PermissionsExt;
-                    let metadata = entry.metadata().ok()?;
-                    (metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
-                        .then(|| entry.file_name().to_string_lossy().into_owned())
-                }));
-            }
-        }
-        programs.sort();
-        programs.dedup();
+        let programs = programs_on(&std::env::var_os("PATH").unwrap_or_else(whence::default_path));
         let mut commands: Vec<String> = builtins::names().map(str::to_owned).collect();
         commands.extend(shell.funcs.names().map(str::to_owned));
         commands.extend(programs.iter().cloned());
@@ -21838,6 +21839,27 @@ mod tests {
         fs::remove_dir_all(&dir).expect("the probe directory should be removable");
         let ran = ran.expect("the probe should have run the alias's command and logged its argv");
         assert_eq!(ran, "operand  --help\n", "{ran:?}");
+    }
+
+    #[test]
+    fn a_symlinked_program_completes_like_the_file_it_names() {
+        use std::fs;
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        // Scanned through its own `PATH` value, since the process-wide one is
+        // shared with every other test in this binary.
+        let dir = std::env::temp_dir().join(format!("mesh-path-links-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let real = dir.join("multicall");
+        fs::write(&real, "#!/bin/sh\n").unwrap();
+        fs::set_permissions(&real, fs::Permissions::from_mode(0o755)).unwrap();
+        symlink(&real, dir.join("linked")).unwrap();
+        symlink(dir.join("missing"), dir.join("dangling")).unwrap();
+        fs::write(dir.join("plain"), "").unwrap();
+
+        let programs = crate::repl::programs_on(dir.as_os_str());
+        fs::remove_dir_all(&dir).expect("the PATH directory should be removable");
+        assert_eq!(programs, ["linked", "multicall"]);
     }
 
     #[test]
