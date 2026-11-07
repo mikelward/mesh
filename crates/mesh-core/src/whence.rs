@@ -549,7 +549,7 @@ pub(crate) fn default_path() -> OsString {
     OsString::from("/bin:/usr/bin")
 }
 
-fn is_executable_file(path: &Path) -> bool {
+pub(crate) fn is_executable_file(path: &Path) -> bool {
     fs::metadata(path).is_ok_and(|data| data.is_file() && data.permissions().mode() & 0o111 != 0)
 }
 
