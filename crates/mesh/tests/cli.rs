@@ -910,7 +910,11 @@ fn command_looks_past_a_builtin_and_says_so_when_there_is_no_program() {
 fn commands_own_words_are_only_the_ones_in_front_of_the_program() {
     // Everything from the program name on belongs to the program: `--help` after
     // it is the program's question, which is the whole point of the builtin.
-    let out = run_with_input("func printf(x) { puts mine }\ncommand printf '%s\\n' --help\n");
+    // `sh` answers with its own `printf`, so no system `printf` can claim the
+    // `--help` (uutils' does, wherever it appears).
+    let out = run_with_input(
+        "func sh(x) { puts mine }\ncommand sh -c 'printf \"%s\\n\" \"$1\"' sh --help\n",
+    );
     assert_eq!(
         String::from_utf8_lossy(&out.stdout),
         "--help\n",
@@ -14071,7 +14075,9 @@ fn exec_replaces_the_shell_with_the_program() {
 fn exec_arguments_belong_to_the_program() {
     // Only the leading words are `exec`'s own, as with `command`: `--help` after
     // the program is the program's question to answer, not this builtin's.
-    let help = run_with_input("exec /usr/bin/printf '%s\\n' --help\n");
+    // `sh` answers with its own `printf`, so no system `printf` can claim the
+    // `--help` (uutils' does, wherever it appears).
+    let help = run_with_input("exec sh -c 'printf \"%s\\n\" \"$1\"' sh --help\n");
     assert_eq!(
         String::from_utf8_lossy(&help.stdout),
         "--help\n",
